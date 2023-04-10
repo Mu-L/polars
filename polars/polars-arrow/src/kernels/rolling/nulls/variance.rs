@@ -1,8 +1,9 @@
-use super::*;
 use mean::MeanWindow;
 use nulls;
 use nulls::{rolling_apply_agg_window, RollingAggWindowNulls};
-use num::pow::Pow;
+use num_traits::pow::Pow;
+
+use super::*;
 
 pub(super) struct SumSquaredWindow<'a, T> {
     slice: &'a [T],
@@ -21,7 +22,7 @@ impl<'a, T: NativeType + IsFloat + Add<Output = T> + Sub<Output = T> + Mul<Outpu
         let mut sum_of_squares = None;
         let mut idx = start;
         self.null_count = 0;
-        for value in (&self.slice[start..end]).iter() {
+        for value in &self.slice[start..end] {
             let valid = self.validity.get_bit_unchecked(idx);
             if valid {
                 match sum_of_squares {

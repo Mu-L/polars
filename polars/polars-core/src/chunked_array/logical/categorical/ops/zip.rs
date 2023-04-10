@@ -5,7 +5,7 @@ impl CategoricalChunked {
         &self,
         mask: &BooleanChunked,
         other: &CategoricalChunked,
-    ) -> Result<Self> {
+    ) -> PolarsResult<Self> {
         let cats = match &**self.get_rev_map() {
             RevMapping::Local(rev_map) => {
                 // the logic for merging the rev maps will concatenate utf8 arrays
@@ -16,6 +16,13 @@ impl CategoricalChunked {
             _ => self.logical().zip_with(mask, other.logical())?,
         };
         let new_state = self.merge_categorical_map(other)?;
-        Ok(CategoricalChunked::from_cats_and_rev_map(cats, new_state))
+
+        // Safety:
+        // we checked the rev_maps.
+        unsafe {
+            Ok(CategoricalChunked::from_cats_and_rev_map_unchecked(
+                cats, new_state,
+            ))
+        }
     }
 }

@@ -33,14 +33,16 @@
 //! let df_read = IpcStreamReader::new(buf).finish().unwrap();
 //! assert!(df.frame_equal(&df_read));
 //! ```
-use crate::{finish_reader, ArrowReader, ArrowResult};
-use crate::{prelude::*, WriterFactory};
+use std::io::{Read, Seek, Write};
+use std::path::PathBuf;
+
 use arrow::io::ipc::read::{StreamMetadata, StreamState};
 use arrow::io::ipc::write::WriteOptions;
 use arrow::io::ipc::{read, write};
 use polars_core::prelude::*;
-use std::io::{Read, Seek, Write};
-use std::path::PathBuf;
+
+use crate::prelude::*;
+use crate::{finish_reader, ArrowReader, ArrowResult, WriterFactory};
 
 /// Read Arrows Stream IPC format into a DataFrame
 ///
@@ -51,7 +53,7 @@ use std::path::PathBuf;
 /// use polars_io::ipc::IpcStreamReader;
 /// use polars_io::SerReader;
 ///
-/// fn example() -> Result<DataFrame> {
+/// fn example() -> PolarsResult<DataFrame> {
 ///     let file = File::open("file.ipc").expect("file not found");
 ///
 ///     IpcStreamReader::new(file)
@@ -73,12 +75,12 @@ pub struct IpcStreamReader<R> {
 
 impl<R: Read + Seek> IpcStreamReader<R> {
     /// Get schema of the Ipc Stream File
-    pub fn schema(&mut self) -> Result<Schema> {
-        Ok((&self.metadata()?.schema.fields).into())
+    pub fn schema(&mut self) -> PolarsResult<Schema> {
+        Ok((self.metadata()?.schema.fields.iter()).into())
     }
 
     /// Get arrow schema of the Ipc Stream File, this is faster than creating a polars schema.
-    pub fn arrow_schema(&mut self) -> Result<ArrowSchema> {
+    pub fn arrow_schema(&mut self) -> PolarsResult<ArrowSchema> {
         Ok(self.metadata()?.schema)
     }
     /// Stop reading when `n` rows are read.
@@ -106,7 +108,7 @@ impl<R: Read + Seek> IpcStreamReader<R> {
         self
     }
 
-    fn metadata(&mut self) -> Result<StreamMetadata> {
+    fn metadata(&mut self) -> PolarsResult<StreamMetadata> {
         match &self.metadata {
             None => {
                 let metadata = read::read_stream_metadata(&mut self.reader)?;
@@ -154,13 +156,13 @@ where
         self
     }
 
-    fn finish(mut self) -> Result<DataFrame> {
+    fn finish(mut self) -> PolarsResult<DataFrame> {
         let rechunk = self.rechunk;
         let metadata = self.metadata()?;
         let schema = &metadata.schema;
 
         if let Some(columns) = self.columns {
-            let prj = columns_to_projection(columns, schema)?;
+            let prj = columns_to_projection(&columns, schema)?;
             self.projection = Some(prj);
         }
 
@@ -183,7 +185,6 @@ where
             rechunk,
             self.n_rows,
             None,
-            None,
             &schema,
             self.row_count,
         )
@@ -193,7 +194,7 @@ where
 
 fn fix_column_order(df: DataFrame, projection: Option<Vec<usize>>, row_count: bool) -> DataFrame {
     if let Some(proj) = projection {
-        let offset = if row_count { 1 } else { 0 };
+        let offset = usize::from(row_count);
         let mut args = (0..proj.len()).zip(proj).collect::<Vec<_>>();
         // first el of tuple is argument index
         // second el is the projection index
@@ -225,7 +226,7 @@ fn fix_column_order(df: DataFrame, projection: Option<Vec<usize>>, row_count: bo
 /// use std::fs::File;
 /// use polars_io::SerWriter;
 ///
-/// fn example(df: &mut DataFrame) -> Result<()> {
+/// fn example(df: &mut DataFrame) -> PolarsResult<()> {
 ///     let mut file = File::create("file.ipc").expect("could not create file");
 ///
 ///     IpcStreamWriter::new(&mut file)
@@ -239,9 +240,10 @@ pub struct IpcStreamWriter<W> {
     compression: Option<write::Compression>,
 }
 
-use crate::RowCount;
 use polars_core::frame::ArrowChunk;
 pub use write::Compression as IpcCompression;
+
+use crate::RowCount;
 
 impl<W> IpcStreamWriter<W> {
     /// Set the compression used. Defaults to None.
@@ -262,7 +264,7 @@ where
         }
     }
 
-    fn finish(&mut self, df: &mut DataFrame) -> Result<()> {
+    fn finish(&mut self, df: &mut DataFrame) -> PolarsResult<()> {
         let mut ipc_stream_writer = write::StreamWriter::new(
             &mut self.writer,
             WriteOptions {

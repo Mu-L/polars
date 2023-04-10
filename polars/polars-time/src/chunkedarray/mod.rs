@@ -27,10 +27,11 @@ pub use time::TimeMethods;
 pub use utf8::Utf8Methods;
 
 pub fn unix_time() -> NaiveDateTime {
-    NaiveDateTime::from_timestamp(0, 0)
+    NaiveDateTime::from_timestamp_opt(0, 0).unwrap()
 }
 
 // a separate function so that it is not compiled twice
+#[cfg(any(feature = "dtype-date", feature = "dtype-datetime"))]
 pub(crate) fn months_to_quarters(mut ca: UInt32Chunked) -> UInt32Chunked {
     ca.apply_mut(|month| (month + 2) / 3);
     ca

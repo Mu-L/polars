@@ -1,4 +1,5 @@
 use super::*;
+use crate::frame::hash_join::single_keys::probe_to_offsets;
 
 /// Only keeps track of membership in right table
 pub(super) fn create_probe_table_semi_anti<T, IntoSlice>(keys: Vec<IntoSlice>) -> Vec<PlHashSet<T>>
@@ -6,7 +7,7 @@ where
     T: Send + Hash + Eq + Sync + Copy + AsU64,
     IntoSlice: AsRef<[T]> + Send + Sync,
 {
-    let n_partitions = set_partition_size();
+    let n_partitions = _set_partition_size();
 
     // We will create a hashtable in every thread.
     // We use the hash to partition the keys to the matching hashtable.
@@ -56,7 +57,7 @@ where
             .zip(offsets)
             // probes_hashes: Vec<u64> processed by this thread
             // offset: offset index
-            .map(move |(probe, offset)| {
+            .flat_map(move |(probe, offset)| {
                 // local reference
                 let hash_sets = &hash_sets;
                 let probe = probe.as_ref();
@@ -83,7 +84,6 @@ where
                 });
                 results
             })
-            .flatten()
     })
 }
 

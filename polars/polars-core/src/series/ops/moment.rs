@@ -1,7 +1,6 @@
 use crate::prelude::*;
 
-#[cfg_attr(docsrs, doc(cfg(feature = "moment")))]
-fn moment_precomputed_mean(s: &Series, moment: usize, mean: f64) -> Result<Option<f64>> {
+fn moment_precomputed_mean(s: &Series, moment: usize, mean: f64) -> PolarsResult<Option<f64>> {
     // see: https://github.com/scipy/scipy/blob/47bb6febaa10658c72962b9615d5d5aa2513fa3a/scipy/stats/stats.py#L922
     let out = match moment {
         0 => Some(1.0),
@@ -21,6 +20,8 @@ fn moment_precomputed_mean(s: &Series, moment: usize, mean: f64) -> Result<Optio
             let a_zero_mean = s.cast(&DataType::Float64)? - mean;
 
             let mut s = if n_list.pop().unwrap() == 1 {
+                // TODO remove: false positive
+                #[allow(clippy::redundant_clone)]
                 a_zero_mean.clone()
             } else {
                 &a_zero_mean * &a_zero_mean
@@ -42,14 +43,13 @@ impl Series {
     /// Compute the sample skewness of a data set.
     ///
     /// For normally distributed data, the skewness should be about zero. For
-    /// unimodal continuous distributions, a skewness value greater than zero means
+    /// uni-modal continuous distributions, a skewness value greater than zero means
     /// that there is more weight in the right tail of the distribution. The
     /// function `skewtest` can be used to determine if the skewness value
     /// is close enough to zero, statistically speaking.
     ///
     /// see: https://github.com/scipy/scipy/blob/47bb6febaa10658c72962b9615d5d5aa2513fa3a/scipy/stats/stats.py#L1024
-    #[cfg_attr(docsrs, doc(cfg(feature = "moment")))]
-    pub fn skew(&self, bias: bool) -> Result<Option<f64>> {
+    pub fn skew(&self, bias: bool) -> PolarsResult<Option<f64>> {
         let mean = match self.mean() {
             Some(mean) => mean,
             None => return Ok(None),
@@ -61,8 +61,8 @@ impl Series {
         let out = m3 / m2.powf(1.5);
 
         if !bias {
-            let n = self.len() as f64;
-            Ok(Some(((n - 1.0) * n).sqrt() / (n - 2.0) * m3 / m2.powf(1.5)))
+            let n = (self.len() - self.null_count()) as f64;
+            Ok(Some(((n - 1.0) * n).sqrt() / (n - 2.0) * out))
         } else {
             Ok(Some(out))
         }
@@ -77,8 +77,7 @@ impl Series {
     /// eliminate bias coming from biased moment estimators
     ///
     /// see: https://github.com/scipy/scipy/blob/47bb6febaa10658c72962b9615d5d5aa2513fa3a/scipy/stats/stats.py#L1027
-    #[cfg_attr(docsrs, doc(cfg(feature = "moment")))]
-    pub fn kurtosis(&self, fisher: bool, bias: bool) -> Result<Option<f64>> {
+    pub fn kurtosis(&self, fisher: bool, bias: bool) -> PolarsResult<Option<f64>> {
         let mean = match self.mean() {
             Some(mean) => mean,
             None => return Ok(None),
@@ -88,8 +87,8 @@ impl Series {
         let m4 = moment_precomputed_mean(self, 4, mean)?.unwrap();
 
         let out = if !bias {
-            let n = self.len() as f64;
-            1.0 / (n - 2.0) / (n - 3.0)
+            let n = (self.len() - self.null_count()) as f64;
+            3.0 + 1.0 / (n - 2.0) / (n - 3.0)
                 * ((n.powf(2.0) - 1.0) * m4 / m2.powf(2.0) - 3.0 * (n - 1.0).powf(2.0))
         } else {
             m4 / m2.powf(2.0)
@@ -107,7 +106,7 @@ mod test {
     use super::*;
 
     impl Series {
-        fn moment(&self, moment: usize) -> Result<Option<f64>> {
+        fn moment(&self, moment: usize) -> PolarsResult<Option<f64>> {
             match self.mean() {
                 Some(mean) => moment_precomputed_mean(self, moment, mean),
                 None => Ok(None),
@@ -116,7 +115,7 @@ mod test {
     }
 
     #[test]
-    fn test_moment_compute() -> Result<()> {
+    fn test_moment_compute() -> PolarsResult<()> {
         let s = Series::new("", &[1, 2, 3, 4, 5, 23]);
 
         assert_eq!(s.moment(0)?, Some(1.0));
@@ -128,18 +127,37 @@ mod test {
     }
 
     #[test]
-    fn test_skew() -> Result<()> {
+    fn test_skew() -> PolarsResult<()> {
         let s = Series::new("", &[1, 2, 3, 4, 5, 23]);
-        assert!(s.skew(false)?.unwrap() - 2.2905330058490514 < 0.0001);
-        assert!(s.skew(true)?.unwrap() - 2.2905330058490514 < 0.0001);
+        let s2 = Series::new("", &[Some(1), Some(2), Some(3), None, Some(1)]);
+
+        assert!((s.skew(false)?.unwrap() - 2.2905330058490514).abs() < 0.0001);
+        assert!((s.skew(true)?.unwrap() - 1.6727687946848508).abs() < 0.0001);
+
+        assert!((s2.skew(false)?.unwrap() - 0.8545630383279711).abs() < 0.0001);
+        assert!((s2.skew(true)?.unwrap() - 0.49338220021815865).abs() < 0.0001);
+
         Ok(())
     }
 
     #[test]
-    fn test_kurtosis() -> Result<()> {
+    fn test_kurtosis() -> PolarsResult<()> {
         let s = Series::new("", &[1, 2, 3, 4, 5, 23]);
-        assert!(s.kurtosis(true, false)?.unwrap() - 5.400820058440946 < 0.0001);
-        assert!(s.kurtosis(true, true)?.unwrap() - 0.9945668771797536 < 0.0001);
+
+        assert!((s.kurtosis(true, true)?.unwrap() - 0.9945668771797536).abs() < 0.0001);
+        assert!((s.kurtosis(true, false)?.unwrap() - 5.400820058440946).abs() < 0.0001);
+        assert!((s.kurtosis(false, true)?.unwrap() - 3.994566877179754).abs() < 0.0001);
+        assert!((s.kurtosis(false, false)?.unwrap() - 8.400820058440946).abs() < 0.0001);
+
+        let s2 = Series::new(
+            "",
+            &[Some(1), Some(2), Some(3), None, Some(1), Some(2), Some(3)],
+        );
+        assert!((s2.kurtosis(true, true)?.unwrap() - (-1.5)).abs() < 0.0001);
+        assert!((s2.kurtosis(true, false)?.unwrap() - (-1.875)).abs() < 0.0001);
+        assert!((s2.kurtosis(false, true)?.unwrap() - 1.5).abs() < 0.0001);
+        assert!((s2.kurtosis(false, false)?.unwrap() - 1.125).abs() < 0.0001);
+
         Ok(())
     }
 }

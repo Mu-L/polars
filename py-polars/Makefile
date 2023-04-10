@@ -1,61 +1,86 @@
+.DEFAULT_GOAL := help
+
+PYTHONPATH=
 SHELL=/bin/bash
-PYTHON=venv/bin/python
-PYTHON_BIN=venv/bin
+VENV = .venv
 
-.PHONY: pre-commit test pip clean
+ifeq ($(OS),Windows_NT)
+	VENV_BIN=$(VENV)/Scripts
+else
+	VENV_BIN=$(VENV)/bin
+endif
 
-venv:
-	@python -m venv venv
-	@venv/bin/pip install -U pip
-	@venv/bin/pip install -r build.requirements.txt
-	@unset CONDA_PREFIX && source venv/bin/activate && maturin develop
+.venv:  ## Set up virtual environment and install requirements
+	python3 -m venv $(VENV)
+	$(MAKE) requirements
 
-clean:
-	@-rm -r venv
+.PHONY: requirements
+requirements: .venv  ## Install/refresh all project requirements
+	$(VENV_BIN)/python -m pip install --upgrade pip
+	$(VENV_BIN)/pip install -r requirements-dev.txt
+	$(VENV_BIN)/pip install -r requirements-lint.txt
+	$(VENV_BIN)/pip install -r docs/requirements-docs.txt
+
+.PHONY: build
+build: .venv  ## Compile and install Polars for development
+	@unset CONDA_PREFIX && source $(VENV_BIN)/activate && maturin develop
+
+.PHONY: build-release
+build-release: .venv  ## Compile and install a faster Polars binary
+	@unset CONDA_PREFIX && source $(VENV_BIN)/activate && maturin develop --release
+
+.PHONY: fmt
+fmt: .venv  ## Run autoformatting and linting
+	$(VENV_BIN)/black .
+	$(VENV_BIN)/blackdoc .
+	$(VENV_BIN)/ruff .
+	$(VENV_BIN)/typos ..
+	$(VENV_BIN)/python scripts/check_stacklevels.py
+	cargo fmt --all
+	-dprint fmt
+	-$(VENV_BIN)/mypy
+
+.PHONY: clippy
+clippy:  ## Run clippy
+	cargo clippy -- -D warnings
+
+.PHONY: pre-commit
+pre-commit: fmt clippy  ## Run all code quality checks
+
+.PHONY: test
+test: .venv build  ## Run fast unittests
+	$(VENV_BIN)/pytest -n auto --dist worksteal
+
+.PHONY: doctest
+doctest: .venv build  ## Run doctests
+	$(VENV_BIN)/python tests/docs/run_doctest.py
+
+.PHONY: test-all
+test-all: .venv build  ## Run all tests
+	$(VENV_BIN)/pytest -n auto --dist worksteal -m "slow or not slow"
+	$(VENV_BIN)/python tests/docs/run_doctest.py
+
+.PHONY: coverage
+coverage: .venv build  ## Run tests and report coverage
+	$(VENV_BIN)/pytest --cov -n auto --dist worksteal -m "not benchmark"
+
+.PHONY: clean
+clean:  ## Clean up caches and build artifacts
+	@rm -rf .venv/
+	@rm -rf target/
+	@rm -rf docs/build/
+	@rm -rf docs/source/reference/api/
+	@rm -rf .hypothesis/
+	@rm -rf .mypy_cache/
+	@rm -rf .pytest_cache/
+	@rm -rf .ruff_cache/
+	@rm -f .coverage
+	@rm -f coverage.xml
+	@rm -f polars/polars.abi3.so
+	@find . -type f -name '*.py[co]' -delete -or -type d -name __pycache__ -delete
 	@cargo clean
 
-pre-commit: venv
-	$(PYTHON_BIN)/isort .
-	$(PYTHON_BIN)/black .
-	$(PYTHON_BIN)/blackdoc .
-	$(PYTHON_BIN)/mypy
-	$(PYTHON_BIN)/flake8
-	make -C .. fmt_toml
-	cargo fmt --all
-
-test: venv
-	$(PYTHON_BIN)/maturin develop
-	$(PYTHON) -m pytest tests
-
-test-all: venv
-	$(PYTHON_BIN)/maturin develop
-	$(PYTHON) -m pytest tests
-	$(PYTHON) -m pytest tests_parametric
-
-test-with-cov: venv
-	$(PYTHON) -m pytest \
-		--cov=polars \
-		--cov-report xml \
-		--cov-fail-under=85 \
-		--import-mode=importlib
-
-doctest:
-	cd tests && ../$(PYTHON) run_doc_examples.py
-
-install-wheel:
-	pip install --force-reinstall -U wheels/polars-*.whl
-
-build-no-venv:
-	maturin build -o wheels
-
-build-no-venv-release:
-	maturin build -o wheels --release
-
-build-and-test-no-venv:
-	maturin build -o wheels
-	pip install --force-reinstall -U wheels/polars-*.whl
-	pytest tests
-
-install-no-venv: build-no-venv install-wheel
-install-no-venv-release: build-no-venv-release install-wheel
-
+.PHONY: help
+help:  ## Display this help screen
+	@echo -e "\033[1mAvailable commands:\033[0m\n"
+	@grep -E '^[a-z.A-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' | sort

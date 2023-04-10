@@ -1,7 +1,9 @@
+use std::ops::{BitAnd, BitOr, BitXor, Not};
+
+use arrow::compute;
+
 use super::*;
 use crate::utils::{align_chunks_binary, combine_validities, CustomIterTools};
-use arrow::compute;
-use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 impl<T> BitAnd for &ChunkedArray<T>
 where
@@ -26,12 +28,13 @@ where
                     .map(|(l, r)| *l & *r)
                     .collect_trusted::<Vec<_>>();
 
-                let arr = PrimitiveArray::from_data(T::get_dtype().to_arrow(), av.into(), validity);
+                let arr = PrimitiveArray::new(T::get_dtype().to_arrow(), av.into(), validity);
                 Box::new(arr) as ArrayRef
             })
             .collect::<Vec<_>>();
 
-        ChunkedArray::from_chunks(self.name(), chunks)
+        // safety: same type
+        unsafe { ChunkedArray::from_chunks(self.name(), chunks) }
     }
 }
 
@@ -58,12 +61,13 @@ where
                     .map(|(l, r)| *l | *r)
                     .collect_trusted::<Vec<_>>();
 
-                let arr = PrimitiveArray::from_data(T::get_dtype().to_arrow(), av.into(), validity);
+                let arr = PrimitiveArray::new(T::get_dtype().to_arrow(), av.into(), validity);
                 Box::new(arr) as ArrayRef
             })
             .collect::<Vec<_>>();
 
-        ChunkedArray::from_chunks(self.name(), chunks)
+        // safety: same type
+        unsafe { ChunkedArray::from_chunks(self.name(), chunks) }
     }
 }
 
@@ -90,12 +94,13 @@ where
                     .map(|(l, r)| l.bitxor(*r))
                     .collect_trusted::<Vec<_>>();
 
-                let arr = PrimitiveArray::from_data(T::get_dtype().to_arrow(), av.into(), validity);
+                let arr = PrimitiveArray::new(T::get_dtype().to_arrow(), av.into(), validity);
                 Box::new(arr) as ArrayRef
             })
             .collect::<Vec<_>>();
 
-        ChunkedArray::from_chunks(self.name(), chunks)
+        // safety: same type
+        unsafe { ChunkedArray::from_chunks(self.name(), chunks) }
     }
 }
 
@@ -115,14 +120,14 @@ impl BitOr for &BooleanChunked {
                         rhs.rename(self.name());
                         rhs
                     }
-                    None => &self.expand_at_index(0, rhs.len()) | rhs,
+                    None => &self.new_from_index(0, rhs.len()) | rhs,
                 };
             }
             (_, 1) => {
                 return match rhs.get(0) {
                     Some(true) => BooleanChunked::full(self.name(), true, self.len()),
                     Some(false) => self.clone(),
-                    None => &rhs.expand_at_index(0, self.len()) | self,
+                    None => &rhs.new_from_index(0, self.len()) | self,
                 };
             }
             _ => {}
@@ -132,12 +137,10 @@ impl BitOr for &BooleanChunked {
         let chunks = lhs
             .downcast_iter()
             .zip(rhs.downcast_iter())
-            .map(|(lhs, rhs)| {
-                Box::new(compute::boolean_kleene::or(lhs, rhs).expect("should be same size"))
-                    as ArrayRef
-            })
+            .map(|(lhs, rhs)| Box::new(compute::boolean_kleene::or(lhs, rhs)) as ArrayRef)
             .collect();
-        BooleanChunked::from_chunks(self.name(), chunks)
+        // safety: same type
+        unsafe { BooleanChunked::from_chunks(self.name(), chunks) }
     }
 }
 
@@ -169,14 +172,14 @@ impl BitXor for &BooleanChunked {
                         rhs.rename(self.name());
                         rhs
                     }
-                    None => &self.expand_at_index(0, rhs.len()) | rhs,
+                    None => &self.new_from_index(0, rhs.len()) | rhs,
                 };
             }
             (_, 1) => {
                 return match rhs.get(0) {
                     Some(true) => self.not(),
                     Some(false) => self.clone(),
-                    None => &rhs.expand_at_index(0, self.len()) | self,
+                    None => &rhs.new_from_index(0, self.len()) | self,
                 };
             }
             _ => {}
@@ -195,7 +198,8 @@ impl BitXor for &BooleanChunked {
             })
             .collect::<Vec<_>>();
 
-        ChunkedArray::from_chunks(self.name(), chunks)
+        // safety: same type
+        unsafe { ChunkedArray::from_chunks(self.name(), chunks) }
     }
 }
 
@@ -219,14 +223,14 @@ impl BitAnd for &BooleanChunked {
                 return match self.get(0) {
                     Some(true) => rhs.clone(),
                     Some(false) => BooleanChunked::full(self.name(), false, rhs.len()),
-                    None => &self.expand_at_index(0, rhs.len()) & rhs,
+                    None => &self.new_from_index(0, rhs.len()) & rhs,
                 };
             }
             (_, 1) => {
                 return match rhs.get(0) {
                     Some(true) => self.clone(),
                     Some(false) => BooleanChunked::full(self.name(), false, self.len()),
-                    None => self & &rhs.expand_at_index(0, self.len()),
+                    None => self & &rhs.new_from_index(0, self.len()),
                 };
             }
             _ => {}
@@ -236,12 +240,10 @@ impl BitAnd for &BooleanChunked {
         let chunks = lhs
             .downcast_iter()
             .zip(rhs.downcast_iter())
-            .map(|(lhs, rhs)| {
-                Box::new(compute::boolean_kleene::and(lhs, rhs).expect("should be same size"))
-                    as ArrayRef
-            })
+            .map(|(lhs, rhs)| Box::new(compute::boolean_kleene::and(lhs, rhs)) as ArrayRef)
             .collect();
-        BooleanChunked::from_chunks(self.name(), chunks)
+        // safety: same type
+        unsafe { BooleanChunked::from_chunks(self.name(), chunks) }
     }
 }
 

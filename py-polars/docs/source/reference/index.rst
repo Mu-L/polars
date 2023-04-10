@@ -1,4 +1,3 @@
-
 =============
 API reference
 =============
@@ -9,13 +8,16 @@ methods. All classes and functions exposed in ``polars.*`` namespace are public.
 .. toctree::
    :maxdepth: 2
 
-   config
-   dataframe
-   datatypes
-   exceptions
-   expression
-   functions
    io
-   lazyframe
-   series
+   series/index
+   dataframe/index
+   lazyframe/index
+   expressions/index
+   api
+   functions
+   datatypes
+   config
+   exceptions
    testing
+   utils
+   sql

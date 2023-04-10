@@ -1,18 +1,18 @@
 mod asof;
 mod groups;
+use std::borrow::Cow;
+
+use asof::*;
+use num_traits::Bounded;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use smartstring::alias::String as SmartString;
 
 use crate::prelude::*;
 use crate::utils::slice_slice;
-use asof::*;
-use num::Bounded;
-#[cfg(feature = "serde")]
-use serde::Deserializer;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AsOfOptions {
     pub strategy: AsofStrategy,
     /// A tolerance in the same unit as the asof column
@@ -22,40 +22,31 @@ pub struct AsOfOptions {
     /// - "2h15m"
     /// - "1d6h"
     /// etc
-    pub tolerance_str: Option<String>,
-    pub left_by: Option<Vec<String>>,
-    pub right_by: Option<Vec<String>>,
+    pub tolerance_str: Option<SmartString>,
+    pub left_by: Option<Vec<SmartString>>,
+    pub right_by: Option<Vec<SmartString>>,
 }
 
-#[cfg(feature = "serde")]
-impl<'a> Deserialize<'a> for AsOfOptions {
-    fn deserialize<D>(_deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'a>,
-    {
-        todo!()
-    }
-}
-
-fn check_asof_columns(a: &Series, b: &Series) -> Result<()> {
-    if a.dtype() != b.dtype() {
-        return Err(PolarsError::ComputeError(
-            format!(
-                "keys used in asof-join must have equal dtypes. We got: left: {:?}\tright: {:?}",
-                a.dtype(),
-                b.dtype()
-            )
-            .into(),
-        ));
-    }
-
+fn check_asof_columns(a: &Series, b: &Series) -> PolarsResult<()> {
+    let dtype_a = a.dtype();
+    let dtype_b = b.dtype();
+    polars_ensure!(
+        dtype_a == dtype_b,
+        ComputeError: "mismatching key dtypes in asof-join: `{}` and `{}`",
+        a.dtype(), b.dtype()
+    );
+    polars_ensure!(
+        a.null_count() == 0 && b.null_count() == 0,
+        ComputeError: "asof join must not have null values in 'on' arguments"
+    );
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum AsofStrategy {
     /// selects the last row in the right DataFrame whose ‘on’ key is less than or equal to the left’s key
+    #[default]
     Backward,
     /// selects the first row in the right DataFrame whose ‘on’ key is greater than or equal to the left’s key.
     Forward,
@@ -71,14 +62,9 @@ where
         other: &Series,
         strategy: AsofStrategy,
         tolerance: Option<AnyValue<'static>>,
-    ) -> Result<Vec<Option<IdxSize>>> {
+    ) -> PolarsResult<Vec<Option<IdxSize>>> {
         let other = self.unpack_series_matching_type(other)?;
 
-        if self.null_count() > 0 || other.null_count() > 0 {
-            return Err(PolarsError::ComputeError(
-                "asof join must not have null values in 'on' arguments".into(),
-            ));
-        }
         // cont_slice requires a single chunk
         let ca = self.rechunk();
         let other = other.rechunk();
@@ -123,7 +109,7 @@ impl DataFrame {
         tolerance: Option<AnyValue<'static>>,
         suffix: Option<String>,
         slice: Option<(i64, usize)>,
-    ) -> Result<DataFrame> {
+    ) -> PolarsResult<DataFrame> {
         let left_key = self.column(left_on)?;
         let right_key = other.column(right_on)?;
 
@@ -196,12 +182,11 @@ impl DataFrame {
             )
         };
 
-        self.finish_join(left, right_df, suffix)
+        _finish_join(left, right_df, suffix.as_deref())
     }
 
     /// This is similar to a left-join except that we match on nearest key rather than equal keys.
     /// The keys must be sorted to perform an asof join
-    #[cfg_attr(docsrs, doc(cfg(feature = "asof_join")))]
     pub fn join_asof(
         &self,
         other: &DataFrame,
@@ -210,7 +195,7 @@ impl DataFrame {
         strategy: AsofStrategy,
         tolerance: Option<AnyValue<'static>>,
         suffix: Option<String>,
-    ) -> Result<DataFrame> {
+    ) -> PolarsResult<DataFrame> {
         self._join_asof(other, left_on, right_on, strategy, tolerance, suffix, None)
     }
 }

@@ -1,17 +1,16 @@
-use crate::conversion::get_pyseq;
 use polars::prelude::*;
 use polars_core::utils::CustomIterTools;
 use pyo3::{PyAny, PyResult};
 
 pub fn py_seq_to_list(name: &str, seq: &PyAny, dtype: &DataType) -> PyResult<Series> {
-    let (seq, len) = get_pyseq(seq)?;
+    let len = seq.len()?;
     let s = match dtype {
         DataType::Int64 => {
             let mut builder =
                 ListPrimitiveChunkedBuilder::<Int64Type>::new(name, len, len * 5, DataType::Int64);
             for sub_seq in seq.iter()? {
                 let sub_seq = sub_seq?;
-                let (sub_seq, len) = get_pyseq(sub_seq)?;
+                let len = sub_seq.len()?;
 
                 // safety: we know the iterators len
                 let iter = unsafe {
@@ -40,7 +39,7 @@ pub fn py_seq_to_list(name: &str, seq: &PyAny, dtype: &DataType) -> PyResult<Ser
             );
             for sub_seq in seq.iter()? {
                 let sub_seq = sub_seq?;
-                let (sub_seq, len) = get_pyseq(sub_seq)?;
+                let len = sub_seq.len()?;
                 // safety: we know the iterators len
                 let iter = unsafe {
                     sub_seq
@@ -63,7 +62,7 @@ pub fn py_seq_to_list(name: &str, seq: &PyAny, dtype: &DataType) -> PyResult<Ser
             let mut builder = ListBooleanChunkedBuilder::new(name, len, len * 5);
             for sub_seq in seq.iter()? {
                 let sub_seq = sub_seq?;
-                let (sub_seq, len) = get_pyseq(sub_seq)?;
+                let len = sub_seq.len()?;
                 // safety: we know the iterators len
                 let iter = unsafe {
                     sub_seq
@@ -86,7 +85,7 @@ pub fn py_seq_to_list(name: &str, seq: &PyAny, dtype: &DataType) -> PyResult<Ser
             let mut builder = ListUtf8ChunkedBuilder::new(name, len, len * 5);
             for sub_seq in seq.iter()? {
                 let sub_seq = sub_seq?;
-                let (sub_seq, len) = get_pyseq(sub_seq)?;
+                let len = sub_seq.len()?;
                 // safety: we know the iterators len
                 let iter = unsafe {
                     sub_seq
@@ -106,7 +105,7 @@ pub fn py_seq_to_list(name: &str, seq: &PyAny, dtype: &DataType) -> PyResult<Ser
             builder.finish().into_series()
         }
         dt => {
-            panic!("cannot create list array from {:?}", dt);
+            panic!("cannot create list array from {dt:?}");
         }
     };
 

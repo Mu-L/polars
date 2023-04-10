@@ -20,7 +20,7 @@
 //! use polars::prelude::*;
 //! use polars::df;
 //!
-//! # fn example() -> Result<()> {
+//! # fn example() -> PolarsResult<()> {
 //! let df = df![
 //!     "a" => [1, 2, 3],
 //!     "b" => [None, Some("a"), Some("b")]
@@ -29,12 +29,12 @@
 //! let lf: LazyFrame = df.lazy();
 //!
 //! // scan a csv file lazily
-//! let lf: LazyFrame = LazyCsvReader::new("some_path".into())
-//!                     .has_header(true)
-//!                     .finish();
+//! let lf: LazyFrame = LazyCsvReader::new("some_path")
+//!     .has_header(true)
+//!     .finish()?;
 //!
 //! // scan a parquet file lazily
-//! let lf: LazyFrame = LazyFrame::scan_parquet("some_path".into(), None, true);
+//! let lf: LazyFrame = LazyFrame::scan_parquet("some_path", Default::default())?;
 //!
 //! # Ok(())
 //! # }
@@ -45,7 +45,7 @@
 //! use polars::prelude::*;
 //! use polars::df;
 //!
-//! # fn example() -> Result<()> {
+//! # fn example() -> PolarsResult<()> {
 //! let df = df![
 //!     "a" => [1, 2, 3],
 //!     "b" => [None, Some("a"), Some("b")]
@@ -74,7 +74,7 @@
 //! use polars::prelude::*;
 //! use polars::df;
 //!
-//! # fn example() -> Result<()> {
+//! # fn example() -> PolarsResult<()> {
 //! let df = df![
 //!     "a" => [1, 2, 3],
 //!     "b" => ["a", "a", "b"]
@@ -82,10 +82,10 @@
 //! // sort this DataFrame by multiple columns
 //!
 //! // ordering of the columns
-//! let reverse = vec![true, false];
+//! let descending = vec![true, false];
 //!
 //! let sorted = df.lazy()
-//!     .sort_by_exprs(vec![col("b"), col("a")], reverse)
+//!     .sort_by_exprs(vec![col("b"), col("a")], descending, false)
 //!     .collect()?;
 //!
 //! // sorted:
@@ -96,9 +96,7 @@
 //! // │ i64 ┆ str │
 //! // ╞═════╪═════╡
 //! // │ 1   ┆ "a" │
-//! // ├╌╌╌╌╌┼╌╌╌╌╌┤
 //! // │ 2   ┆ "a" │
-//! // ├╌╌╌╌╌┼╌╌╌╌╌┤
 //! // │ 3   ┆ "b" │
 //! // ╰─────┴─────╯
 //!
@@ -112,12 +110,12 @@
 //!
 //! ```
 //! use polars::prelude::*;
-//! # fn example() -> Result<()> {
+//! # fn example() -> PolarsResult<()> {
 //!
-//!  let df = LazyCsvReader::new("reddit.csv".into())
+//!  let df = LazyCsvReader::new("reddit.csv")
 //!     .has_header(true)
 //!     .with_delimiter(b',')
-//!     .finish()
+//!     .finish()?
 //!     .groupby([col("comment_karma")])
 //!     .agg([col("name").n_unique().alias("unique_names"), col("link_karma").max()])
 //!     // take only 100 rows.
@@ -131,7 +129,7 @@
 //! ```
 //! use polars::prelude::*;
 //! use polars::df;
-//! # fn example() -> Result<()> {
+//! # fn example() -> PolarsResult<()> {
 //! let df_a = df![
 //!     "a" => [1, 2, 1, 1],
 //!     "b" => ["a", "b", "c", "c"],
@@ -156,15 +154,10 @@
 //! // │ str ┆ i64 ┆ i64 ┆ str  ┆ str     │
 //! // ╞═════╪═════╪═════╪══════╪═════════╡
 //! // │ "a" ┆ 0   ┆ 1   ┆ "a"  ┆ "let"   │
-//! // ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
 //! // │ "a" ┆ 0   ┆ 1   ┆ "c"  ┆ "var"   │
-//! // ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
 //! // │ "a" ┆ 0   ┆ 1   ┆ "c"  ┆ "const" │
-//! // ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
 //! // │ "b" ┆ 1   ┆ 2   ┆ null ┆ null    │
-//! // ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
 //! // │ "c" ┆ 2   ┆ 1   ┆ null ┆ null    │
-//! // ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
 //! // │ "c" ┆ 3   ┆ 1   ┆ null ┆ null    │
 //! // ╰─────┴─────┴─────┴──────┴─────────╯
 //!
@@ -206,7 +199,7 @@
 //! ```
 //! use polars::prelude::*;
 //! use polars::df;
-//! # fn example() -> Result<()> {
+//! # fn example() -> PolarsResult<()> {
 //! let df = df![
 //!     "range" => [1, 2, 3, 4, 5, 6, 8, 9, 10],
 //!     "left" => (0..10).map(|_| Some("foo")).collect::<Vec<_>>(),
@@ -227,23 +220,14 @@
 //! // │ i64   ┆ str   ┆ str   ┆ str        │
 //! // ╞═══════╪═══════╪═══════╪════════════╡
 //! // │ 0     ┆ "foo" ┆ "bar" ┆ "bar"      │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 //! // │ 1     ┆ "foo" ┆ "bar" ┆ "bar"      │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 //! // │ 2     ┆ "foo" ┆ "bar" ┆ "bar"      │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 //! // │ 3     ┆ "foo" ┆ "bar" ┆ "bar"      │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-//! // │ ...   ┆ ...   ┆ ...   ┆ ...        │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
+//! // │ …     ┆ …     ┆ …     ┆ …          │
 //! // │ 5     ┆ "foo" ┆ "bar" ┆ "foo"      │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 //! // │ 6     ┆ "foo" ┆ "bar" ┆ "foo"      │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 //! // │ 7     ┆ "foo" ┆ "bar" ┆ "foo"      │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 //! // │ 8     ┆ "foo" ┆ "bar" ┆ "foo"      │
-//! // ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 //! // │ 9     ┆ "foo" ┆ "bar" ┆ "foo"      │
 //! // ╰───────┴───────┴───────┴────────────╯
 //!
@@ -264,7 +248,7 @@
 //!     a
 //! }
 //!
-//! fn apply_multiples(lf: LazyFrame) -> Result<DataFrame> {
+//! fn apply_multiples(lf: LazyFrame) -> PolarsResult<DataFrame> {
 //!     df![
 //!         "a" => [1.0, 2.0, 3.0],
 //!         "b" => [3.0, 5.1, 0.3]

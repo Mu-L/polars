@@ -1,11 +1,14 @@
+use std::convert::TryFrom;
+
+use arrow::array::*;
+
 use crate::prelude::*;
 #[cfg(feature = "dtype-struct")]
 use crate::series::iterator::SeriesIter;
 use crate::utils::CustomIterTools;
-use arrow::array::*;
-use std::convert::TryFrom;
 
 type LargeStringArray = Utf8Array<i64>;
+type LargeBinaryArray = BinaryArray<i64>;
 type LargeListArray = ListArray<i64>;
 pub mod par;
 
@@ -189,9 +192,9 @@ impl<'a> ExactSizeIterator for Utf8IterNoNull<'a> {}
 impl Utf8Chunked {
     #[allow(clippy::wrong_self_convention)]
     #[doc(hidden)]
-    pub fn into_no_null_iter<'a>(
-        &'a self,
-    ) -> impl Iterator<Item = &'a str>
+    pub fn into_no_null_iter(
+        &self,
+    ) -> impl Iterator<Item = &str>
            + '_
            + Send
            + Sync
@@ -207,24 +210,124 @@ impl Utf8Chunked {
     }
 }
 
+impl<'a> IntoIterator for &'a BinaryChunked {
+    type Item = Option<&'a [u8]>;
+    type IntoIter = Box<dyn PolarsIterator<Item = Self::Item> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        // we know that we only iterate over length == self.len()
+        unsafe { Box::new(self.downcast_iter().flatten().trust_my_length(self.len())) }
+    }
+}
+
+pub struct BinaryIterNoNull<'a> {
+    array: &'a LargeBinaryArray,
+    current: usize,
+    current_end: usize,
+}
+
+impl<'a> BinaryIterNoNull<'a> {
+    /// create a new iterator
+    pub fn new(array: &'a LargeBinaryArray) -> Self {
+        BinaryIterNoNull {
+            array,
+            current: 0,
+            current_end: array.len(),
+        }
+    }
+}
+
+impl<'a> Iterator for BinaryIterNoNull<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == self.current_end {
+            None
+        } else {
+            let old = self.current;
+            self.current += 1;
+            unsafe { Some(self.array.value_unchecked(old)) }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (
+            self.array.len() - self.current,
+            Some(self.array.len() - self.current),
+        )
+    }
+}
+
+impl<'a> DoubleEndedIterator for BinaryIterNoNull<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.current_end == self.current {
+            None
+        } else {
+            self.current_end -= 1;
+            unsafe { Some(self.array.value_unchecked(self.current_end)) }
+        }
+    }
+}
+
+/// all arrays have known size.
+impl<'a> ExactSizeIterator for BinaryIterNoNull<'a> {}
+
+impl BinaryChunked {
+    #[allow(clippy::wrong_self_convention)]
+    #[doc(hidden)]
+    pub fn into_no_null_iter(
+        &self,
+    ) -> impl Iterator<Item = &[u8]>
+           + '_
+           + Send
+           + Sync
+           + ExactSizeIterator
+           + DoubleEndedIterator
+           + TrustedLen {
+        // we know that we only iterate over length == self.len()
+        unsafe {
+            self.downcast_iter()
+                .flat_map(BinaryIterNoNull::new)
+                .trust_my_length(self.len())
+        }
+    }
+}
+
 impl<'a> IntoIterator for &'a ListChunked {
     type Item = Option<Series>;
     type IntoIter = Box<dyn PolarsIterator<Item = Self::Item> + 'a>;
     fn into_iter(self) -> Self::IntoIter {
         let dtype = self.inner_dtype();
 
-        // we know that we only iterate over length == self.len()
-        unsafe {
-            Box::new(
-                self.downcast_iter()
-                    .flat_map(|arr| arr.iter())
-                    .trust_my_length(self.len())
-                    .map(move |arr| {
-                        arr.map(|arr| {
-                            Series::from_chunks_and_dtype_unchecked("", vec![arr], &dtype)
-                        })
-                    }),
-            )
+        if self.null_count() == 0 {
+            // we know that we only iterate over length == self.len()
+            unsafe {
+                Box::new(
+                    self.downcast_iter()
+                        .flat_map(|arr| arr.iter().unwrap_required())
+                        .trust_my_length(self.len())
+                        .map(move |arr| {
+                            Some(Series::from_chunks_and_dtype_unchecked(
+                                "",
+                                vec![arr],
+                                &dtype,
+                            ))
+                        }),
+                )
+            }
+        } else {
+            // we know that we only iterate over length == self.len()
+            unsafe {
+                Box::new(
+                    self.downcast_iter()
+                        .flat_map(|arr| arr.iter())
+                        .trust_my_length(self.len())
+                        .map(move |arr| {
+                            arr.map(|arr| {
+                                Series::from_chunks_and_dtype_unchecked("", vec![arr], &dtype)
+                            })
+                        }),
+                )
+            }
         }
     }
 }

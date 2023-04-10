@@ -1,5 +1,6 @@
-use crate::prelude::*;
 use rayon::prelude::*;
+
+use crate::prelude::*;
 
 unsafe fn idx_to_str(idx: usize, arr: &Utf8Array<i64>) -> Option<&str> {
     if arr.is_valid(idx) {
@@ -23,17 +24,14 @@ impl Utf8Chunked {
     }
 
     pub fn par_iter(&self) -> impl ParallelIterator<Item = Option<&str>> + '_ {
-        self.chunks
-            .par_iter()
-            .map(move |arr| {
-                // Safety:
-                // guarded by the type system
-                let arr = &**arr;
-                let arr = unsafe { &*(arr as *const dyn Array as *const Utf8Array<i64>) };
-                (0..arr.len())
-                    .into_par_iter()
-                    .map(move |idx| unsafe { idx_to_str(idx, arr) })
-            })
-            .flatten()
+        self.chunks.par_iter().flat_map(move |arr| {
+            // Safety:
+            // guarded by the type system
+            let arr = &**arr;
+            let arr = unsafe { &*(arr as *const dyn Array as *const Utf8Array<i64>) };
+            (0..arr.len())
+                .into_par_iter()
+                .map(move |idx| unsafe { idx_to_str(idx, arr) })
+        })
     }
 }

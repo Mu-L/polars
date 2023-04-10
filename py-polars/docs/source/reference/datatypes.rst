@@ -1,12 +1,12 @@
 ==========
-Data Types
+Data types
 ==========
-.. currentmodule:: polars.datatypes
+.. currentmodule:: polars
 
 .. autosummary::
     :toctree: api/
     :nosignatures:
-    
+
     DataType
 
 Numeric
@@ -15,6 +15,7 @@ Numeric
     :toctree: api/
     :nosignatures:
 
+    Decimal
     Float32
     Float64
     Int16
@@ -26,7 +27,7 @@ Numeric
     UInt64
     UInt8
 
-Date / Time
+Temporal
 ~~~~~~~~~~~
 .. autosummary::
     :toctree: api/
@@ -52,7 +53,9 @@ Other
     :nosignatures:
 
     Boolean
+    Binary
     Categorical
     Null
     Object
     Utf8
+    Unknown

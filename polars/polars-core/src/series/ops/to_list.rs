@@ -1,7 +1,10 @@
+use std::borrow::Cow;
+
+use arrow::offset::Offsets;
+use polars_arrow::kernels::list::array_to_unit_list;
+
 use crate::chunked_array::builder::get_list_builder;
 use crate::prelude::*;
-use polars_arrow::kernels::list::array_to_unit_list;
-use std::borrow::Cow;
 
 fn reshape_fast_path(name: &str, s: &Series) -> Series {
     let chunks = match s.dtype() {
@@ -16,7 +19,9 @@ fn reshape_fast_path(name: &str, s: &Series) -> Series {
             .collect::<Vec<_>>(),
     };
 
-    let mut ca = ListChunked::from_chunks(name, chunks);
+    // safety dtype is checked.
+    let mut ca = unsafe { ListChunked::from_chunks(name, chunks) };
+    ca.set_inner_dtype(s.dtype().clone());
     ca.set_fast_explode();
     ca.into_series()
 }
@@ -25,31 +30,35 @@ impl Series {
     /// Convert the values of this Series to a ListChunked with a length of 1,
     /// So a Series of:
     /// `[1, 2, 3]` becomes `[[1, 2, 3]]`
-    pub fn to_list(&self) -> Result<ListChunked> {
+    pub fn to_list(&self) -> PolarsResult<ListChunked> {
         let s = self.rechunk();
         let values = s.array_ref(0);
 
         let offsets = vec![0i64, values.len() as i64];
         let inner_type = self.dtype();
 
-        let data_type = ListArray::<i64>::default_datatype(inner_type.to_physical().to_arrow());
+        let data_type = ListArray::<i64>::default_datatype(values.data_type().clone());
 
         // Safety:
         // offsets are correct;
-        let arr =
-            unsafe { ListArray::new_unchecked(data_type, offsets.into(), values.clone(), None) };
+        let arr = unsafe {
+            ListArray::new(
+                data_type,
+                Offsets::new_unchecked(offsets).into(),
+                values.clone(),
+                None,
+            )
+        };
         let name = self.name();
 
-        let mut ca = ListChunked::from_chunks(name, vec![Box::new(arr)]);
-        if self.dtype() != &self.dtype().to_physical() {
-            ca.to_logical(inner_type.clone())
-        }
+        let mut ca = unsafe { ListChunked::from_chunks(name, vec![Box::new(arr)]) };
+        ca.to_logical(inner_type.clone());
         ca.set_fast_explode();
 
         Ok(ca)
     }
 
-    pub fn reshape(&self, dims: &[i64]) -> Result<Series> {
+    pub fn reshape(&self, dims: &[i64]) -> PolarsResult<Series> {
         if dims.is_empty() {
             panic!("dimensions cannot be empty")
         }
@@ -80,12 +89,10 @@ impl Series {
         }
 
         let prod = dims.iter().product::<i64>() as usize;
-        if prod != s_ref.len() {
-            return Err(PolarsError::ComputeError(
-                format!("cannot reshape len {} into shape {:?}", s_ref.len(), dims).into(),
-            ));
-        }
-
+        polars_ensure!(
+            prod == s_ref.len(),
+            ComputeError: "cannot reshape len {} into shape {:?}", s_ref.len(), dims,
+        );
         match dims.len() {
             1 => Ok(s_ref.slice(0, dims[0] as usize)),
             2 => {
@@ -130,7 +137,7 @@ mod test {
     use crate::chunked_array::builder::get_list_builder;
 
     #[test]
-    fn test_to_list() -> Result<()> {
+    fn test_to_list() -> PolarsResult<()> {
         let s = Series::new("a", &[1, 2, 3]);
 
         let mut builder = get_list_builder(s.dtype(), s.len(), 1, s.name())?;
@@ -144,7 +151,7 @@ mod test {
     }
 
     #[test]
-    fn test_reshape() -> Result<()> {
+    fn test_reshape() -> PolarsResult<()> {
         let s = Series::new("a", &[1, 2, 3, 4]);
 
         for (dims, list_len) in [

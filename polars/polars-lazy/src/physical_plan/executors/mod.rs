@@ -1,13 +1,12 @@
 mod cache;
-mod drop_duplicates;
-mod explode;
+mod executor;
+mod ext_context;
 mod filter;
 mod groupby;
 mod groupby_dynamic;
 mod groupby_partitioned;
 mod groupby_rolling;
 mod join;
-mod melt;
 mod projection;
 #[cfg(feature = "python")]
 mod python_scan;
@@ -17,37 +16,43 @@ mod sort;
 mod stack;
 mod udf;
 mod union;
+mod unique;
 
+use std::borrow::Cow;
+
+pub use executor::*;
+use polars_core::POOL;
+use polars_plan::global::FETCH_ROWS;
+use polars_plan::utils::*;
+use rayon::prelude::*;
+
+pub(super) use self::cache::*;
+pub(super) use self::ext_context::*;
+pub(super) use self::filter::*;
+pub(super) use self::groupby::*;
+#[cfg(feature = "dynamic_groupby")]
+pub(super) use self::groupby_dynamic::*;
+pub(super) use self::groupby_partitioned::*;
+#[cfg(feature = "dynamic_groupby")]
+pub(super) use self::groupby_rolling::*;
+pub(super) use self::join::*;
+pub(super) use self::projection::*;
 #[cfg(feature = "python")]
 pub(super) use self::python_scan::*;
-
-pub(super) use self::{
-    cache::*, drop_duplicates::*, explode::*, filter::*, groupby::*, groupby_dynamic::*,
-    groupby_partitioned::*, groupby_rolling::*, join::*, melt::*, projection::*, scan::*, slice::*,
-    sort::*, stack::*, udf::*, union::*,
-};
-
+pub(super) use self::scan::*;
+pub(super) use self::slice::*;
+pub(super) use self::sort::*;
+pub(super) use self::stack::*;
+pub(super) use self::udf::*;
+pub(super) use self::union::*;
+pub(super) use self::unique::*;
 use super::*;
-use crate::logical_plan::FETCH_ROWS;
-use polars_core::POOL;
-use rayon::prelude::*;
-use std::path::PathBuf;
-
-const POLARS_VERBOSE: &str = "POLARS_VERBOSE";
-
-fn set_n_rows(n_rows: Option<usize>) -> Option<usize> {
-    let fetch_rows = FETCH_ROWS.with(|fetch_rows| fetch_rows.get());
-    match fetch_rows {
-        None => n_rows,
-        Some(n) => Some(n),
-    }
-}
 
 fn execute_projection_cached_window_fns(
     df: &DataFrame,
     exprs: &[Arc<dyn PhysicalExpr>],
     state: &ExecutionState,
-) -> Result<Vec<Series>> {
+) -> PolarsResult<Vec<Series>> {
     // We partition by normal expression and window expression
     // - the normal expressions can run in parallel
     // - the window expression take more memory and often use the same groupby keys and join tuples
@@ -59,7 +64,7 @@ fn execute_projection_cached_window_fns(
     // String: partition_name,
     // u32: index,
     // bool: flatten (we must run those first because they need a sorted group tuples.
-    //       if we cache the group tuples we must ensure we cast the sorted onces.
+    //       if we cache the group tuples we must ensure we cast the sorted ones.
     let mut windows: Vec<(String, Vec<(u32, bool, Arc<dyn PhysicalExpr>)>)> = vec![];
     let mut other = Vec::with_capacity(exprs.len());
 
@@ -68,7 +73,7 @@ fn execute_projection_cached_window_fns(
     let mut index = 0u32;
     exprs.iter().for_each(|phys| {
         index += 1;
-        let e = phys.as_expression();
+        let e = phys.as_expression().unwrap();
 
         let mut is_window = false;
         for e in e.into_iter() {
@@ -97,19 +102,18 @@ fn execute_projection_cached_window_fns(
         other
             .par_iter()
             .map(|(idx, expr)| expr.evaluate(df, state).map(|s| (*idx, s)))
-            .collect::<Result<Vec<_>>>()
+            .collect::<PolarsResult<Vec<_>>>()
     })?;
 
     for mut partition in windows {
         // clear the cache for every partitioned group
-        let mut state = state.clone();
-        state.clear_expr_cache();
+        let mut state = state.split();
 
         // don't bother caching if we only have a single window function in this partition
         if partition.1.len() == 1 {
-            state.cache_window = false;
+            state.remove_cache_window_flag();
         } else {
-            state.cache_window = true;
+            state.insert_cache_window_flag();
         }
 
         partition.1.sort_unstable_by_key(|(_idx, explode, _)| {
@@ -119,14 +123,20 @@ fn execute_projection_cached_window_fns(
         });
 
         for (index, _, e) in partition.1 {
-            // caching more than one window expression is a complicated topic for another day
-            // see issue #2523
-            state.cache_window = e
-                .as_expression()
+            if e.as_expression()
+                .unwrap()
                 .into_iter()
                 .filter(|e| matches!(e, Expr::Window { .. }))
                 .count()
-                == 1;
+                == 1
+            {
+                state.insert_cache_window_flag();
+            }
+            // caching more than one window expression is a complicated topic for another day
+            // see issue #2523
+            else {
+                state.remove_cache_window_flag();
+            }
 
             let s = e.evaluate(df, &state)?;
             selected_columns.push((index, s));
@@ -141,9 +151,9 @@ fn execute_projection_cached_window_fns(
 pub(crate) fn evaluate_physical_expressions(
     df: &DataFrame,
     exprs: &[Arc<dyn PhysicalExpr>],
-    state: &ExecutionState,
+    state: &mut ExecutionState,
     has_windows: bool,
-) -> Result<DataFrame> {
+) -> PolarsResult<DataFrame> {
     let zero_length = df.height() == 0;
     let selected_columns = if has_windows {
         execute_projection_cached_window_fns(df, exprs, state)?
@@ -152,10 +162,9 @@ pub(crate) fn evaluate_physical_expressions(
             exprs
                 .par_iter()
                 .map(|expr| expr.evaluate(df, state))
-                .collect::<Result<_>>()
+                .collect::<PolarsResult<_>>()
         })?
     };
-    state.clear_schema_cache();
 
     check_expand_literals(selected_columns, zero_length)
 }
@@ -163,7 +172,7 @@ pub(crate) fn evaluate_physical_expressions(
 fn check_expand_literals(
     mut selected_columns: Vec<Series>,
     zero_length: bool,
-) -> Result<DataFrame> {
+) -> PolarsResult<DataFrame> {
     let first_len = selected_columns[0].len();
     let mut df_height = 0;
     let mut all_equal_len = true;
@@ -176,11 +185,7 @@ fn check_expand_literals(
                 all_equal_len = false;
             }
             let name = s.name();
-            if !names.insert(name) {
-                return Err(PolarsError::Duplicate(
-                    format!("Column with name: '{}' has more than one occurrences", name).into(),
-                ));
-            }
+            polars_ensure!(names.insert(name), duplicate = name);
         }
     }
     // If all series are the same length it is ok. If not we can broadcast Series of length one.
@@ -188,13 +193,18 @@ fn check_expand_literals(
         selected_columns = selected_columns
             .into_iter()
             .map(|series| {
-                if series.len() == 1 && df_height > 1 {
-                    series.expand_at_index(0, df_height)
-                } else {
+                Ok(if series.len() == 1 && df_height > 1 {
+                    series.new_from_index(0, df_height)
+                } else if series.len() == df_height || series.len() == 0 {
                     series
-                }
+                } else {
+                    polars_bail!(
+                        ComputeError: "series length {} doesn't match the dataframe height of {}",
+                        series.len(), df_height
+                    );
+                })
             })
-            .collect()
+            .collect::<PolarsResult<_>>()?
     }
 
     let df = DataFrame::new_no_checks(selected_columns);

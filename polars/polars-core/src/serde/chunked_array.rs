@@ -1,8 +1,10 @@
-use super::DeDataType;
-use crate::prelude::*;
+use std::cell::RefCell;
+
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
-use std::cell::RefCell;
+
+use super::DeDataType;
+use crate::prelude::*;
 
 pub struct IterSer<I>
 where
@@ -117,6 +119,7 @@ macro_rules! impl_serialize {
 impl_serialize!(Utf8Chunked);
 impl_serialize!(BooleanChunked);
 impl_serialize!(ListChunked);
+impl_serialize!(BinaryChunked);
 
 #[cfg(feature = "dtype-categorical")]
 impl Serialize for CategoricalChunked {
@@ -127,7 +130,33 @@ impl Serialize for CategoricalChunked {
     where
         S: Serializer,
     {
-        let ca = self.cast(&DataType::Utf8).unwrap();
-        ca.serialize(serializer)
+        {
+            let mut state = serializer.serialize_map(Some(3))?;
+            state.serialize_entry("name", self.name())?;
+            let dtype: DeDataType = self.dtype().into();
+            state.serialize_entry("datatype", &dtype)?;
+            state.serialize_entry("values", &IterSer::new(self.iter_str()))?;
+            state.end()
+        }
+    }
+}
+
+#[cfg(feature = "dtype-struct")]
+impl Serialize for StructChunked {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<<S as Serializer>::Ok, <S as Serializer>::Error>
+    where
+        S: Serializer,
+    {
+        {
+            let mut state = serializer.serialize_map(Some(3))?;
+            state.serialize_entry("name", self.name())?;
+            let dtype: DeDataType = self.dtype().into();
+            state.serialize_entry("datatype", &dtype)?;
+            state.serialize_entry("values", self.fields())?;
+            state.end()
+        }
     }
 }

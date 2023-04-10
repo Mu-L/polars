@@ -1,5 +1,5 @@
-use crate::chunked_array::builder::{get_list_builder, AnonymousListBuilder};
-use crate::prelude::*;
+use std::borrow::Cow;
+
 #[cfg(feature = "dtype-duration")]
 use chrono::Duration as ChronoDuration;
 #[cfg(feature = "dtype-date")]
@@ -8,7 +8,9 @@ use chrono::NaiveDate;
 use chrono::NaiveDateTime;
 #[cfg(feature = "dtype-time")]
 use chrono::NaiveTime;
-use std::borrow::Cow;
+
+use crate::chunked_array::builder::{get_list_builder, AnonymousListBuilder};
+use crate::prelude::*;
 
 pub trait NamedFrom<T, Phantom: ?Sized> {
     /// Initialize by name and values.
@@ -61,6 +63,7 @@ macro_rules! impl_named_from {
 }
 
 impl_named_from!([String], Utf8Type, from_slice);
+impl_named_from!([Vec<u8>], BinaryType, from_slice);
 impl_named_from!([bool], BooleanType, from_slice);
 #[cfg(feature = "dtype-u8")]
 impl_named_from!([u8], UInt8Type, from_slice);
@@ -77,6 +80,7 @@ impl_named_from!([i64], Int64Type, from_slice);
 impl_named_from!([f32], Float32Type, from_slice);
 impl_named_from!([f64], Float64Type, from_slice);
 impl_named_from!([Option<String>], Utf8Type, from_slice_options);
+impl_named_from!([Option<Vec<u8>>], BinaryType, from_slice_options);
 impl_named_from!([Option<bool>], BooleanType, from_slice_options);
 #[cfg(feature = "dtype-u8")]
 impl_named_from!([Option<u8>], UInt8Type, from_slice_options);
@@ -122,8 +126,8 @@ impl<T: AsRef<[Series]>> NamedFrom<T, ListType> for Series {
         let dt = series_slice[0].dtype();
 
         // inner type is also list so we need the anonymous builder
-        if let DataType::List(inner) = dt {
-            let mut builder = AnonymousListBuilder::new(name, list_cap, Some(*inner.clone()));
+        if let DataType::List(_) = dt {
+            let mut builder = AnonymousListBuilder::new(name, list_cap, Some(dt.clone()));
             for s in series_slice {
                 builder.append_series(s)
             }
@@ -215,6 +219,62 @@ impl<'a, T: AsRef<[Option<Cow<'a, str>>]>> NamedFrom<T, [Option<Cow<'a, str>>]> 
 impl<'a, T: AsRef<[Option<Cow<'a, str>>]>> NamedFrom<T, [Option<Cow<'a, str>>]> for Utf8Chunked {
     fn new(name: &str, v: T) -> Self {
         Utf8Chunked::from_iter_options(
+            name,
+            v.as_ref()
+                .iter()
+                .map(|opt| opt.as_ref().map(|value| value.as_ref())),
+        )
+    }
+}
+
+impl<'a, T: AsRef<[&'a [u8]]>> NamedFrom<T, [&'a [u8]]> for Series {
+    fn new(name: &str, v: T) -> Self {
+        BinaryChunked::from_slice(name, v.as_ref()).into_series()
+    }
+}
+
+impl<'a, T: AsRef<[&'a [u8]]>> NamedFrom<T, [&'a [u8]]> for BinaryChunked {
+    fn new(name: &str, v: T) -> Self {
+        BinaryChunked::from_slice(name, v.as_ref())
+    }
+}
+
+impl<'a, T: AsRef<[Option<&'a [u8]>]>> NamedFrom<T, [Option<&'a [u8]>]> for Series {
+    fn new(name: &str, v: T) -> Self {
+        BinaryChunked::from_slice_options(name, v.as_ref()).into_series()
+    }
+}
+
+impl<'a, T: AsRef<[Option<&'a [u8]>]>> NamedFrom<T, [Option<&'a [u8]>]> for BinaryChunked {
+    fn new(name: &str, v: T) -> Self {
+        BinaryChunked::from_slice_options(name, v.as_ref())
+    }
+}
+
+impl<'a, T: AsRef<[Cow<'a, [u8]>]>> NamedFrom<T, [Cow<'a, [u8]>]> for Series {
+    fn new(name: &str, v: T) -> Self {
+        BinaryChunked::from_iter_values(name, v.as_ref().iter().map(|value| value.as_ref()))
+            .into_series()
+    }
+}
+
+impl<'a, T: AsRef<[Cow<'a, [u8]>]>> NamedFrom<T, [Cow<'a, [u8]>]> for BinaryChunked {
+    fn new(name: &str, v: T) -> Self {
+        BinaryChunked::from_iter_values(name, v.as_ref().iter().map(|value| value.as_ref()))
+    }
+}
+
+impl<'a, T: AsRef<[Option<Cow<'a, [u8]>>]>> NamedFrom<T, [Option<Cow<'a, [u8]>>]> for Series {
+    fn new(name: &str, v: T) -> Self {
+        BinaryChunked::new(name, v).into_series()
+    }
+}
+
+impl<'a, T: AsRef<[Option<Cow<'a, [u8]>>]>> NamedFrom<T, [Option<Cow<'a, [u8]>>]>
+    for BinaryChunked
+{
+    fn new(name: &str, v: T) -> Self {
+        BinaryChunked::from_iter_options(
             name,
             v.as_ref()
                 .iter()
@@ -394,12 +454,12 @@ mod test {
     fn test_temporal_df_construction() {
         // check if we can construct.
         let _df = df![
-            "date" => [NaiveDate::from_ymd(2021, 1, 1)],
-            "datetime" => [NaiveDate::from_ymd(2021, 1, 1).and_hms(0, 0, 0)],
-            "optional_date" => [Some(NaiveDate::from_ymd(2021, 1, 1))],
-            "optional_datetime" => [Some(NaiveDate::from_ymd(2021, 1, 1).and_hms(0, 0, 0))],
-            "time" => [NaiveTime::from_hms(23, 23, 23)],
-            "optional_time" => [Some(NaiveTime::from_hms(23, 23, 23))],
+            "date" => [NaiveDate::from_ymd_opt(2021, 1, 1).unwrap()],
+            "datetime" => [NaiveDate::from_ymd_opt(2021, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap()],
+            "optional_date" => [Some(NaiveDate::from_ymd_opt(2021, 1, 1).unwrap())],
+            "optional_datetime" => [Some(NaiveDate::from_ymd_opt(2021, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap())],
+            "time" => [NaiveTime::from_hms_opt(23, 23, 23).unwrap()],
+            "optional_time" => [Some(NaiveTime::from_hms_opt(23, 23, 23).unwrap())],
             "duration" => [ChronoDuration::from_std(std::time::Duration::from_secs(10)).unwrap()],
             "optional_duration" => [Some(ChronoDuration::from_std(std::time::Duration::from_secs(10)).unwrap())],
         ].unwrap();

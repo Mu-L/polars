@@ -1,6 +1,7 @@
-use crate::prelude::*;
 use polars_core::prelude::*;
 use polars_io::RowCount;
+
+use crate::prelude::*;
 
 #[derive(Clone)]
 pub struct ScanArgsAnonymous {
@@ -28,7 +29,7 @@ impl LazyFrame {
     pub fn anonymous_scan(
         function: Arc<dyn AnonymousScan>,
         args: ScanArgsAnonymous,
-    ) -> Result<Self> {
+    ) -> PolarsResult<Self> {
         let mut lf: LazyFrame = LogicalPlanBuilder::anonymous_scan(
             function,
             args.schema,

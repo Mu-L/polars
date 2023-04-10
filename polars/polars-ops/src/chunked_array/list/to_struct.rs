@@ -1,5 +1,8 @@
-use super::*;
 use polars_core::export::rayon::prelude::*;
+use polars_utils::format_smartstring;
+use smartstring::alias::String as SmartString;
+
+use super::*;
 
 #[derive(Copy, Clone, Debug)]
 pub enum ListToStructWidthStrategy {
@@ -44,38 +47,37 @@ fn det_n_fields(ca: &ListChunked, n_fields: ListToStructWidthStrategy) -> usize 
     }
 }
 
-pub type NameGenerator = Arc<dyn Fn(usize) -> String + Send + Sync>;
+pub type NameGenerator = Arc<dyn Fn(usize) -> SmartString + Send + Sync>;
+
+pub fn _default_struct_name_gen(idx: usize) -> SmartString {
+    format_smartstring!("field_{idx}")
+}
 
 pub trait ToStruct: AsList {
     fn to_struct(
         &self,
         n_fields: ListToStructWidthStrategy,
         name_generator: Option<NameGenerator>,
-    ) -> Result<StructChunked> {
+    ) -> PolarsResult<StructChunked> {
         let ca = self.as_list();
         let n_fields = det_n_fields(ca, n_fields);
 
-        let default_name_gen = |idx| format!("field_{idx}");
+        let name_generator = name_generator
+            .as_deref()
+            .unwrap_or(&_default_struct_name_gen);
 
-        let name_generator = name_generator.as_deref().unwrap_or(&default_name_gen);
-
-        if n_fields == 0 {
-            Err(PolarsError::ComputeError(
-                "cannot create a struct with 0 fields".into(),
-            ))
-        } else {
-            let fields = (0..n_fields)
-                .into_par_iter()
-                .map(|i| {
-                    ca.lst_get(i as i64).map(|mut s| {
-                        s.rename(&name_generator(i));
-                        s
-                    })
+        polars_ensure!(n_fields != 0, ComputeError: "cannot create a struct with 0 fields");
+        let fields = (0..n_fields)
+            .into_par_iter()
+            .map(|i| {
+                ca.lst_get(i as i64).map(|mut s| {
+                    s.rename(&name_generator(i));
+                    s
                 })
-                .collect::<Result<Vec<_>>>()?;
+            })
+            .collect::<PolarsResult<Vec<_>>>()?;
 
-            StructChunked::new(ca.name(), &fields)
-        }
+        StructChunked::new(ca.name(), &fields)
     }
 }
 

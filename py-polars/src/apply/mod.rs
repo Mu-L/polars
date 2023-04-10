@@ -1,14 +1,18 @@
 pub mod dataframe;
 pub mod series;
 
-use crate::prelude::ObjectValue;
-use crate::{PyPolarsErr, PySeries, Wrap};
+use std::collections::BTreeMap;
+
 use polars::chunked_array::builder::get_list_builder;
 use polars::prelude::*;
+use polars_core::export::rayon::prelude::*;
 use polars_core::utils::CustomIterTools;
-use polars_core::{export::rayon::prelude::*, POOL};
+use polars_core::POOL;
 use pyo3::types::PyDict;
 use pyo3::{PyAny, PyResult};
+
+use crate::prelude::ObjectValue;
+use crate::{PyPolarsErr, PySeries, Wrap};
 
 pub trait PyArrowPrimitiveType: PolarsNumericType {}
 
@@ -31,17 +35,14 @@ fn iterator_to_struct<'a>(
     capacity: usize,
 ) -> PyResult<PySeries> {
     let (vals, flds) = match &first_value {
-        AnyValue::Struct(vals, flds) => (&**vals, *flds),
-        AnyValue::StructOwned(payload) => (&*payload.0, &*payload.1),
+        av @ AnyValue::Struct(_, _, flds) => (av._iter_struct_av().collect::<Vec<_>>(), &**flds),
+        AnyValue::StructOwned(payload) => (payload.0.clone(), &*payload.1),
         _ => {
             return Err(crate::error::ComputeError::new_err(format!(
-                "expected struct got {:?}",
-                first_value
+                "expected struct got {first_value:?}",
             )))
         }
     };
-
-    let struct_width = vals.len();
 
     // every item in the struct is kept as its own buffer of anyvalues
     // so as struct with 2 items: {a, b}
@@ -50,45 +51,67 @@ fn iterator_to_struct<'a>(
     //      [ a values ]
     //      [ b values ]
     // ]
-    let mut items = Vec::with_capacity(vals.len());
-    for item in vals {
+    let mut struct_fields: BTreeMap<&str, Vec<AnyValue>> = BTreeMap::new();
+
+    // use the first value and the known null count to initialize the buffers
+    // if we find a new key later on, we make a new entry in the BTree
+    for (value, fld) in vals.into_iter().zip(flds) {
         let mut buf = Vec::with_capacity(capacity);
         for _ in 0..init_null_count {
             buf.push(AnyValue::Null);
         }
-        buf.push(item.clone());
-        items.push(buf);
+        buf.push(value);
+        struct_fields.insert(fld.name(), buf);
     }
 
     for dict in it {
         match dict {
             None => {
-                for field_items in &mut items {
+                for field_items in struct_fields.values_mut() {
                     field_items.push(AnyValue::Null);
                 }
             }
             Some(dict) => {
                 let dict = dict.downcast::<PyDict>()?;
-                if dict.len() != struct_width {
-                    return Err(crate::error::ComputeError::new_err(
-                        "all tuples must have equal size",
-                    ));
-                }
+
+                let current_len = struct_fields
+                    .values()
+                    .next()
+                    .map(|buf| buf.len())
+                    .unwrap_or(0);
+
                 // we ignore the keys of the rest of the dicts
                 // the first item determines the output name
-                for ((_, val), field_items) in dict.iter().zip(&mut items) {
+                for (key, val) in dict.iter() {
+                    let key = key.str().unwrap().to_str().unwrap();
+                    let buf = struct_fields.entry(key).or_insert_with(|| {
+                        let mut buf = Vec::with_capacity(capacity);
+                        for _ in 0..(init_null_count + current_len) {
+                            buf.push(AnyValue::Null);
+                        }
+                        buf
+                    });
                     let item = val.extract::<Wrap<AnyValue>>()?;
-                    field_items.push(item.0)
+                    buf.push(item.0)
+                }
+
+                // add nulls to keys that were not in the dict
+                if dict.len() < struct_fields.len() {
+                    let current_len = current_len + 1;
+                    for buf in struct_fields.values_mut() {
+                        if buf.len() < current_len {
+                            buf.push(AnyValue::Null)
+                        }
+                    }
                 }
             }
         }
     }
 
     let fields = POOL.install(|| {
-        items
+        struct_fields
             .par_iter()
-            .zip(flds)
-            .map(|(av, fld)| Series::new(fld.name(), av))
+            .map(|(name, avs)| Series::new(name, avs))
             .collect::<Vec<_>>()
     });
 
@@ -161,6 +184,7 @@ fn iterator_to_bool(
     ca
 }
 
+#[cfg(feature = "object")]
 fn iterator_to_object(
     it: impl Iterator<Item = Option<ObjectValue>>,
     init_null_count: usize,
@@ -236,7 +260,16 @@ fn iterator_to_list(
     }
     builder.append_opt_series(first_value);
     for opt_val in it {
-        builder.append_opt_series(opt_val.as_ref())
+        match opt_val {
+            None => builder.append_null(),
+            Some(s) => {
+                if s.len() == 0 && s.dtype() != dt {
+                    builder.append_series(&Series::full_null("", 0, dt))
+                } else {
+                    builder.append_series(&s)
+                }
+            }
+        }
     }
     Ok(builder.finish())
 }

@@ -1,5 +1,11 @@
-use crate::prelude::*;
+#[cfg(feature = "timezones")]
+use arrow::temporal_conversions::parse_offset;
 use polars_core::prelude::*;
+use polars_ops::prelude::*;
+
+use crate::prelude::*;
+#[cfg(feature = "timezones")]
+use crate::utils::unlocalize_timestamp;
 
 pub trait PolarsUpsample {
     /// Upsample a DataFrame at a regular frequency.
@@ -32,7 +38,7 @@ pub trait PolarsUpsample {
         time_column: &str,
         every: Duration,
         offset: Duration,
-    ) -> Result<DataFrame>;
+    ) -> PolarsResult<DataFrame>;
 
     /// Upsample a DataFrame at a regular frequency.
     ///
@@ -64,7 +70,7 @@ pub trait PolarsUpsample {
         time_column: &str,
         every: Duration,
         offset: Duration,
-    ) -> Result<DataFrame>;
+    ) -> PolarsResult<DataFrame>;
 }
 
 impl PolarsUpsample for DataFrame {
@@ -74,7 +80,7 @@ impl PolarsUpsample for DataFrame {
         time_column: &str,
         every: Duration,
         offset: Duration,
-    ) -> Result<DataFrame> {
+    ) -> PolarsResult<DataFrame> {
         let by = by.into_vec();
         upsample_impl(self, by, time_column, every, offset, false)
     }
@@ -85,7 +91,7 @@ impl PolarsUpsample for DataFrame {
         time_column: &str,
         every: Duration,
         offset: Duration,
-    ) -> Result<DataFrame> {
+    ) -> PolarsResult<DataFrame> {
         let by = by.into_vec();
         upsample_impl(self, by, time_column, every, offset, true)
     }
@@ -98,7 +104,7 @@ fn upsample_impl(
     every: Duration,
     offset: Duration,
     stable: bool,
-) -> Result<DataFrame> {
+) -> PolarsResult<DataFrame> {
     let s = source.column(index_column)?;
     if matches!(s.dtype(), DataType::Date) {
         let mut df = source.clone();
@@ -132,22 +138,39 @@ fn upsample_single_impl(
     index_column: &Series,
     every: Duration,
     offset: Duration,
-) -> Result<DataFrame> {
+) -> PolarsResult<DataFrame> {
     let index_col_name = index_column.name();
 
     use DataType::*;
     match index_column.dtype() {
         Datetime(tu, tz) => {
-            let s = index_column.cast(&DataType::Int64).unwrap();
+            let s = index_column.cast(&Int64).unwrap();
             let ca = s.i64().unwrap();
             let first = ca.into_iter().flatten().next();
             let last = ca.into_iter().flatten().next_back();
             match (first, last) {
                 (Some(first), Some(last)) => {
+                    let (first, last) = match tz {
+                        #[cfg(feature = "timezones")]
+                        Some(tz) => match tz.parse::<chrono_tz::Tz>() {
+                            Ok(tz) => (
+                                unlocalize_timestamp(first, *tu, tz),
+                                unlocalize_timestamp(last, *tu, tz),
+                            ),
+                            Err(_) => match parse_offset(tz) {
+                                Ok(tz) => (
+                                    unlocalize_timestamp(first, *tu, tz),
+                                    unlocalize_timestamp(last, *tu, tz),
+                                ),
+                                Err(_) => unreachable!(),
+                            },
+                        },
+                        _ => (first, last),
+                    };
                     let first = match tu {
-                        TimeUnit::Nanoseconds => offset.add_ns(first),
-                        TimeUnit::Microseconds => offset.add_us(first),
-                        TimeUnit::Milliseconds => offset.add_ms(first),
+                        TimeUnit::Nanoseconds => offset.add_ns(first, NO_TIMEZONE)?,
+                        TimeUnit::Microseconds => offset.add_us(first, NO_TIMEZONE)?,
+                        TimeUnit::Milliseconds => offset.add_ms(first, NO_TIMEZONE)?,
                     };
                     let range = date_range_impl(
                         index_col_name,
@@ -156,8 +179,8 @@ fn upsample_single_impl(
                         every,
                         ClosedWindow::Both,
                         *tu,
-                    )
-                    .with_time_zone(tz.clone())
+                        tz.as_ref(),
+                    )?
                     .into_series()
                     .into_frame();
                     range.join(
@@ -168,13 +191,13 @@ fn upsample_single_impl(
                         None,
                     )
                 }
-                _ => Err(PolarsError::ComputeError(
-                    "Cannot determine upsample boundaries. All elements are null.".into(),
-                )),
+                _ => polars_bail!(
+                    ComputeError: "cannot determine upsample boundaries: all elements are null"
+                ),
             }
         }
-        dt => Err(PolarsError::ComputeError(
-            format!("upsample not allowed for index_column of dtype {:?}", dt).into(),
-        )),
+        dt => polars_bail!(
+            ComputeError: "upsample not allowed for index column of dtype {}", dt,
+        ),
     }
 }

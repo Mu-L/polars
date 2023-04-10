@@ -1,8 +1,9 @@
-use super::*;
 use polars_ops::prelude::ListNameSpaceImpl;
 
+use super::*;
+
 #[test]
-fn test_agg_exprs() -> Result<()> {
+fn test_agg_exprs() -> PolarsResult<()> {
     let df = fruits_cars();
 
     // a binary expression followed by a function and an aggregation. See if it runs
@@ -10,8 +11,7 @@ fn test_agg_exprs() -> Result<()> {
         .lazy()
         .groupby_stable([col("cars")])
         .agg([(lit(1) - col("A"))
-            .map(|s| Ok(&s * 2), GetOutput::same_type())
-            .list()
+            .map(|s| Ok(Some(&s * 2)), GetOutput::same_type())
             .alias("foo")])
         .collect()?;
     let ca = out.column("foo")?.list()?;
@@ -22,7 +22,7 @@ fn test_agg_exprs() -> Result<()> {
 }
 
 #[test]
-fn test_agg_unique_first() -> Result<()> {
+fn test_agg_unique_first() -> PolarsResult<()> {
     let df = df![
         "g"=> [1, 1, 2, 2, 3, 4, 1],
         "v"=> [1, 2, 2, 2, 3, 4, 1],
@@ -64,37 +64,7 @@ fn test_lazy_agg_scan() {
 }
 
 #[test]
-fn test_lazy_df_aggregations() {
-    let df = load_df();
-
-    assert!(df
-        .clone()
-        .lazy()
-        .min()
-        .collect()
-        .unwrap()
-        .frame_equal_missing(&df.min()));
-    assert!(df
-        .clone()
-        .lazy()
-        .median()
-        .collect()
-        .unwrap()
-        .frame_equal_missing(&df.median()));
-    assert!(df
-        .clone()
-        .lazy()
-        .quantile(0.5, QuantileInterpolOptions::default())
-        .collect()
-        .unwrap()
-        .frame_equal_missing(
-            &df.quantile(0.5, QuantileInterpolOptions::default())
-                .unwrap()
-        ));
-}
-
-#[test]
-fn test_cumsum_agg_as_key() -> Result<()> {
+fn test_cumsum_agg_as_key() -> PolarsResult<()> {
     let df = df![
         "depth" => &[0i32, 1, 2, 3, 4, 5, 6, 7, 8, 9],
         "soil" => &["peat", "peat", "peat", "silt", "silt", "silt", "sand", "sand", "peat", "peat"]
@@ -125,7 +95,7 @@ fn test_cumsum_agg_as_key() -> Result<()> {
 
 #[test]
 #[cfg(feature = "moment")]
-fn test_auto_skew_kurtosis_agg() -> Result<()> {
+fn test_auto_skew_kurtosis_agg() -> PolarsResult<()> {
     let df = fruits_cars();
 
     let out = df
@@ -145,7 +115,7 @@ fn test_auto_skew_kurtosis_agg() -> Result<()> {
 }
 
 #[test]
-fn test_auto_list_agg() -> Result<()> {
+fn test_auto_list_agg() -> PolarsResult<()> {
     let df = fruits_cars();
 
     // test if alias executor adds a list after shift and fill
@@ -180,7 +150,8 @@ fn test_auto_list_agg() -> Result<()> {
     Ok(())
 }
 #[test]
-fn test_power_in_agg_list1() -> Result<()> {
+#[cfg(feature = "rolling_window")]
+fn test_power_in_agg_list1() -> PolarsResult<()> {
     let df = fruits_cars();
 
     // this test if the group tuples are correctly updated after
@@ -211,7 +182,6 @@ fn test_power_in_agg_list1() -> Result<()> {
             },
         )
         .collect()?;
-    dbg!(&out);
 
     let agg = out.column("foo")?.list()?;
     let first = agg.get(0).unwrap();
@@ -222,7 +192,8 @@ fn test_power_in_agg_list1() -> Result<()> {
 }
 
 #[test]
-fn test_power_in_agg_list2() -> Result<()> {
+#[cfg(feature = "rolling_window")]
+fn test_power_in_agg_list2() -> PolarsResult<()> {
     let df = fruits_cars();
 
     // this test if the group tuples are correctly updated after
@@ -254,7 +225,7 @@ fn test_power_in_agg_list2() -> Result<()> {
     Ok(())
 }
 #[test]
-fn test_binary_agg_context_0() -> Result<()> {
+fn test_binary_agg_context_0() -> PolarsResult<()> {
     let df = df![
         "groups" => [1, 1, 2, 2, 3, 3],
         "vals" => [1, 2, 3, 4, 5, 6]
@@ -290,7 +261,7 @@ fn test_binary_agg_context_0() -> Result<()> {
 
 // just like binary expression, this must be changed. This can work
 #[test]
-fn test_binary_agg_context_1() -> Result<()> {
+fn test_binary_agg_context_1() -> PolarsResult<()> {
     let df = df![
         "groups" => [1, 1, 2, 2, 3, 3],
         "vals" => [1, 13, 3, 87, 1, 6]
@@ -348,7 +319,7 @@ fn test_binary_agg_context_1() -> Result<()> {
 }
 
 #[test]
-fn test_binary_agg_context_2() -> Result<()> {
+fn test_binary_agg_context_2() -> PolarsResult<()> {
     let df = df![
         "groups" => [1, 1, 2, 2, 3, 3],
         "vals" => [1, 2, 3, 4, 5, 6]
@@ -360,7 +331,7 @@ fn test_binary_agg_context_2() -> Result<()> {
         .clone()
         .lazy()
         .groupby_stable([col("groups")])
-        .agg([((col("vals").first() - col("vals")).list()).alias("vals")])
+        .agg([(col("vals").first() - col("vals")).alias("vals")])
         .collect()?;
 
     // 0 - [1, 2] = [0, -1]
@@ -378,7 +349,7 @@ fn test_binary_agg_context_2() -> Result<()> {
     let out = df
         .lazy()
         .groupby_stable([col("groups")])
-        .agg([((col("vals")) - col("vals").first()).list().alias("vals")])
+        .agg([((col("vals")) - col("vals").first()).alias("vals")])
         .collect()?;
 
     // [1, 2] - 1 = [0, 1]
@@ -396,7 +367,7 @@ fn test_binary_agg_context_2() -> Result<()> {
 }
 
 #[test]
-fn test_binary_agg_context_3() -> Result<()> {
+fn test_binary_agg_context_3() -> PolarsResult<()> {
     let df = fruits_cars();
 
     let out = df
@@ -406,14 +377,14 @@ fn test_binary_agg_context_3() -> Result<()> {
         .collect()?;
 
     let out = out.column("last")?;
-    assert_eq!(out.get(0), AnyValue::Int32(4));
-    assert_eq!(out.get(1), AnyValue::Int32(0));
+    assert_eq!(out.get(0)?, AnyValue::Int32(4));
+    assert_eq!(out.get(1)?, AnyValue::Int32(0));
 
     Ok(())
 }
 
 #[test]
-fn test_shift_elementwise_issue_2509() -> Result<()> {
+fn test_shift_elementwise_issue_2509() -> PolarsResult<()> {
     let df = df![
         "x"=> [0, 0, 0, 1, 1, 1, 2, 2, 2],
         "y"=> [0, 10, 20, 0, 10, 20, 0, 10, 20]
@@ -422,24 +393,24 @@ fn test_shift_elementwise_issue_2509() -> Result<()> {
         .lazy()
         // Don't use maintain order here! That hides the bug
         .groupby([col("x")])
-        .agg(&[(col("y").shift(-1) + col("x")).list().alias("sum")])
+        .agg(&[(col("y").shift(-1) + col("x")).alias("sum")])
         .sort("x", Default::default())
         .collect()?;
 
     let out = out.explode(["sum"])?;
     let out = out.column("sum")?;
-    assert_eq!(out.get(0), AnyValue::Int32(10));
-    assert_eq!(out.get(1), AnyValue::Int32(20));
-    assert_eq!(out.get(2), AnyValue::Null);
-    assert_eq!(out.get(3), AnyValue::Int32(11));
-    assert_eq!(out.get(4), AnyValue::Int32(21));
-    assert_eq!(out.get(5), AnyValue::Null);
+    assert_eq!(out.get(0)?, AnyValue::Int32(10));
+    assert_eq!(out.get(1)?, AnyValue::Int32(20));
+    assert_eq!(out.get(2)?, AnyValue::Null);
+    assert_eq!(out.get(3)?, AnyValue::Int32(11));
+    assert_eq!(out.get(4)?, AnyValue::Int32(21));
+    assert_eq!(out.get(5)?, AnyValue::Null);
 
     Ok(())
 }
 
 #[test]
-fn take_aggregations() -> Result<()> {
+fn take_aggregations() -> PolarsResult<()> {
     let df = df![
         "user" => ["lucy", "bob", "bob", "lucy", "tim"],
         "book" => ["c", "b", "a", "a", "a"],
@@ -455,9 +426,9 @@ fn take_aggregations() -> Result<()> {
         .collect()?;
 
     let s = out.column("fav_book")?;
-    assert_eq!(s.get(0), AnyValue::Utf8("a"));
-    assert_eq!(s.get(1), AnyValue::Utf8("c"));
-    assert_eq!(s.get(2), AnyValue::Utf8("a"));
+    assert_eq!(s.get(0)?, AnyValue::Utf8("a"));
+    assert_eq!(s.get(1)?, AnyValue::Utf8("c"));
+    assert_eq!(s.get(2)?, AnyValue::Utf8("a"));
 
     let out = df
         .clone()
@@ -466,7 +437,15 @@ fn take_aggregations() -> Result<()> {
         .agg([
             // keep the head as it test slice correctness
             col("book")
-                .take(col("count").arg_sort(true).head(Some(2)))
+                .take(
+                    col("count")
+                        .arg_sort(SortOptions {
+                            descending: true,
+                            nulls_last: false,
+                            multithreaded: true,
+                        })
+                        .head(Some(2)),
+                )
                 .alias("ordered"),
         ])
         .sort("user", Default::default())
@@ -492,12 +471,18 @@ fn take_aggregations() -> Result<()> {
     Ok(())
 }
 #[test]
-fn test_take_consistency() -> Result<()> {
+fn test_take_consistency() -> PolarsResult<()> {
     let df = fruits_cars();
     let out = df
         .clone()
         .lazy()
-        .select([col("A").arg_sort(true).take(lit(0))])
+        .select([col("A")
+            .arg_sort(SortOptions {
+                descending: true,
+                nulls_last: false,
+                multithreaded: true,
+            })
+            .take(lit(0))])
         .collect()?;
 
     let a = out.column("A")?;
@@ -508,7 +493,13 @@ fn test_take_consistency() -> Result<()> {
         .clone()
         .lazy()
         .groupby_stable([col("cars")])
-        .agg([col("A").arg_sort(true).take(lit(0))])
+        .agg([col("A")
+            .arg_sort(SortOptions {
+                descending: true,
+                nulls_last: false,
+                multithreaded: true,
+            })
+            .take(lit(0))])
         .collect()?;
 
     let out = out.column("A")?;
@@ -521,9 +512,24 @@ fn test_take_consistency() -> Result<()> {
         .groupby_stable([col("cars")])
         .agg([
             col("A"),
-            col("A").arg_sort(true).take(lit(0)).alias("1"),
             col("A")
-                .take(col("A").arg_sort(true).take(lit(0)))
+                .arg_sort(SortOptions {
+                    descending: true,
+                    nulls_last: false,
+                    multithreaded: true,
+                })
+                .take(lit(0))
+                .alias("1"),
+            col("A")
+                .take(
+                    col("A")
+                        .arg_sort(SortOptions {
+                            descending: true,
+                            nulls_last: false,
+                            multithreaded: true,
+                        })
+                        .take(lit(0)),
+                )
                 .alias("2"),
         ])
         .collect()?;
@@ -540,7 +546,7 @@ fn test_take_consistency() -> Result<()> {
 }
 
 #[test]
-fn test_take_in_groups() -> Result<()> {
+fn test_take_in_groups() -> PolarsResult<()> {
     let df = fruits_cars();
 
     let out = df
@@ -552,7 +558,6 @@ fn test_take_in_groups() -> Result<()> {
             .alias("taken")])
         .collect()?;
 
-    dbg!(&out);
     assert_eq!(
         Vec::from(out.column("taken")?.i32()?),
         &[Some(3), Some(3), Some(5), Some(5), Some(5)]

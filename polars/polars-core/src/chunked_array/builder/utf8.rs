@@ -1,7 +1,7 @@
 use super::*;
 
 pub struct Utf8ChunkedBuilder {
-    pub builder: MutableUtf8Array<i64>,
+    pub(crate) builder: MutableUtf8Array<i64>,
     pub capacity: usize,
     field: Field,
 }
@@ -40,12 +40,14 @@ impl Utf8ChunkedBuilder {
 
     pub fn finish(mut self) -> Utf8Chunked {
         let arr = self.builder.as_box();
+        let length = arr.len() as IdxSize;
+
         ChunkedArray {
             field: Arc::new(self.field),
             chunks: vec![arr],
             phantom: PhantomData,
-            categorical_map: None,
-            ..Default::default()
+            bit_settings: Default::default(),
+            length,
         }
     }
 

@@ -1,17 +1,22 @@
 pub(crate) mod series;
+mod supertype;
 
-use crate::prelude::*;
-use crate::POOL;
-pub use arrow;
-pub use polars_arrow::utils::TrustMyLength;
-pub use polars_arrow::utils::*;
-pub use rayon;
-use rayon::prelude::*;
 use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
+use arrow::bitmap::Bitmap;
+use num_traits::{One, Zero};
+pub use polars_arrow::utils::{TrustMyLength, *};
+use rayon::prelude::*;
+pub use series::*;
+use smartstring::alias::String as SmartString;
+pub use supertype::*;
+pub use {arrow, rayon};
+
 #[cfg(feature = "private")]
-pub use crate::chunked_array::ops::sort::argsort_no_nulls;
+pub use crate::chunked_array::ops::sort::arg_sort_no_nulls;
+use crate::prelude::*;
+use crate::POOL;
 
 #[repr(transparent)]
 pub struct Wrap<T>(pub T);
@@ -23,7 +28,7 @@ impl<T> Deref for Wrap<T> {
     }
 }
 
-pub(crate) fn set_partition_size() -> usize {
+pub fn _set_partition_size() -> usize {
     let mut n_partitions = POOL.current_num_threads();
     // set n_partitions to closes 2^n above the no of threads.
     loop {
@@ -101,16 +106,17 @@ macro_rules! split_array {
 }
 
 #[cfg(feature = "private")]
-pub fn split_ca<T>(ca: &ChunkedArray<T>, n: usize) -> Result<Vec<ChunkedArray<T>>>
+pub fn split_ca<T>(ca: &ChunkedArray<T>, n: usize) -> PolarsResult<Vec<ChunkedArray<T>>>
 where
-    ChunkedArray<T>: ChunkOps,
+    T: PolarsDataType,
 {
     split_array!(ca, n, i64)
 }
 
 // prefer this one over split_ca, as this can push the null_count into the thread pool
+// returns an `(offset, length)` tuple
 #[doc(hidden)]
-pub fn split_offsets(len: usize, n: usize) -> Vec<(usize, usize)> {
+pub fn _split_offsets(len: usize, n: usize) -> Vec<(usize, usize)> {
     if n == 1 {
         vec![(0, len)]
     } else {
@@ -132,34 +138,50 @@ pub fn split_offsets(len: usize, n: usize) -> Vec<(usize, usize)> {
 
 #[cfg(feature = "private")]
 #[doc(hidden)]
-pub fn split_series(s: &Series, n: usize) -> Result<Vec<Series>> {
+pub fn split_series(s: &Series, n: usize) -> PolarsResult<Vec<Series>> {
     split_array!(s, n, i64)
 }
 
 fn flatten_df(df: &DataFrame) -> impl Iterator<Item = DataFrame> + '_ {
-    df.iter_chunks().map(|chunk| {
-        DataFrame::new_no_checks(
+    df.iter_chunks_physical().flat_map(|chunk| {
+        let df = DataFrame::new_no_checks(
             df.iter()
                 .zip(chunk.into_arrays())
                 .map(|(s, arr)| {
                     // Safety:
                     // datatypes are correct
-                    unsafe {
+                    let mut out = unsafe {
                         Series::from_chunks_and_dtype_unchecked(s.name(), vec![arr], s.dtype())
-                    }
+                    };
+                    out.set_sorted_flag(s.is_sorted_flag());
+                    out
                 })
                 .collect(),
-        )
+        );
+        if df.height() == 0 {
+            None
+        } else {
+            Some(df)
+        }
     })
 }
 
-#[cfg(feature = "private")]
-#[doc(hidden)]
-pub fn split_df(df: &DataFrame, n: usize) -> Result<Vec<DataFrame>> {
-    let total_len = df.height();
-    let chunk_size = total_len / n;
+pub fn flatten_series(s: &Series) -> Vec<Series> {
+    let name = s.name();
+    let dtype = s.dtype();
+    unsafe {
+        s.chunks()
+            .iter()
+            .map(|arr| Series::from_chunks_and_dtype_unchecked(name, vec![arr.clone()], dtype))
+            .collect()
+    }
+}
 
-    if df.n_chunks()? == n
+pub fn split_df_as_ref(df: &DataFrame, n: usize) -> PolarsResult<Vec<DataFrame>> {
+    let total_len = df.height();
+    let chunk_size = std::cmp::max(total_len / n, 3);
+
+    if df.n_chunks() == n
         && df.get_columns()[0]
             .chunk_lengths()
             .all(|len| len.abs_diff(chunk_size) < 100)
@@ -172,12 +194,12 @@ pub fn split_df(df: &DataFrame, n: usize) -> Result<Vec<DataFrame>> {
     for i in 0..n {
         let offset = i * chunk_size;
         let len = if i == (n - 1) {
-            total_len - offset
+            total_len.saturating_sub(offset)
         } else {
             chunk_size
         };
         let df = df.slice((i * chunk_size) as i64, len);
-        if df.n_chunks()? > 1 {
+        if df.n_chunks() > 1 {
             // we add every chunk as separate dataframe. This make sure that every partition
             // deals with it.
             out.extend(flatten_df(&df))
@@ -187,6 +209,18 @@ pub fn split_df(df: &DataFrame, n: usize) -> Result<Vec<DataFrame>> {
     }
 
     Ok(out)
+}
+
+#[cfg(feature = "private")]
+#[doc(hidden)]
+/// Split a [`DataFrame`] into `n` parts. We take a `&mut` to be able to repartition/align chunks.
+pub fn split_df(df: &mut DataFrame, n: usize) -> PolarsResult<Vec<DataFrame>> {
+    if n == 0 || df.height() == 0 {
+        return Ok(vec![df.clone()]);
+    }
+    // make sure that chunks are aligned.
+    df.rechunk();
+    split_df_as_ref(df, n)
 }
 
 pub fn slice_slice<T>(vals: &[T], offset: i64, len: usize) -> &[T] {
@@ -247,9 +281,10 @@ macro_rules! match_dtype_to_physical_apply_macro {
 /// Apply a macro on the Series
 #[macro_export]
 macro_rules! match_dtype_to_logical_apply_macro {
-    ($obj:expr, $macro:ident, $macro_utf8:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
+    ($obj:expr, $macro:ident, $macro_utf8:ident, $macro_binary:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
         match $obj {
             DataType::Utf8 => $macro_utf8!($($opt_args)*),
+            DataType::Binary => $macro_binary!($($opt_args)*),
             DataType::Boolean => $macro_bool!($($opt_args)*),
             #[cfg(feature = "dtype-u8")]
             DataType::UInt8 => $macro!(UInt8Type $(, $opt_args)*),
@@ -296,10 +331,80 @@ macro_rules! match_arrow_data_type_apply_macro_ca {
     }};
 }
 
+#[macro_export]
+macro_rules! with_match_physical_numeric_type {(
+    $dtype:expr, | $_:tt $T:ident | $($body:tt)*
+) => ({
+    macro_rules! __with_ty__ {( $_ $T:ident ) => ( $($body)* )}
+    use $crate::datatypes::DataType::*;
+    match $dtype {
+        Int8 => __with_ty__! { i8 },
+        Int16 => __with_ty__! { i16 },
+        Int32 => __with_ty__! { i32 },
+        Int64 => __with_ty__! { i64 },
+        UInt8 => __with_ty__! { u8 },
+        UInt16 => __with_ty__! { u16 },
+        UInt32 => __with_ty__! { u32 },
+        UInt64 => __with_ty__! { u64 },
+        Float32 => __with_ty__! { f32 },
+        Float64 => __with_ty__! { f64 },
+        _ => unimplemented!()
+    }
+})}
+
+#[macro_export]
+macro_rules! with_match_physical_numeric_polars_type {(
+    $key_type:expr, | $_:tt $T:ident | $($body:tt)*
+) => ({
+    macro_rules! __with_ty__ {( $_ $T:ident ) => ( $($body)* )}
+    use $crate::datatypes::DataType::*;
+    match $key_type {
+            #[cfg(feature = "dtype-i8")]
+        Int8 => __with_ty__! { Int8Type },
+            #[cfg(feature = "dtype-i16")]
+        Int16 => __with_ty__! { Int16Type },
+        Int32 => __with_ty__! { Int32Type },
+        Int64 => __with_ty__! { Int64Type },
+            #[cfg(feature = "dtype-u8")]
+        UInt8 => __with_ty__! { UInt8Type },
+            #[cfg(feature = "dtype-u16")]
+        UInt16 => __with_ty__! { UInt16Type },
+        UInt32 => __with_ty__! { UInt32Type },
+        UInt64 => __with_ty__! { UInt64Type },
+        Float32 => __with_ty__! { Float32Type },
+        Float64 => __with_ty__! { Float64Type },
+        _ => unimplemented!()
+    }
+})}
+
+#[macro_export]
+macro_rules! with_match_physical_integer_polars_type {(
+    $key_type:expr, | $_:tt $T:ident | $($body:tt)*
+) => ({
+    macro_rules! __with_ty__ {( $_ $T:ident ) => ( $($body)* )}
+    use $crate::datatypes::DataType::*;
+    use $crate::datatypes::*;
+    match $key_type {
+            #[cfg(feature = "dtype-i8")]
+        Int8 => __with_ty__! { Int8Type },
+            #[cfg(feature = "dtype-i16")]
+        Int16 => __with_ty__! { Int16Type },
+        Int32 => __with_ty__! { Int32Type },
+        Int64 => __with_ty__! { Int64Type },
+            #[cfg(feature = "dtype-u8")]
+        UInt8 => __with_ty__! { UInt8Type },
+            #[cfg(feature = "dtype-u16")]
+        UInt16 => __with_ty__! { UInt16Type },
+        UInt32 => __with_ty__! { UInt32Type },
+        UInt64 => __with_ty__! { UInt64Type },
+        _ => unimplemented!()
+    }
+})}
+
 /// Apply a macro on the Downcasted ChunkedArray's of DataTypes that are logical numerics.
 /// So no logical.
 #[macro_export]
-macro_rules! match_arrow_data_type_apply_macro_ca_logical_num {
+macro_rules! downcast_as_macro_arg_physical {
     ($self:expr, $macro:ident $(, $opt_args:expr)*) => {{
         match $self.dtype() {
             #[cfg(feature = "dtype-u8")]
@@ -316,6 +421,62 @@ macro_rules! match_arrow_data_type_apply_macro_ca_logical_num {
             DataType::Int64 => $macro!($self.i64().unwrap() $(, $opt_args)*),
             DataType::Float32 => $macro!($self.f32().unwrap() $(, $opt_args)*),
             DataType::Float64 => $macro!($self.f64().unwrap() $(, $opt_args)*),
+            dt => panic!("not implemented for {:?}", dt),
+        }
+    }};
+}
+
+/// Apply a macro on the Downcasted ChunkedArray's of DataTypes that are logical numerics.
+/// So no logical.
+#[macro_export]
+macro_rules! downcast_as_macro_arg_physical_mut {
+    ($self:expr, $macro:ident $(, $opt_args:expr)*) => {{
+        // clone so that we do not borrow
+        match $self.dtype().clone() {
+            #[cfg(feature = "dtype-u8")]
+            DataType::UInt8 => {
+                let ca: &mut UInt8Chunked = $self.as_mut();
+                $macro!(UInt8Type, ca $(, $opt_args)*)
+            },
+            #[cfg(feature = "dtype-u16")]
+            DataType::UInt16 => {
+                let ca: &mut UInt16Chunked = $self.as_mut();
+                $macro!(UInt16Type, ca $(, $opt_args)*)
+            },
+            DataType::UInt32 => {
+                let ca: &mut UInt32Chunked = $self.as_mut();
+                $macro!(UInt32Type, ca $(, $opt_args)*)
+            },
+            DataType::UInt64 => {
+                let ca: &mut UInt64Chunked = $self.as_mut();
+                $macro!(UInt64Type, ca $(, $opt_args)*)
+            },
+            #[cfg(feature = "dtype-i8")]
+            DataType::Int8 => {
+                let ca: &mut Int8Chunked = $self.as_mut();
+                $macro!(Int8Type, ca $(, $opt_args)*)
+            },
+            #[cfg(feature = "dtype-i16")]
+            DataType::Int16 => {
+                let ca: &mut Int16Chunked = $self.as_mut();
+                $macro!(Int16Type, ca $(, $opt_args)*)
+            },
+            DataType::Int32 => {
+                let ca: &mut Int32Chunked = $self.as_mut();
+                $macro!(Int32Type, ca $(, $opt_args)*)
+            },
+            DataType::Int64 => {
+                let ca: &mut Int64Chunked = $self.as_mut();
+                $macro!(Int64Type, ca $(, $opt_args)*)
+            },
+            DataType::Float32 => {
+                let ca: &mut Float32Chunked = $self.as_mut();
+                $macro!(Float32Type, ca $(, $opt_args)*)
+            },
+            DataType::Float64 => {
+                let ca: &mut Float64Chunked = $self.as_mut();
+                $macro!(Float64Type, ca $(, $opt_args)*)
+            },
             dt => panic!("not implemented for {:?}", dt),
         }
     }};
@@ -341,6 +502,7 @@ macro_rules! apply_method_all_arrow_series {
             DataType::Int64 => $self.i64().unwrap().$method($($args),*),
             DataType::Float32 => $self.f32().unwrap().$method($($args),*),
             DataType::Float64 => $self.f64().unwrap().$method($($args),*),
+            DataType::Time => $self.time().unwrap().$method($($args),*),
             DataType::Date => $self.date().unwrap().$method($($args),*),
             DataType::Datetime(_, _) => $self.datetime().unwrap().$method($($args),*),
             DataType::List(_) => $self.list().unwrap().$method($($args),*),
@@ -387,7 +549,7 @@ macro_rules! apply_method_physical_numeric {
 macro_rules! df {
     ($($col_name:expr => $slice:expr), + $(,)?) => {
         {
-            DataFrame::new(vec![$(Series::new($col_name, $slice),)+])
+            $crate::prelude::DataFrame::new(vec![$($crate::prelude::Series::new($col_name, $slice),)+])
         }
     }
 }
@@ -402,387 +564,6 @@ pub fn get_time_units(tu_l: &TimeUnit, tu_r: &TimeUnit) -> TimeUnit {
     }
 }
 
-/// Given two datatypes, determine the supertype that both types can safely be cast to
-#[cfg(feature = "private")]
-pub fn get_supertype(l: &DataType, r: &DataType) -> Result<DataType> {
-    match _get_supertype(l, r) {
-        Some(dt) => Ok(dt),
-        None => _get_supertype(r, l).ok_or_else(|| {
-            PolarsError::ComputeError(
-                format!("Failed to determine supertype of {:?} and {:?}", l, r).into(),
-            )
-        }),
-    }
-}
-
-/// Given two datatypes, determine the supertype that both types can safely be cast to
-fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
-    use DataType::*;
-    if l == r {
-        return Some(l.clone());
-    }
-
-    match (l, r) {
-        #[cfg(feature = "dtype-i8")]
-        (Int8, Boolean) => Some(Int8),
-        //(Int8, Int8) => Some(Int8),
-        #[cfg(all(feature = "dtype-i8", feature = "dtype-i16"))]
-        (Int8, Int16) => Some(Int16),
-        #[cfg(feature = "dtype-i8")]
-        (Int8, Int32) => Some(Int32),
-        #[cfg(feature = "dtype-i8")]
-        (Int8, Int64) => Some(Int64),
-        #[cfg(all(feature = "dtype-i8", feature = "dtype-i16"))]
-        (Int8, UInt8) => Some(Int16),
-        #[cfg(all(feature = "dtype-i8", feature = "dtype-u16"))]
-        (Int8, UInt16) => Some(Int32),
-        #[cfg(feature = "dtype-i8")]
-        (Int8, UInt32) => Some(Int64),
-        #[cfg(feature = "dtype-i8")]
-        (Int8, UInt64) => Some(Float64), // Follow numpy
-        #[cfg(feature = "dtype-i8")]
-        (Int8, Float32) => Some(Float32),
-        #[cfg(feature = "dtype-i8")]
-        (Int8, Float64) => Some(Float64),
-
-        #[cfg(feature = "dtype-i16")]
-        (Int16, Boolean) => Some(Int16),
-        #[cfg(all(feature = "dtype-i16", feature = "dtype-i8"))]
-        (Int16, Int8) => Some(Int16),
-        //(Int16, Int16) => Some(Int16),
-        #[cfg(feature = "dtype-i16")]
-        (Int16, Int32) => Some(Int32),
-        #[cfg(feature = "dtype-i16")]
-        (Int16, Int64) => Some(Int64),
-        #[cfg(all(feature = "dtype-i16", feature = "dtype-u8"))]
-        (Int16, UInt8) => Some(Int16),
-        #[cfg(all(feature = "dtype-i16", feature = "dtype-u16"))]
-        (Int16, UInt16) => Some(Int32),
-        #[cfg(feature = "dtype-i16")]
-        (Int16, UInt32) => Some(Int64),
-        #[cfg(feature = "dtype-i16")]
-        (Int16, UInt64) => Some(Float64), // Follow numpy
-        #[cfg(feature = "dtype-i16")]
-        (Int16, Float32) => Some(Float32),
-        #[cfg(feature = "dtype-i16")]
-        (Int16, Float64) => Some(Float64),
-
-        (Int32, Boolean) => Some(Int32),
-        #[cfg(feature = "dtype-i8")]
-        (Int32, Int8) => Some(Int32),
-        #[cfg(feature = "dtype-i16")]
-        (Int32, Int16) => Some(Int32),
-        //(Int32, Int32) => Some(Int32),
-        (Int32, Int64) => Some(Int64),
-        #[cfg(feature = "dtype-u8")]
-        (Int32, UInt8) => Some(Int32),
-        #[cfg(feature = "dtype-u16")]
-        (Int32, UInt16) => Some(Int32),
-        (Int32, UInt32) => Some(Int64),
-        #[cfg(not(feature = "bigidx"))]
-        (Int32, UInt64) => Some(Float64), // Follow numpy
-        #[cfg(feature = "bigidx")]
-        (Int32, UInt64) => Some(Int64), // Needed for bigidx
-        (Int32, Float32) => Some(Float64), // Follow numpy
-        (Int32, Float64) => Some(Float64),
-
-        (Int64, Boolean) => Some(Int64),
-        #[cfg(feature = "dtype-i8")]
-        (Int64, Int8) => Some(Int64),
-        #[cfg(feature = "dtype-i16")]
-        (Int64, Int16) => Some(Int64),
-        (Int64, Int32) => Some(Int64),
-        //(Int64, Int64) => Some(Int64),
-        #[cfg(feature = "dtype-u8")]
-        (Int64, UInt8) => Some(Int64),
-        #[cfg(feature = "dtype-u16")]
-        (Int64, UInt16) => Some(Int64),
-        (Int64, UInt32) => Some(Int64),
-        #[cfg(not(feature = "bigidx"))]
-        (Int64, UInt64) => Some(Float64), // Follow numpy
-        #[cfg(feature = "bigidx")]
-        (Int64, UInt64) => Some(Int64), // Needed for bigidx
-        (Int64, Float32) => Some(Float64), // Follow numpy
-        (Int64, Float64) => Some(Float64),
-
-        #[cfg(feature = "dtype-u8")]
-        (UInt8, Boolean) => Some(UInt8),
-        #[cfg(all(feature = "dtype-u8", feature = "dtype-i8"))]
-        (UInt8, Int8) => Some(Int16),
-        #[cfg(all(feature = "dtype-u8", feature = "dtype-i16"))]
-        (UInt8, Int16) => Some(Int16),
-        #[cfg(feature = "dtype-u8")]
-        (UInt8, Int32) => Some(Int32),
-        #[cfg(feature = "dtype-u8")]
-        (UInt8, Int64) => Some(Int64),
-        //(UInt8, UInt8) => Some(UInt8),
-        #[cfg(all(feature = "dtype-u8", feature = "dtype-u16"))]
-        (UInt8, UInt16) => Some(UInt16),
-        #[cfg(feature = "dtype-u8")]
-        (UInt8, UInt32) => Some(UInt32),
-        #[cfg(feature = "dtype-u8")]
-        (UInt8, UInt64) => Some(UInt64),
-        #[cfg(feature = "dtype-u8")]
-        (UInt8, Float32) => Some(Float32),
-        #[cfg(feature = "dtype-u8")]
-        (UInt8, Float64) => Some(Float64),
-
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, Boolean) => Some(UInt16),
-        #[cfg(all(feature = "dtype-u16", feature = "dtype-i8"))]
-        (UInt16, Int8) => Some(Int32),
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, Int16) => Some(Int32),
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, Int32) => Some(Int32),
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, Int64) => Some(Int64),
-        #[cfg(all(feature = "dtype-u16", feature = "dtype-u8"))]
-        (UInt16, UInt8) => Some(UInt16),
-        //(UInt16, UInt16) => Some(UInt16),
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, UInt32) => Some(UInt32),
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, UInt64) => Some(UInt64),
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, Float32) => Some(Float32),
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, Float64) => Some(Float64),
-
-        (UInt32, Boolean) => Some(UInt32),
-        #[cfg(feature = "dtype-i8")]
-        (UInt32, Int8) => Some(Int64),
-        #[cfg(feature = "dtype-i16")]
-        (UInt32, Int16) => Some(Int64),
-        (UInt32, Int32) => Some(Int64),
-        (UInt32, Int64) => Some(Int64),
-        #[cfg(feature = "dtype-u8")]
-        (UInt32, UInt8) => Some(UInt32),
-        #[cfg(feature = "dtype-u16")]
-        (UInt32, UInt16) => Some(UInt32),
-        //(UInt32, UInt32) => Some(UInt32),
-        (UInt32, UInt64) => Some(UInt64),
-        (UInt32, Float32) => Some(Float64), // Follow numpy
-        (UInt32, Float64) => Some(Float64),
-
-        (UInt64, Boolean) => Some(UInt64),
-        #[cfg(feature = "dtype-i8")]
-        (UInt64, Int8) => Some(Float64), // Follow numpy
-        #[cfg(feature = "dtype-i16")]
-        (UInt64, Int16) => Some(Float64), // Follow numpy
-        #[cfg(not(feature = "bigidx"))]
-        (UInt64, Int32) => Some(Float64), // Follow numpy
-        #[cfg(feature = "bigidx")]
-        (UInt64, Int32) => Some(Int64), // Needed for bigidx
-        #[cfg(not(feature = "bigidx"))]
-        (UInt64, Int64) => Some(Float64), // Follow numpy
-        #[cfg(feature = "bigidx")]
-        (UInt64, Int64) => Some(Int64), // Needed for bigidx
-        #[cfg(feature = "dtype-u8")]
-        (UInt64, UInt8) => Some(UInt64),
-        #[cfg(feature = "dtype-u16")]
-        (UInt64, UInt16) => Some(UInt64),
-        (UInt64, UInt32) => Some(UInt64),
-        //(UInt64, UInt64) => Some(UInt64),
-        (UInt64, Float32) => Some(Float64), // Follow numpy
-        (UInt64, Float64) => Some(Float64),
-
-        (Float32, Boolean) => Some(Float32),
-        #[cfg(feature = "dtype-i8")]
-        (Float32, Int8) => Some(Float32),
-        #[cfg(feature = "dtype-i16")]
-        (Float32, Int16) => Some(Float32),
-        (Float32, Int32) => Some(Float64),
-        (Float32, Int64) => Some(Float64),
-        #[cfg(feature = "dtype-u8")]
-        (Float32, UInt8) => Some(Float32),
-        #[cfg(feature = "dtype-u16")]
-        (Float32, UInt16) => Some(Float32),
-        (Float32, UInt32) => Some(Float64),
-        (Float32, UInt64) => Some(Float64),
-        //(Float32, Float32) => Some(Float32),
-        (Float32, Float64) => Some(Float64),
-
-        (Float64, Boolean) => Some(Float64),
-        #[cfg(feature = "dtype-i8")]
-        (Float64, Int8) => Some(Float64),
-        #[cfg(feature = "dtype-i16")]
-        (Float64, Int16) => Some(Float64),
-        (Float64, Int32) => Some(Float64),
-        (Float64, Int64) => Some(Float64),
-        #[cfg(feature = "dtype-u8")]
-        (Float64, UInt8) => Some(Float64),
-        #[cfg(feature = "dtype-u16")]
-        (Float64, UInt16) => Some(Float64),
-        (Float64, UInt32) => Some(Float64),
-        (Float64, UInt64) => Some(Float64),
-        (Float64, Float32) => Some(Float64),
-        //(Float64, Float64) => Some(Float64),
-
-        // Time related dtypes
-        #[cfg(feature = "dtype-date")]
-        (UInt32, Date) => Some(Int64),
-        #[cfg(feature = "dtype-datetime")]
-        (UInt32, Datetime(_, _)) => Some(Int64),
-        #[cfg(feature = "dtype-duration")]
-        (UInt32, Duration(_)) => Some(Int64),
-        #[cfg(feature = "dtype-time")]
-        (UInt32, Time) => Some(Int64),
-
-        #[cfg(feature = "dtype-date")]
-        (Int32, Date) => Some(Int32),
-        #[cfg(feature = "dtype-datetime")]
-        (Int32, Datetime(_, _)) => Some(Int64),
-        #[cfg(feature = "dtype-duration")]
-        (Int32, Duration(_)) => Some(Int64),
-        #[cfg(feature = "dtype-time")]
-        (Int32, Time) => Some(Int64),
-
-        #[cfg(feature = "dtype-datetime")]
-        (Int64, Datetime(_, _)) => Some(Int64),
-        #[cfg(feature = "dtype-duration")]
-        (Int64, Duration(_)) => Some(Int64),
-        #[cfg(feature = "dtype-date")]
-        (Int64, Date) => Some(Int64),
-        #[cfg(feature = "dtype-time")]
-        (Int64, Time) => Some(Int64),
-
-        #[cfg(feature = "dtype-date")]
-        (Float32, Date) => Some(Float32),
-        #[cfg(feature = "dtype-datetime")]
-        (Float32, Datetime(_, _)) => Some(Float64),
-        #[cfg(feature = "dtype-duration")]
-        (Float32, Duration(_)) => Some(Float64),
-        #[cfg(feature = "dtype-time")]
-        (Float32, Time) => Some(Float64),
-
-        #[cfg(feature = "dtype-date")]
-        (Float64, Date) => Some(Float64),
-        #[cfg(feature = "dtype-datetime")]
-        (Float64, Datetime(_, _)) => Some(Float64),
-        #[cfg(feature = "dtype-duration")]
-        (Float64, Duration(_)) => Some(Float64),
-        #[cfg(feature = "dtype-time")]
-        (Float64, Time) => Some(Float64),
-
-        #[cfg(feature = "dtype-date")]
-        (Date, UInt32) => Some(Int64),
-        #[cfg(feature = "dtype-date")]
-        (Date, UInt64) => Some(Int64),
-        #[cfg(feature = "dtype-date")]
-        (Date, Int32) => Some(Int32),
-        #[cfg(feature = "dtype-date")]
-        (Date, Int64) => Some(Int64),
-        #[cfg(feature = "dtype-date")]
-        (Date, Float32) => Some(Float32),
-        #[cfg(feature = "dtype-date")]
-        (Date, Float64) => Some(Float64),
-        #[cfg(all(feature = "dtype-date", feature = "dtype-datetime"))]
-        (Date, Datetime(tu, tz)) => Some(Datetime(*tu, tz.clone())),
-
-        #[cfg(feature = "dtype-datetime")]
-        (Datetime(_, _), UInt32) => Some(Int64),
-        #[cfg(feature = "dtype-datetime")]
-        (Datetime(_, _), UInt64) => Some(Int64),
-        #[cfg(feature = "dtype-datetime")]
-        (Datetime(_, _), Int32) => Some(Int64),
-        #[cfg(feature = "dtype-datetime")]
-        (Datetime(_, _), Int64) => Some(Int64),
-        #[cfg(feature = "dtype-datetime")]
-        (Datetime(_, _), Float32) => Some(Float64),
-        #[cfg(feature = "dtype-datetime")]
-        (Datetime(_, _), Float64) => Some(Float64),
-        #[cfg(all(feature = "dtype-datetime", feature = "dtype=date"))]
-        (Datetime(tu, tz), Date) => Some(Datetime(*tu, tz.clone())),
-
-        #[cfg(feature = "dtype-duration")]
-        (Duration(_), UInt32) => Some(Int64),
-        #[cfg(feature = "dtype-duration")]
-        (Duration(_), UInt64) => Some(Int64),
-        #[cfg(feature = "dtype-duration")]
-        (Duration(_), Int32) => Some(Int64),
-        #[cfg(feature = "dtype-duration")]
-        (Duration(_), Int64) => Some(Int64),
-        #[cfg(feature = "dtype-duration")]
-        (Duration(_), Float32) => Some(Float64),
-        #[cfg(feature = "dtype-duration")]
-        (Duration(_), Float64) => Some(Float64),
-
-        #[cfg(feature = "dtype-time")]
-        (Time, Int32) => Some(Int64),
-        #[cfg(feature = "dtype-time")]
-        (Time, Int64) => Some(Int64),
-        #[cfg(feature = "dtype-time")]
-        (Time, Float32) => Some(Float64),
-        #[cfg(feature = "dtype-time")]
-        (Time, Float64) => Some(Float64),
-
-        #[cfg(all(feature = "dtype-time", feature = "dtype-datetime"))]
-        (Time, Datetime(_, _)) => Some(Int64),
-        #[cfg(all(feature = "dtype-datetime", feature = "dtype-time"))]
-        (Datetime(_, _), Time) => Some(Int64),
-        #[cfg(all(feature = "dtype-time", feature = "dtype-date"))]
-        (Time, Date) => Some(Int64),
-        #[cfg(all(feature = "dtype-date", feature = "dtype-time"))]
-        (Date, Time) => Some(Int64),
-
-        (Utf8, _) => Some(Utf8),
-        (_, Utf8) => Some(Utf8),
-
-        (Boolean, Boolean) => Some(Boolean),
-        #[cfg(feature = "dtype-i8")]
-        (Boolean, Int8) => Some(Int8),
-        #[cfg(feature = "dtype-i16")]
-        (Boolean, Int16) => Some(Int16),
-        (Boolean, Int32) => Some(Int32),
-        (Boolean, Int64) => Some(Int64),
-        #[cfg(feature = "dtype-u8")]
-        (Boolean, UInt8) => Some(UInt8),
-        #[cfg(feature = "dtype-u16")]
-        (Boolean, UInt16) => Some(UInt16),
-        (Boolean, UInt32) => Some(UInt32),
-        (Boolean, UInt64) => Some(UInt64),
-        (Boolean, Float32) => Some(Float32),
-        (Boolean, Float64) => Some(Float64),
-
-        (dt, Null) => Some(dt.clone()),
-        (Null, dt) => Some(dt.clone()),
-
-        #[cfg(all(feature = "dtype-duration", feature = "dtype-datetime"))]
-        (Duration(lu), Datetime(ru, Some(tz))) | (Datetime(lu, Some(tz)), Duration(ru)) => {
-            if tz.is_empty() {
-                Some(Datetime(get_time_units(lu, ru), None))
-            } else {
-                Some(Datetime(get_time_units(lu, ru), Some(tz.clone())))
-            }
-        }
-        #[cfg(all(feature = "dtype-duration", feature = "dtype-datetime"))]
-        (Duration(lu), Datetime(ru, None)) | (Datetime(lu, None), Duration(ru)) => {
-            Some(Datetime(get_time_units(lu, ru), None))
-        }
-        #[cfg(all(feature = "dtype-duration", feature = "dtype-date"))]
-        (Duration(_), Date) | (Date, Duration(_)) => Some(Datetime(TimeUnit::Milliseconds, None)),
-        #[cfg(feature = "dtype-duration")]
-        (Duration(lu), Duration(ru)) => Some(Duration(get_time_units(lu, ru))),
-
-        // None and Some("") timezones
-        // we cast from more precision to higher precision as that always fits with occasional loss of precision
-        #[cfg(feature = "dtype-datetime")]
-        (Datetime(tu_l, tz_l), Datetime(tu_r, tz_r))
-            if (tz_l.is_none() || tz_l.as_deref() == Some(""))
-                && (tz_r.is_none() || tz_r.as_deref() == Some("")) =>
-        {
-            let tu = get_time_units(tu_l, tu_r);
-            Some(Datetime(tu, None))
-        }
-        (List(inner), other) | (other, List(inner)) => {
-            let st = _get_supertype(inner, other)?;
-            Some(DataType::List(Box::new(st)))
-        }
-        _ => None,
-    }
-}
-
 /// This takes ownership of the DataFrame so that drop is called earlier.
 /// Does not check if schema is correct
 pub fn accumulate_dataframes_vertical_unchecked<I>(dfs: I) -> DataFrame
@@ -790,7 +571,10 @@ where
     I: IntoIterator<Item = DataFrame>,
 {
     let mut iter = dfs.into_iter();
+    let additional = iter.size_hint().0;
     let mut acc_df = iter.next().unwrap();
+    acc_df.reserve_chunks(additional);
+
     for df in iter {
         acc_df.vstack_mut_unchecked(&df);
     }
@@ -798,12 +582,14 @@ where
 }
 
 /// This takes ownership of the DataFrame so that drop is called earlier.
-pub fn accumulate_dataframes_vertical<I>(dfs: I) -> Result<DataFrame>
+pub fn accumulate_dataframes_vertical<I>(dfs: I) -> PolarsResult<DataFrame>
 where
     I: IntoIterator<Item = DataFrame>,
 {
     let mut iter = dfs.into_iter();
+    let additional = iter.size_hint().0;
     let mut acc_df = iter.next().unwrap();
+    acc_df.reserve_chunks(additional);
     for df in iter {
         acc_df.vstack_mut(&df)?;
     }
@@ -811,19 +597,36 @@ where
 }
 
 /// Concat the DataFrames to a single DataFrame.
-pub fn concat_df<'a, I>(dfs: I) -> Result<DataFrame>
+pub fn concat_df<'a, I>(dfs: I) -> PolarsResult<DataFrame>
 where
     I: IntoIterator<Item = &'a DataFrame>,
 {
     let mut iter = dfs.into_iter();
+    let additional = iter.size_hint().0;
     let mut acc_df = iter.next().unwrap().clone();
+    acc_df.reserve_chunks(additional);
     for df in iter {
         acc_df.vstack_mut(df)?;
     }
     Ok(acc_df)
 }
 
-pub fn accumulate_dataframes_horizontal(dfs: Vec<DataFrame>) -> Result<DataFrame> {
+/// Concat the DataFrames to a single DataFrame.
+pub fn concat_df_unchecked<'a, I>(dfs: I) -> DataFrame
+where
+    I: IntoIterator<Item = &'a DataFrame>,
+{
+    let mut iter = dfs.into_iter();
+    let additional = iter.size_hint().0;
+    let mut acc_df = iter.next().unwrap().clone();
+    acc_df.reserve_chunks(additional);
+    for df in iter {
+        acc_df.vstack_mut_unchecked(df);
+    }
+    acc_df
+}
+
+pub fn accumulate_dataframes_horizontal(dfs: Vec<DataFrame>) -> PolarsResult<DataFrame> {
     let mut iter = dfs.into_iter();
     let mut acc_df = iter.next().unwrap();
     for df in iter {
@@ -835,12 +638,16 @@ pub fn accumulate_dataframes_horizontal(dfs: Vec<DataFrame>) -> Result<DataFrame
 /// Simple wrapper to parallelize functions that can be divided over threads aggregated and
 /// finally aggregated in the main thread. This can be done for sum, min, max, etc.
 #[cfg(feature = "private")]
-pub fn parallel_op_series<F>(f: F, s: Series, n_threads: Option<usize>) -> Result<Series>
+pub fn parallel_op_series<F>(
+    f: F,
+    s: Series,
+    n_threads: Option<usize>,
+) -> PolarsResult<Option<Series>>
 where
-    F: Fn(Series) -> Result<Series> + Send + Sync,
+    F: Fn(Series) -> PolarsResult<Series> + Send + Sync,
 {
     let n_threads = n_threads.unwrap_or_else(|| POOL.current_num_threads());
-    let splits = split_offsets(s.len(), n_threads);
+    let splits = _split_offsets(s.len(), n_threads);
 
     let chunks = POOL.install(|| {
         splits
@@ -849,7 +656,7 @@ where
                 let s = s.slice(offset as i64, len);
                 f(s)
             })
-            .collect::<Result<Vec<_>>>()
+            .collect::<PolarsResult<Vec<_>>>()
     })?;
 
     let mut iter = chunks.into_iter();
@@ -859,16 +666,14 @@ where
         acc
     });
 
-    f(out)
+    f(out).map(Some)
 }
 
-pub(crate) fn align_chunks_binary<'a, T, B>(
+pub fn align_chunks_binary<'a, T, B>(
     left: &'a ChunkedArray<T>,
     right: &'a ChunkedArray<B>,
 ) -> (Cow<'a, ChunkedArray<T>>, Cow<'a, ChunkedArray<B>>)
 where
-    ChunkedArray<B>: ChunkOps,
-    ChunkedArray<T>: ChunkOps,
     B: PolarsDataType,
     T: PolarsDataType,
 {
@@ -908,8 +713,6 @@ pub(crate) fn align_chunks_binary_owned<T, B>(
     right: ChunkedArray<B>,
 ) -> (ChunkedArray<T>, ChunkedArray<B>)
 where
-    ChunkedArray<B>: ChunkOps,
-    ChunkedArray<T>: ChunkOps,
     B: PolarsDataType,
     T: PolarsDataType,
 {
@@ -922,6 +725,7 @@ where
 }
 
 #[allow(clippy::type_complexity)]
+#[cfg(feature = "zip_with")]
 pub(crate) fn align_chunks_ternary<'a, A, B, C>(
     a: &'a ChunkedArray<A>,
     b: &'a ChunkedArray<B>,
@@ -932,13 +736,12 @@ pub(crate) fn align_chunks_ternary<'a, A, B, C>(
     Cow<'a, ChunkedArray<C>>,
 )
 where
-    ChunkedArray<A>: ChunkOps,
-    ChunkedArray<B>: ChunkOps,
-    ChunkedArray<C>: ChunkOps,
     A: PolarsDataType,
     B: PolarsDataType,
     C: PolarsDataType,
 {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(b.len(), c.len());
     match (a.chunks.len(), b.chunks.len(), c.chunks.len()) {
         (1, 1, 1) => (Cow::Borrowed(a), Cow::Borrowed(b), Cow::Borrowed(c)),
         (_, 1, 1) => (
@@ -1022,6 +825,16 @@ where
     }
 }
 
+impl<I, S> IntoVec<SmartString> for I
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    fn into_vec(self) -> Vec<SmartString> {
+        self.into_iter().map(|s| s.as_ref().into()).collect()
+    }
+}
+
 /// This logic is same as the impl on ChunkedArray
 /// The difference is that there is less indirection because the caller should preallocate
 /// `chunk_lens` once. On the `ChunkedArray` we indirect through an `ArrayRef` which is an indirection
@@ -1029,30 +842,39 @@ where
 #[inline]
 pub(crate) fn index_to_chunked_index<
     I: Iterator<Item = Idx>,
-    Idx: PartialOrd + std::ops::AddAssign + std::ops::SubAssign + num::Zero + num::One,
+    Idx: PartialOrd + std::ops::AddAssign + std::ops::SubAssign + Zero + One,
 >(
     chunk_lens: I,
     index: Idx,
 ) -> (Idx, Idx) {
     let mut index_remainder = index;
-    let mut current_chunk_idx = num::Zero::zero();
+    let mut current_chunk_idx = Zero::zero();
 
     for chunk_len in chunk_lens {
         if chunk_len > index_remainder {
             break;
         } else {
             index_remainder -= chunk_len;
-            current_chunk_idx += num::One::one();
+            current_chunk_idx += One::one();
         }
     }
     (current_chunk_idx, index_remainder)
 }
 
-/// # SAFETY
-/// `dst` must be valid for `dst.len()` elements, and `src` and `dst` may not overlap.
-#[inline]
-pub(crate) unsafe fn copy_from_slice_unchecked<T>(src: &[T], dst: &mut [T]) {
-    std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), dst.len());
+#[cfg(feature = "dtype-struct")]
+pub(crate) fn index_to_chunked_index2(chunks: &[ArrayRef], index: usize) -> (usize, usize) {
+    let mut index_remainder = index;
+    let mut current_chunk_idx = 0;
+
+    for chunk in chunks {
+        if chunk.len() > index_remainder {
+            break;
+        } else {
+            index_remainder -= chunk.len();
+            current_chunk_idx += 1;
+        }
+    }
+    (current_chunk_idx, index_remainder)
 }
 
 #[cfg(feature = "chunked_ids")]
@@ -1064,6 +886,91 @@ pub(crate) fn create_chunked_index_mapping(chunks: &[ArrayRef], len: usize) -> V
     }
 
     vals
+}
+
+pub(crate) fn first_non_null<'a, I>(iter: I) -> Option<usize>
+where
+    I: Iterator<Item = Option<&'a Bitmap>>,
+{
+    let mut offset = 0;
+    for validity in iter {
+        if let Some(validity) = validity {
+            for (idx, is_valid) in validity.iter().enumerate() {
+                if is_valid {
+                    return Some(offset + idx);
+                }
+            }
+            offset += validity.len()
+        } else {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+pub(crate) fn last_non_null<'a, I>(iter: I, len: usize) -> Option<usize>
+where
+    I: DoubleEndedIterator<Item = Option<&'a Bitmap>>,
+{
+    if len == 0 {
+        return None;
+    }
+    let mut offset = 0;
+    let len = len - 1;
+    for validity in iter.rev() {
+        if let Some(validity) = validity {
+            for (idx, is_valid) in validity.iter().rev().enumerate() {
+                if is_valid {
+                    return Some(len - (offset + idx));
+                }
+            }
+            offset += validity.len()
+        } else {
+            return Some(len - offset);
+        }
+    }
+    None
+}
+
+/// ensure that nulls are propagated to both arrays
+pub fn coalesce_nulls<'a, T: PolarsDataType>(
+    a: &'a ChunkedArray<T>,
+    b: &'a ChunkedArray<T>,
+) -> (Cow<'a, ChunkedArray<T>>, Cow<'a, ChunkedArray<T>>) {
+    if a.null_count() > 0 || b.null_count() > 0 {
+        let (a, b) = align_chunks_binary(a, b);
+        let mut b = b.into_owned();
+        let a = a.coalesce_nulls(b.chunks());
+
+        for arr in a.chunks().iter() {
+            for arr_b in unsafe { b.chunks_mut() } {
+                *arr_b = arr_b.with_validity(arr.validity().cloned())
+            }
+        }
+        (Cow::Owned(a), Cow::Owned(b))
+    } else {
+        (Cow::Borrowed(a), Cow::Borrowed(b))
+    }
+}
+
+pub fn coalesce_nulls_series(a: &Series, b: &Series) -> (Series, Series) {
+    if a.null_count() > 0 || b.null_count() > 0 {
+        let mut a = a.rechunk();
+        let mut b = b.rechunk();
+        for (arr_a, arr_b) in unsafe { a.chunks_mut().iter_mut().zip(b.chunks_mut()) } {
+            let validity = match (arr_a.validity(), arr_b.validity()) {
+                (None, Some(b)) => Some(b.clone()),
+                (Some(a), Some(b)) => Some(a & b),
+                (Some(a), None) => Some(a.clone()),
+                (None, None) => None,
+            };
+            *arr_a = arr_a.with_validity(validity.clone());
+            *arr_b = arr_b.with_validity(validity);
+        }
+        (a, b)
+    } else {
+        (a.clone(), b.clone())
+    }
 }
 
 #[cfg(test)]

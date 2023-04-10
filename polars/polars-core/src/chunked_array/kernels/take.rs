@@ -1,9 +1,11 @@
-use crate::prelude::*;
+use std::convert::TryFrom;
+
 use arrow::bitmap::MutableBitmap;
 use polars_arrow::array::PolarsArray;
 use polars_arrow::bit_util::unset_bit_raw;
-use polars_arrow::kernels::take::take_value_indices_from_list;
-use std::convert::TryFrom;
+use polars_arrow::compute::take::take_value_indices_from_list;
+
+use crate::prelude::*;
 
 /// Take kernel for multiple chunks. We directly return a ChunkedArray because that path chooses the fastest collection path.
 pub(crate) fn take_primitive_iter_n_chunks<T: PolarsNumericType, I: IntoIterator<Item = usize>>(
@@ -75,7 +77,8 @@ pub(crate) unsafe fn take_list_unchecked(
         } else {
             None
         };
+    let dtype = ListArray::<i64>::default_datatype(taken.data_type().clone());
     // Safety:
     // offsets are monotonically increasing
-    ListArray::new_unchecked(values.data_type().clone(), offsets.into(), taken, validity)
+    ListArray::new(dtype, offsets.into(), taken, validity)
 }

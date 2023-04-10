@@ -1,41 +1,43 @@
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(feature = "simd", feature(portable_simd))]
+#![allow(ambiguous_glob_reexports)]
 extern crate core;
+
 #[macro_use]
 pub mod utils;
 pub mod chunked_array;
+pub mod cloud;
+pub mod config;
 pub mod datatypes;
 #[cfg(feature = "docs")]
 pub mod doc;
 pub mod error;
 pub mod export;
-mod fmt;
+pub mod fmt;
 pub mod frame;
 pub mod functions;
+pub(crate) mod hashing;
 mod named_from;
 pub mod prelude;
 pub mod schema;
 #[cfg(feature = "serde")]
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 pub mod serde;
 pub mod series;
 pub mod testing;
 #[cfg(test)]
 mod tests;
-pub(crate) mod vector_hasher;
 
-use once_cell::sync::Lazy;
-
-#[cfg(feature = "object")]
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use hashing::IdBuildHasher;
+use once_cell::sync::Lazy;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::sync::Mutex;
 
 #[cfg(feature = "dtype-categorical")]
 pub use crate::chunked_array::logical::categorical::stringcache::*;
 
-#[cfg(feature = "object")]
-pub(crate) static PROCESS_ID: Lazy<u128> = Lazy::new(|| {
+pub static PROCESS_ID: Lazy<u128> = Lazy::new(|| {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -43,6 +45,7 @@ pub(crate) static PROCESS_ID: Lazy<u128> = Lazy::new(|| {
 });
 
 // this is re-exported in utils for polars child crates
+#[cfg(not(target_family = "wasm"))] // only use this on non wasm targets
 pub static POOL: Lazy<ThreadPool> = Lazy::new(|| {
     ThreadPoolBuilder::new()
         .num_threads(
@@ -57,6 +60,9 @@ pub static POOL: Lazy<ThreadPool> = Lazy::new(|| {
         .build()
         .expect("could not spawn threads")
 });
+
+#[cfg(target_family = "wasm")] // instead use this on wasm targets
+pub static POOL: Lazy<polars_utils::wasm::Pool> = Lazy::new(|| polars_utils::wasm::Pool);
 
 // utility for the tests to ensure a single thread can execute
 pub static SINGLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));

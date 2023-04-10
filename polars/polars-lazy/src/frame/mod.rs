@@ -3,80 +3,52 @@
 mod csv;
 #[cfg(feature = "ipc")]
 mod ipc;
+#[cfg(feature = "json")]
+mod ndjson;
 #[cfg(feature = "parquet")]
 mod parquet;
 #[cfg(feature = "python")]
 mod python;
 
 mod anonymous_scan;
+mod file_list_reader;
+#[cfg(feature = "pivot")]
+pub mod pivot;
 
-pub use anonymous_scan::*;
-
-#[cfg(feature = "csv-file")]
-pub use csv::*;
-#[cfg(feature = "ipc")]
-pub use ipc::*;
-#[cfg(feature = "parquet")]
-pub use parquet::*;
 use std::borrow::Cow;
-
-#[cfg(any(feature = "parquet", feature = "csv-file", feature = "ipc"))]
-use polars_core::datatypes::PlHashMap;
-use polars_core::frame::hash_join::JoinType;
-use polars_core::prelude::*;
-#[cfg(feature = "dtype-categorical")]
-use polars_core::toggle_string_cache;
+#[cfg(any(feature = "parquet", feature = "ipc"))]
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::logical_plan::optimizer::aggregate_pushdown::AggregatePushdown;
-#[cfg(any(feature = "parquet", feature = "csv-file", feature = "ipc"))]
-use crate::logical_plan::optimizer::file_caching::FileCacher;
-use crate::logical_plan::optimizer::simplify_expr::SimplifyExprRule;
-use crate::logical_plan::optimizer::stack_opt::{OptimizationRule, StackOptimizer};
-use crate::logical_plan::optimizer::{
-    predicate_pushdown::PredicatePushDown, projection_pushdown::ProjectionPushDown,
-};
-use crate::physical_plan::state::ExecutionState;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-#[cfg(any(feature = "ipc", feature = "parquet", feature = "csv-file"))]
-use crate::prelude::file_caching::find_column_union_and_fingerprints;
-use crate::prelude::{
-    drop_nulls::ReplaceDropNulls, fast_projection::FastProjection,
-    simplify_expr::SimplifyBooleanRule, slice_pushdown_lp::SlicePushDown, *,
-};
-
-use crate::logical_plan::FETCH_ROWS;
-use crate::prelude::delay_rechunk::DelayRechunk;
-#[cfg(any(feature = "ipc", feature = "parquet", feature = "csv-file"))]
-use crate::prelude::file_caching::collect_fingerprints;
-use crate::utils::{combine_predicates_expr, expr_to_root_column_names};
+pub use anonymous_scan::*;
+#[cfg(feature = "csv-file")]
+pub use csv::*;
+pub use file_list_reader::*;
+#[cfg(feature = "ipc")]
+pub use ipc::*;
+#[cfg(feature = "json")]
+pub use ndjson::*;
+#[cfg(feature = "parquet")]
+pub use parquet::*;
 use polars_arrow::prelude::QuantileInterpolOptions;
 use polars_core::frame::explode::MeltArgs;
+use polars_core::frame::hash_join::JoinType;
+use polars_core::prelude::*;
 use polars_io::RowCount;
+pub use polars_plan::frame::{AllowedOptimizations, OptState};
+use polars_plan::global::FETCH_ROWS;
+#[cfg(any(feature = "ipc", feature = "parquet", feature = "csv-file"))]
+use polars_plan::logical_plan::collect_fingerprints;
+use polars_plan::logical_plan::optimize;
+use polars_plan::utils::expr_to_leaf_column_names;
+use smartstring::alias::String as SmartString;
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct JoinOptions {
-    pub allow_parallel: bool,
-    pub force_parallel: bool,
-    pub how: JoinType,
-    pub suffix: Cow<'static, str>,
-    pub slice: Option<(i64, usize)>,
-}
-
-impl Default for JoinOptions {
-    fn default() -> Self {
-        JoinOptions {
-            allow_parallel: true,
-            force_parallel: false,
-            how: JoinType::Left,
-            suffix: "_right".into(),
-            slice: None,
-        }
-    }
-}
+use crate::physical_plan::executors::Executor;
+use crate::physical_plan::planner::create_physical_plan;
+use crate::physical_plan::state::ExecutionState;
+#[cfg(feature = "streaming")]
+use crate::physical_plan::streaming::insert_streaming_nodes;
+use crate::prelude::*;
 
 pub trait IntoLazy {
     fn lazy(self) -> LazyFrame;
@@ -85,7 +57,11 @@ pub trait IntoLazy {
 impl IntoLazy for DataFrame {
     /// Convert the `DataFrame` into a lazy `DataFrame`
     fn lazy(self) -> LazyFrame {
-        LogicalPlanBuilder::from_existing_df(self).build().into()
+        let lp = LogicalPlanBuilder::from_existing_df(self).build();
+        LazyFrame {
+            logical_plan: lp,
+            opt_state: Default::default(),
+        }
     }
 }
 
@@ -103,48 +79,18 @@ impl From<LogicalPlan> for LazyFrame {
     fn from(plan: LogicalPlan) -> Self {
         Self {
             logical_plan: plan,
-            opt_state: Default::default(),
+            opt_state: OptState {
+                file_caching: true,
+                ..Default::default()
+            },
         }
     }
 }
-
-#[derive(Copy, Clone)]
-/// State of the allowed optimizations
-pub struct OptState {
-    pub projection_pushdown: bool,
-    pub predicate_pushdown: bool,
-    pub type_coercion: bool,
-    pub simplify_expr: bool,
-    pub file_caching: bool,
-    pub aggregate_pushdown: bool,
-    pub global_string_cache: bool,
-    pub slice_pushdown: bool,
-}
-
-impl Default for OptState {
-    fn default() -> Self {
-        OptState {
-            projection_pushdown: true,
-            predicate_pushdown: true,
-            type_coercion: true,
-            simplify_expr: true,
-            global_string_cache: false,
-            slice_pushdown: true,
-            // will be toggled by a scan operation such as csv scan or parquet scan
-            file_caching: false,
-            aggregate_pushdown: false,
-        }
-    }
-}
-
-/// AllowedOptimizations
-pub type AllowedOptimizations = OptState;
 
 impl LazyFrame {
     /// Get a hold on the schema of the current LazyFrame computation.
-    pub fn schema(&self) -> SchemaRef {
-        let logical_plan = self.clone().get_plan_builder().build();
-        logical_plan.schema().clone()
+    pub fn schema(&self) -> PolarsResult<SchemaRef> {
+        self.logical_plan.schema().map(|schema| schema.into_owned())
     }
 
     pub(crate) fn get_plan_builder(self) -> LogicalPlanBuilder {
@@ -162,14 +108,6 @@ impl LazyFrame {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn into_alp(self) -> (Node, Arena<AExpr>, Arena<ALogicalPlan>) {
-        let mut expr_arena = Arena::with_capacity(64);
-        let mut lp_arena = Arena::with_capacity(32);
-        let root = to_alp(self.logical_plan, &mut expr_arena, &mut lp_arena).unwrap();
-        (root, expr_arena, lp_arena)
-    }
-
     /// Set allowed optimizations
     pub fn with_optimizations(mut self, opt_state: OptState) -> Self {
         self.opt_state = opt_state;
@@ -183,11 +121,12 @@ impl LazyFrame {
             predicate_pushdown: false,
             type_coercion: true,
             simplify_expr: false,
-            global_string_cache: false,
             slice_pushdown: false,
             // will be toggled by a scan operation such as csv scan or parquet scan
             file_caching: false,
-            aggregate_pushdown: false,
+            #[cfg(feature = "cse")]
+            common_subplan_elimination: false,
+            streaming: false,
         })
     }
 
@@ -215,15 +154,10 @@ impl LazyFrame {
         self
     }
 
-    /// Toggle aggregate pushdown.
-    pub fn with_aggregate_pushdown(mut self, toggle: bool) -> Self {
-        self.opt_state.aggregate_pushdown = toggle;
-        self
-    }
-
-    /// Toggle global string cache.
-    pub fn with_string_cache(mut self, toggle: bool) -> Self {
-        self.opt_state.global_string_cache = toggle;
+    /// Toggle common subplan elimination optimization on or off
+    #[cfg(feature = "cse")]
+    pub fn with_common_subplan_elimination(mut self, toggle: bool) -> Self {
+        self.opt_state.common_subplan_elimination = toggle;
         self
     }
 
@@ -233,17 +167,28 @@ impl LazyFrame {
         self
     }
 
+    /// Allow (partial) streaming engine
+    pub fn with_streaming(mut self, toggle: bool) -> Self {
+        self.opt_state.streaming = toggle;
+        self
+    }
+
     /// Describe the logical plan.
     pub fn describe_plan(&self) -> String {
         self.logical_plan.describe()
     }
 
     /// Describe the optimized logical plan.
-    pub fn describe_optimized_plan(&self) -> Result<String> {
-        let mut expr_arena = Arena::with_capacity(512);
-        let mut lp_arena = Arena::with_capacity(512);
-        let lp_top = self.clone().optimize(&mut lp_arena, &mut expr_arena)?;
-        let logical_plan = node_to_lp(lp_top, &mut expr_arena, &mut lp_arena);
+    pub fn describe_optimized_plan(&self) -> PolarsResult<String> {
+        let mut expr_arena = Arena::with_capacity(64);
+        let mut lp_arena = Arena::with_capacity(64);
+        let lp_top = self.clone().optimize_with_scratch(
+            &mut lp_arena,
+            &mut expr_arena,
+            &mut vec![],
+            true,
+        )?;
+        let logical_plan = node_to_lp(lp_top, &expr_arena, &mut lp_arena);
         Ok(logical_plan.describe())
     }
 
@@ -262,13 +207,13 @@ impl LazyFrame {
     /// }
     /// ```
     pub fn sort(self, by_column: &str, options: SortOptions) -> Self {
-        let reverse = options.descending;
+        let descending = options.descending;
         let nulls_last = options.nulls_last;
 
         let opt_state = self.get_opt_state();
         let lp = self
             .get_plan_builder()
-            .sort(vec![col(by_column)], vec![reverse], nulls_last)
+            .sort(vec![col(by_column)], vec![descending], nulls_last)
             .build();
         Self::from_logical_plan(lp, opt_state)
     }
@@ -284,26 +229,57 @@ impl LazyFrame {
     /// /// Sort DataFrame by 'sepal.width' column
     /// fn example(df: DataFrame) -> LazyFrame {
     ///       df.lazy()
-    ///         .sort_by_exprs(vec![col("sepal.width")], vec![false])
+    ///         .sort_by_exprs(vec![col("sepal.width")], vec![false], false)
     /// }
     /// ```
     pub fn sort_by_exprs<E: AsRef<[Expr]>, B: AsRef<[bool]>>(
         self,
         by_exprs: E,
-        reverse: B,
+        descending: B,
+        nulls_last: bool,
     ) -> Self {
         let by_exprs = by_exprs.as_ref().to_vec();
-        let reverse = reverse.as_ref().to_vec();
+        let descending = descending.as_ref().to_vec();
         if by_exprs.is_empty() {
             self
         } else {
             let opt_state = self.get_opt_state();
             let lp = self
                 .get_plan_builder()
-                .sort(by_exprs, reverse, false)
+                .sort(by_exprs, descending, nulls_last)
                 .build();
             Self::from_logical_plan(lp, opt_state)
         }
+    }
+
+    pub fn top_k<E: AsRef<[Expr]>, B: AsRef<[bool]>>(
+        self,
+        k: IdxSize,
+        by_exprs: E,
+        descending: B,
+        nulls_last: bool,
+    ) -> Self {
+        let mut descending = descending.as_ref().to_vec();
+        // top-k is reverse from sort
+        for v in &mut descending {
+            *v = !*v;
+        }
+        // this will optimize to top-k
+        self.sort_by_exprs(by_exprs, descending, nulls_last)
+            .slice(0, k)
+    }
+
+    pub fn bottom_k<E: AsRef<[Expr]>, B: AsRef<[bool]>>(
+        self,
+        k: IdxSize,
+        by_exprs: E,
+        descending: B,
+        nulls_last: bool,
+    ) -> Self {
+        let descending = descending.as_ref().to_vec();
+        // this will optimize to bottom-k
+        self.sort_by_exprs(by_exprs, descending, nulls_last)
+            .slice(0, k)
     }
 
     /// Reverse the DataFrame
@@ -323,105 +299,32 @@ impl LazyFrame {
         self.select_local(vec![col("*").reverse()])
     }
 
-    fn rename_impl_swapping(self, mut existing: Vec<String>, mut new: Vec<String>) -> Self {
-        assert_eq!(new.len(), existing.len());
-        let mut removed = 0;
-        for mut idx in 0..existing.len() {
-            // remove "name" -> "name
-            // these are no ops.
-            idx -= removed;
-            if existing[idx] == new[idx] {
-                existing.swap_remove(idx);
-                new.swap_remove(idx);
-                removed += 1;
+    /// Check the if the `names` are available in the `schema`, if not
+    /// return a `LogicalPlan` that raises an `Error`.
+    fn check_names(&self, names: &[SmartString], schema: Option<&SchemaRef>) -> Option<Self> {
+        let schema = schema
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(self.schema().unwrap()));
+
+        let mut opt_not_found = None;
+        names.iter().for_each(|name| {
+            let invalid = schema.get(name).is_none();
+
+            if invalid && opt_not_found.is_none() {
+                opt_not_found = Some(name)
             }
+        });
+
+        if let Some(name) = opt_not_found {
+            let lp = self
+                .clone()
+                .get_plan_builder()
+                .add_err(polars_err!(SchemaFieldNotFound: "{}", name))
+                .build();
+            Some(Self::from_logical_plan(lp, self.opt_state))
+        } else {
+            None
         }
-
-        // schema after renaming
-        let mut new_schema = (&*self.schema()).clone();
-
-        for (old, new) in existing.iter().zip(new.iter()) {
-            new_schema.rename(old, new.to_string()).unwrap();
-        }
-
-        let prefix = "__POLARS_TEMP_";
-
-        let new: Vec<String> = new
-            .iter()
-            .map(|name| format!("{}{}", prefix, name))
-            .collect();
-
-        self.with_columns(
-            existing
-                .iter()
-                .zip(&new)
-                .map(|(old, new)| col(old).alias(new))
-                .collect::<Vec<_>>(),
-        )
-        .map(
-            move |mut df: DataFrame| {
-                let mut cols = std::mem::take(df.get_columns_mut());
-                // we must find the indices before we start swapping,
-                // because swapping may influence the positions we find if columns are swapped for instance.
-                // e.g. a -> b
-                //      b -> a
-                #[allow(clippy::needless_collect)]
-                let existing_idx = existing
-                    .iter()
-                    .map(|name| cols.iter().position(|s| s.name() == name.as_str()).unwrap())
-                    .collect::<Vec<_>>();
-                let new_idx = new
-                    .iter()
-                    .map(|name| cols.iter().position(|s| s.name() == name.as_str()).unwrap())
-                    .collect::<Vec<_>>();
-
-                for (existing_i, new_i) in existing_idx.into_iter().zip(new_idx) {
-                    cols.swap(existing_i, new_i);
-                    let s = &mut cols[existing_i];
-                    let name = &s.name()[prefix.len()..].to_string();
-                    s.rename(name);
-                }
-                cols.truncate(cols.len() - existing.len());
-                DataFrame::new(cols)
-            },
-            None,
-            Some(new_schema),
-            Some("RENAME_SWAPPING"),
-        )
-    }
-
-    fn rename_imp(self, existing: Vec<String>, new: Vec<String>) -> Self {
-        let mut schema = (*self.schema()).clone();
-
-        for (old, new) in existing.iter().zip(&new) {
-            let _ = schema.rename(old, new.clone());
-        }
-
-        self.with_columns(
-            existing
-                .iter()
-                .zip(&new)
-                .map(|(old, new)| col(old).alias(new.as_ref()))
-                .collect::<Vec<_>>(),
-        )
-        .map(
-            move |mut df: DataFrame| {
-                let cols = df.get_columns_mut();
-                for (existing, new) in existing.iter().zip(new.iter()) {
-                    let idx_a = cols
-                        .iter()
-                        .position(|s| s.name() == existing.as_str())
-                        .unwrap();
-                    let idx_b = cols.iter().position(|s| s.name() == new.as_str()).unwrap();
-                    cols.swap(idx_a, idx_b);
-                }
-                cols.truncate(cols.len() - existing.len());
-                Ok(df)
-            },
-            None,
-            Some(schema),
-            Some("RENAME"),
-        )
     }
 
     /// Rename columns in the DataFrame.
@@ -432,24 +335,33 @@ impl LazyFrame {
         T: AsRef<str>,
         S: AsRef<str>,
     {
-        // We dispatch to 2 implementations.
-        // 1 is swapping eg. rename a -> b and b -> a
-        // 2 is non-swapping eg. rename a -> new_name
-        // the latter allows predicate pushdown.
-        let existing = existing
-            .into_iter()
-            .map(|a| a.as_ref().to_string())
-            .collect::<Vec<_>>();
-        let new = new
-            .into_iter()
-            .map(|a| a.as_ref().to_string())
-            .collect::<Vec<_>>();
-        let schema = &*self.schema();
+        let iter = existing.into_iter();
+        let cap = iter.size_hint().0;
+        let mut existing_vec: Vec<SmartString> = Vec::with_capacity(cap);
+        let mut new_vec: Vec<SmartString> = Vec::with_capacity(cap);
+
+        for (existing, new) in iter.zip(new.into_iter()) {
+            let existing = existing.as_ref();
+            let new = new.as_ref();
+
+            if new != existing {
+                existing_vec.push(existing.into());
+                new_vec.push(new.into());
+            }
+        }
+
         // a column gets swapped
-        if new.iter().any(|name| schema.get(name).is_some()) {
-            self.rename_impl_swapping(existing, new)
+        let schema = &self.schema().unwrap();
+        let swapping = new_vec.iter().any(|name| schema.get(name).is_some());
+
+        if let Some(lp) = self.check_names(&existing_vec, Some(schema)) {
+            lp
         } else {
-            self.rename_imp(existing, new)
+            self.map_private(FunctionNode::Rename {
+                existing: existing_vec.into(),
+                new: new_vec.into(),
+                swapping,
+            })
         }
     }
 
@@ -461,16 +373,22 @@ impl LazyFrame {
         I: IntoIterator<Item = T>,
         T: AsRef<str>,
     {
-        let columns: Vec<String> = columns
+        let columns: Vec<SmartString> = columns
             .into_iter()
-            .map(|name| name.as_ref().to_string())
+            .map(|name| name.as_ref().into())
             .collect();
-        self.drop_columns_impl(&columns)
+        self.drop_columns_impl(columns)
     }
 
     #[allow(clippy::ptr_arg)]
-    fn drop_columns_impl(self, columns: &Vec<String>) -> Self {
-        self.select_local(vec![col("*").exclude(columns)])
+    fn drop_columns_impl(self, columns: Vec<SmartString>) -> Self {
+        if let Some(lp) = self.check_names(&columns, None) {
+            lp
+        } else {
+            self.map_private(FunctionNode::Drop {
+                names: columns.into(),
+            })
+        }
     }
 
     /// Shift the values by a given period and fill the parts that will be empty due to this operation
@@ -517,7 +435,7 @@ impl LazyFrame {
     /// Note that the fetch does not guarantee the final number of rows in the DataFrame.
     /// Filter, join operations and a lower number of rows available in the scanned file influence
     /// the final number of rows.
-    pub fn fetch(self, n_rows: usize) -> Result<DataFrame> {
+    pub fn fetch(self, n_rows: usize) -> PolarsResult<DataFrame> {
         FETCH_ROWS.with(|fetch_rows| fetch_rows.set(Some(n_rows)));
         let res = self.collect();
         FETCH_ROWS.with(|fetch_rows| fetch_rows.set(None));
@@ -528,172 +446,51 @@ impl LazyFrame {
         self,
         lp_arena: &mut Arena<ALogicalPlan>,
         expr_arena: &mut Arena<AExpr>,
-    ) -> Result<Node> {
-        // get toggle values
-        let predicate_pushdown = self.opt_state.predicate_pushdown;
-        let projection_pushdown = self.opt_state.projection_pushdown;
-        let type_coercion = self.opt_state.type_coercion;
-        let simplify_expr = self.opt_state.simplify_expr;
-        let slice_pushdown = self.opt_state.slice_pushdown;
+    ) -> PolarsResult<Node> {
+        self.optimize_with_scratch(lp_arena, expr_arena, &mut vec![], false)
+    }
 
-        #[cfg(any(feature = "ipc", feature = "parquet", feature = "csv-file"))]
-        let agg_scan_projection = self.opt_state.file_caching;
-        let aggregate_pushdown = self.opt_state.aggregate_pushdown;
-
-        let logical_plan = self.get_plan_builder().build();
-
-        // gradually fill the rules passed to the optimizer
-        let opt = StackOptimizer {};
-        let mut rules: Vec<Box<dyn OptimizationRule>> = Vec::with_capacity(8);
-
-        // during debug we check if the optimizations have not modified the final schema
-        #[cfg(debug_assertions)]
-        let prev_schema = logical_plan.schema().clone();
-
-        let mut lp_top = to_alp(logical_plan, expr_arena, lp_arena)?;
-
-        // simplify expression is valuable for projection and predicate pushdown optimizers, so we
-        // run that first
-        // this optimization will run twice because optimizer may create dumb expressions
-        lp_top = opt.optimize_loop(&mut rules, expr_arena, lp_arena, lp_top);
-
-        // we do simplification
-        if simplify_expr {
-            rules.push(Box::new(SimplifyExprRule {}));
+    pub(crate) fn optimize_with_scratch(
+        self,
+        lp_arena: &mut Arena<ALogicalPlan>,
+        expr_arena: &mut Arena<AExpr>,
+        scratch: &mut Vec<Node>,
+        _fmt: bool,
+    ) -> PolarsResult<Node> {
+        #[allow(unused_mut)]
+        let mut opt_state = self.opt_state;
+        let streaming = self.opt_state.streaming;
+        #[cfg(feature = "cse")]
+        if streaming && self.opt_state.common_subplan_elimination {
+            eprintln!("Cannot combine 'streaming' with 'common_subplan_elimination'. CSE will be turned off.");
+            opt_state.common_subplan_elimination = false;
         }
+        let lp_top = optimize(self.logical_plan, opt_state, lp_arena, expr_arena, scratch)?;
 
-        if projection_pushdown {
-            let projection_pushdown_opt = ProjectionPushDown {};
-            let alp = lp_arena.take(lp_top);
-            let alp = projection_pushdown_opt
-                .optimize(alp, lp_arena, expr_arena)
-                .expect("projection pushdown failed");
-            lp_arena.replace(lp_top, alp);
+        if streaming {
+            #[cfg(feature = "streaming")]
+            {
+                insert_streaming_nodes(lp_top, lp_arena, expr_arena, scratch, _fmt)?;
+            }
+            #[cfg(not(feature = "streaming"))]
+            {
+                panic!("activate feature 'streaming'")
+            }
         }
-
-        if predicate_pushdown {
-            let predicate_pushdown_opt = PredicatePushDown::default();
-            let alp = lp_arena.take(lp_top);
-            let alp = predicate_pushdown_opt
-                .optimize(alp, lp_arena, expr_arena)
-                .expect("predicate pushdown failed");
-            lp_arena.replace(lp_top, alp);
-        }
-
-        #[cfg(any(feature = "ipc", feature = "parquet", feature = "csv-file"))]
-        if agg_scan_projection {
-            // we do this so that expressions are simplified created by the pushdown optimizations
-            // we must clean up the predicates, because the agg_scan_projection
-            // uses them in the hashtable to determine duplicates.
-            let simplify_bools =
-                &mut [Box::new(SimplifyBooleanRule {}) as Box<dyn OptimizationRule>];
-            lp_top = opt.optimize_loop(simplify_bools, expr_arena, lp_arena, lp_top);
-
-            // scan the LP to aggregate all the column used in scans
-            // these columns will be added to the state of the AggScanProjection rule
-            let mut file_predicate_to_columns_and_count = PlHashMap::with_capacity(32);
-            find_column_union_and_fingerprints(
-                lp_top,
-                &mut file_predicate_to_columns_and_count,
-                lp_arena,
-                expr_arena,
-            );
-
-            let rule = FileCacher::new(file_predicate_to_columns_and_count);
-            // its important that we do it now
-            // because typo coercion will change the predicates and there for
-            lp_top = opt.optimize_loop(
-                &mut [Box::new(rule) as Box<dyn OptimizationRule>],
-                expr_arena,
-                lp_arena,
-                lp_top,
-            );
-        }
-
-        // make sure its before slice pushdown.
-        rules.push(Box::new(FastProjection {}));
-        rules.push(Box::new(DelayRechunk {}));
-
-        if slice_pushdown {
-            let slice_pushdown_opt = SlicePushDown {};
-            let alp = lp_arena.take(lp_top);
-            let alp = slice_pushdown_opt
-                .optimize(alp, lp_arena, expr_arena)
-                .expect("slice pushdown failed");
-
-            lp_arena.replace(lp_top, alp);
-
-            // expressions use the stack optimizer
-            rules.push(Box::new(slice_pushdown_opt));
-        }
-
-        if type_coercion {
-            rules.push(Box::new(TypeCoercionRule {}))
-        }
-        // this optimization removes branches, so we must do it when type coercion
-        // is completed
-        if simplify_expr {
-            rules.push(Box::new(SimplifyBooleanRule {}));
-        }
-
-        if aggregate_pushdown {
-            rules.push(Box::new(AggregatePushdown::new()))
-        }
-
-        rules.push(Box::new(ReplaceDropNulls {}));
-
-        lp_top = opt.optimize_loop(&mut rules, expr_arena, lp_arena, lp_top);
-
-        // during debug we check if the optimizations have not modified the final schema
-        #[cfg(debug_assertions)]
-        {
-            // only check by names because we may supercast types.
-            assert_eq!(
-                prev_schema.iter_names().collect::<Vec<_>>(),
-                lp_arena
-                    .get(lp_top)
-                    .schema(lp_arena)
-                    .iter_names()
-                    .collect::<Vec<_>>()
-            );
-        };
-
         Ok(lp_top)
     }
 
-    /// Execute all the lazy operations and collect them into a [DataFrame](polars_core::frame::DataFrame).
-    /// Before execution the query is being optimized.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use polars_core::prelude::*;
-    /// use polars_lazy::prelude::*;
-    ///
-    /// fn example(df: DataFrame) -> Result<DataFrame> {
-    ///     df.lazy()
-    ///       .groupby([col("foo")])
-    ///       .agg([col("bar").sum(), col("ham").mean().alias("avg_ham")])
-    ///       .collect()
-    /// }
-    /// ```
-    pub fn collect(self) -> Result<DataFrame> {
+    #[allow(unused_mut)]
+    fn prepare_collect(
+        mut self,
+        check_sink: bool,
+    ) -> PolarsResult<(ExecutionState, Box<dyn Executor>, bool)> {
         let file_caching = self.opt_state.file_caching;
-        #[cfg(feature = "dtype-categorical")]
-        let use_string_cache = self.opt_state.global_string_cache;
-        #[cfg(feature = "dtype-categorical")]
-        if use_string_cache {
-            eprint!("global string cache in combination with LazyFrames is deprecated; please set the global string cache globally.")
-        }
         let mut expr_arena = Arena::with_capacity(256);
         let mut lp_arena = Arena::with_capacity(128);
-        let lp_top = self.optimize(&mut lp_arena, &mut expr_arena)?;
-
-        // if string cache was already set, we skip this and global settings are respected
-        #[cfg(feature = "dtype-categorical")]
-        if use_string_cache {
-            toggle_string_cache(use_string_cache);
-        }
+        let mut scratch = vec![];
+        let lp_top =
+            self.optimize_with_scratch(&mut lp_arena, &mut expr_arena, &mut scratch, false)?;
 
         let finger_prints = if file_caching {
             #[cfg(any(feature = "ipc", feature = "parquet", feature = "csv-file"))]
@@ -710,17 +507,104 @@ impl LazyFrame {
             None
         };
 
-        let planner = DefaultPlanner::default();
-        let mut physical_plan =
-            planner.create_physical_plan(lp_top, &mut lp_arena, &mut expr_arena)?;
+        // file sink should be replaced
+        let no_file_sink = if check_sink {
+            !matches!(lp_arena.get(lp_top), ALogicalPlan::FileSink { .. })
+        } else {
+            true
+        };
+        let physical_plan = create_physical_plan(lp_top, &mut lp_arena, &mut expr_arena)?;
 
         let state = ExecutionState::with_finger_prints(finger_prints);
-        let out = physical_plan.execute(&state);
-        #[cfg(feature = "dtype-categorical")]
-        if use_string_cache {
-            toggle_string_cache(!use_string_cache);
+        Ok((state, physical_plan, no_file_sink))
+    }
+
+    /// Execute all the lazy operations and collect them into a [`DataFrame`].
+    /// Before execution the query is being optimized.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use polars_core::prelude::*;
+    /// use polars_lazy::prelude::*;
+    ///
+    /// fn example(df: DataFrame) -> PolarsResult<DataFrame> {
+    ///     df.lazy()
+    ///       .groupby([col("foo")])
+    ///       .agg([col("bar").sum(), col("ham").mean().alias("avg_ham")])
+    ///       .collect()
+    /// }
+    /// ```
+    pub fn collect(self) -> PolarsResult<DataFrame> {
+        let (mut state, mut physical_plan, _) = self.prepare_collect(false)?;
+        let out = physical_plan.execute(&mut state);
+        #[cfg(debug_assertions)]
+        {
+            #[cfg(any(feature = "ipc", feature = "parquet", feature = "csv-file"))]
+            state.file_cache.assert_empty();
         }
         out
+    }
+
+    //// Profile a LazyFrame.
+    ////
+    //// This will run the query and return a tuple
+    //// containing the materialized DataFrame and a DataFrame that contains profiling information
+    //// of each node that is executed.
+    ////
+    //// The units of the timings are microseconds.
+    pub fn profile(self) -> PolarsResult<(DataFrame, DataFrame)> {
+        let (mut state, mut physical_plan, _) = self.prepare_collect(false)?;
+        state.time_nodes();
+        let out = physical_plan.execute(&mut state)?;
+        let timer_df = state.finish_timer()?;
+        Ok((out, timer_df))
+    }
+
+    //// Stream a query result into a parquet file. This is useful if the final result doesn't fit
+    /// into memory. This methods will return an error if the query cannot be completely done in a
+    /// streaming fashion.
+    #[cfg(feature = "parquet")]
+    pub fn sink_parquet(mut self, path: PathBuf, options: ParquetWriteOptions) -> PolarsResult<()> {
+        self.opt_state.streaming = true;
+        self.logical_plan = LogicalPlan::FileSink {
+            input: Box::new(self.logical_plan),
+            payload: FileSinkOptions {
+                path: Arc::new(path),
+                file_type: FileType::Parquet(options),
+            },
+        };
+        let (mut state, mut physical_plan, is_streaming) = self.prepare_collect(true)?;
+        polars_ensure!(
+            is_streaming,
+            ComputeError: "cannot run the whole query in a streaming order; \
+            use `collect().write_parquet()` instead"
+        );
+        let _ = physical_plan.execute(&mut state)?;
+        Ok(())
+    }
+
+    //// Stream a query result into an ipc/arrow file. This is useful if the final result doesn't fit
+    /// into memory. This methods will return an error if the query cannot be completely done in a
+    /// streaming fashion.
+    #[cfg(feature = "ipc")]
+    pub fn sink_ipc(mut self, path: PathBuf, options: IpcWriterOptions) -> PolarsResult<()> {
+        self.opt_state.streaming = true;
+        self.logical_plan = LogicalPlan::FileSink {
+            input: Box::new(self.logical_plan),
+            payload: FileSinkOptions {
+                path: Arc::new(path),
+                file_type: FileType::Ipc(options),
+            },
+        };
+        let (mut state, mut physical_plan, is_streaming) = self.prepare_collect(true)?;
+        polars_ensure!(
+            is_streaming,
+            ComputeError: "cannot run the whole query in a streaming order; \
+            use `collect().write_ipc()` instead"
+        );
+        let _ = physical_plan.execute(&mut state)?;
+        Ok(())
     }
 
     /// Filter by some predicate expression.
@@ -800,7 +684,7 @@ impl LazyFrame {
     ///        .agg([
     ///            col("rain").min(),
     ///            col("rain").sum(),
-    ///            col("rain").quantile(0.5, QuantileInterpolOptions::Nearest).alias("median_rain"),
+    ///            col("rain").quantile(lit(0.5), QuantileInterpolOptions::Nearest).alias("median_rain"),
     ///        ])
     /// }
     /// ```
@@ -811,16 +695,38 @@ impl LazyFrame {
             .map(|e| e.clone().into())
             .collect::<Vec<_>>();
         let opt_state = self.get_opt_state();
-        LazyGroupBy {
-            logical_plan: self.logical_plan,
-            opt_state,
-            keys,
-            maintain_order: false,
-            dynamic_options: None,
-            rolling_options: None,
+
+        #[cfg(feature = "dynamic_groupby")]
+        {
+            LazyGroupBy {
+                logical_plan: self.logical_plan,
+                opt_state,
+                keys,
+                maintain_order: false,
+                dynamic_options: None,
+                rolling_options: None,
+            }
+        }
+
+        #[cfg(not(feature = "dynamic_groupby"))]
+        {
+            LazyGroupBy {
+                logical_plan: self.logical_plan,
+                opt_state,
+                keys,
+                maintain_order: false,
+            }
         }
     }
 
+    /// Create rolling groups based on a time column.
+    ///
+    /// Also works for index values of type Int32 or Int64.
+    ///
+    /// Different from a [`dynamic_groupby`] the windows are now determined by the
+    /// individual values and are not of constant intervals. For constant intervals use
+    /// *groupby_dynamic*
+    #[cfg(feature = "dynamic_groupby")]
     pub fn groupby_rolling<E: AsRef<[Expr]>>(
         self,
         by: E,
@@ -837,6 +743,22 @@ impl LazyFrame {
         }
     }
 
+    /// Group based on a time value (or index value of type Int32, Int64).
+    ///
+    /// Time windows are calculated and rows are assigned to windows. Different from a
+    /// normal groupby is that a row can be member of multiple groups. The time/index
+    /// window could be seen as a rolling window, with a window size determined by
+    /// dates/times/values instead of slots in the DataFrame.
+    ///
+    /// A window is defined by:
+    ///
+    /// - every: interval of the window
+    /// - period: length of the window
+    /// - offset: offset of the window
+    ///
+    /// The `by` argument should be empty `[]` if you don't want to combine this
+    /// with a ordinary groupby on these keys.
+    #[cfg(feature = "dynamic_groupby")]
     pub fn groupby_dynamic<E: AsRef<[Expr]>>(
         self,
         by: E,
@@ -853,7 +775,7 @@ impl LazyFrame {
         }
     }
 
-    /// Similar to groupby, but order of the DataFrame is maintained.
+    /// Similar to [`groupby`], but order of the DataFrame is maintained.
     pub fn groupby_stable<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(self, by: E) -> LazyGroupBy {
         let keys = by
             .as_ref()
@@ -861,13 +783,27 @@ impl LazyFrame {
             .map(|e| e.clone().into())
             .collect::<Vec<_>>();
         let opt_state = self.get_opt_state();
-        LazyGroupBy {
-            logical_plan: self.logical_plan,
-            opt_state,
-            keys,
-            maintain_order: true,
-            dynamic_options: None,
-            rolling_options: None,
+
+        #[cfg(feature = "dynamic_groupby")]
+        {
+            LazyGroupBy {
+                logical_plan: self.logical_plan,
+                opt_state,
+                keys,
+                maintain_order: true,
+                dynamic_options: None,
+                rolling_options: None,
+            }
+        }
+
+        #[cfg(not(feature = "dynamic_groupby"))]
+        {
+            LazyGroupBy {
+                logical_plan: self.logical_plan,
+                opt_state,
+                keys,
+                maintain_order: true,
+            }
         }
     }
 
@@ -939,12 +875,15 @@ impl LazyFrame {
     /// }
     /// ```
     pub fn join<E: AsRef<[Expr]>>(
-        self,
+        mut self,
         other: LazyFrame,
         left_on: E,
         right_on: E,
         how: JoinType,
     ) -> LazyFrame {
+        // if any of the nodes reads from files we must activate this this plan as well.
+        self.opt_state.file_caching |= other.opt_state.file_caching;
+
         let left_on = left_on.as_ref().to_vec();
         let right_on = right_on.as_ref().to_vec();
         self.join_builder()
@@ -1004,6 +943,17 @@ impl LazyFrame {
         Self::from_logical_plan(lp, opt_state)
     }
 
+    pub fn with_context<C: AsRef<[LazyFrame]>>(self, contexts: C) -> LazyFrame {
+        let contexts = contexts
+            .as_ref()
+            .iter()
+            .map(|lf| lf.logical_plan.clone())
+            .collect();
+        let opt_state = self.get_opt_state();
+        let lp = self.get_plan_builder().with_context(contexts).build();
+        Self::from_logical_plan(lp, opt_state)
+    }
+
     /// Aggregate all the columns as their maximum values.
     pub fn max(self) -> LazyFrame {
         self.select_local(vec![col("*").max()])
@@ -1030,18 +980,18 @@ impl LazyFrame {
     }
 
     /// Aggregate all the columns as their quantile values.
-    pub fn quantile(self, quantile: f64, interpol: QuantileInterpolOptions) -> LazyFrame {
+    pub fn quantile(self, quantile: Expr, interpol: QuantileInterpolOptions) -> LazyFrame {
         self.select_local(vec![col("*").quantile(quantile, interpol)])
     }
 
     /// Aggregate all the columns as their standard deviation values.
-    pub fn std(self) -> LazyFrame {
-        self.select_local(vec![col("*").std()])
+    pub fn std(self, ddof: u8) -> LazyFrame {
+        self.select_local(vec![col("*").std(ddof)])
     }
 
     /// Aggregate all the columns as their variance values.
-    pub fn var(self) -> LazyFrame {
-        self.select_local(vec![col("*").var()])
+    pub fn var(self, ddof: u8) -> LazyFrame {
+        self.select_local(vec![col("*").var(ddof)])
     }
 
     /// Apply explode operation. [See eager explode](polars_core::frame::DataFrame::explode).
@@ -1067,6 +1017,7 @@ impl LazyFrame {
             subset: subset.map(Arc::new),
             maintain_order: true,
             keep_strategy,
+            ..Default::default()
         };
         let lp = self.get_plan_builder().distinct(options).build();
         Self::from_logical_plan(lp, opt_state)
@@ -1083,6 +1034,7 @@ impl LazyFrame {
             subset: subset.map(Arc::new),
             maintain_order: false,
             keep_strategy,
+            ..Default::default()
         };
         let lp = self.get_plan_builder().distinct(options).build();
         Self::from_logical_plan(lp, opt_state)
@@ -1093,10 +1045,14 @@ impl LazyFrame {
     /// Equal to `LazyFrame::filter(col("*").is_not_null())`
     pub fn drop_nulls(self, subset: Option<Vec<Expr>>) -> LazyFrame {
         match subset {
-            None => self.filter(col("*").is_not_null()),
+            None => self.filter(all_exprs([col("*").is_not_null()])),
             Some(subset) => {
-                let it = subset.into_iter().map(|e| e.is_not_null());
-                let predicate = combine_predicates_expr(it);
+                let predicate = all_exprs(
+                    subset
+                        .into_iter()
+                        .map(|e| e.is_not_null())
+                        .collect::<Vec<_>>(),
+                );
                 self.filter(predicate)
             }
         }
@@ -1148,23 +1104,29 @@ impl LazyFrame {
     pub fn map<F>(
         self,
         function: F,
-        optimizations: Option<AllowedOptimizations>,
-        schema: Option<Schema>,
+        optimizations: AllowedOptimizations,
+        schema: Option<Arc<dyn UdfSchema>>,
         name: Option<&'static str>,
     ) -> LazyFrame
     where
-        F: 'static + Fn(DataFrame) -> Result<DataFrame> + Send + Sync,
+        F: 'static + Fn(DataFrame) -> PolarsResult<DataFrame> + Send + Sync,
     {
         let opt_state = self.get_opt_state();
         let lp = self
             .get_plan_builder()
             .map(
                 function,
-                optimizations.unwrap_or_default(),
-                schema.map(Arc::new),
+                optimizations,
+                schema,
                 name.unwrap_or("ANONYMOUS UDF"),
             )
             .build();
+        Self::from_logical_plan(lp, opt_state)
+    }
+
+    pub(crate) fn map_private(self, function: FunctionNode) -> LazyFrame {
+        let opt_state = self.get_opt_state();
+        let lp = self.get_plan_builder().map_private(function).build();
         Self::from_logical_plan(lp, opt_state)
     }
 
@@ -1174,8 +1136,7 @@ impl LazyFrame {
     /// This can have a negative effect on query performance.
     /// This may for instance block predicate pushdown optimization.
     pub fn with_row_count(mut self, name: &str, offset: Option<IdxSize>) -> LazyFrame {
-        let mut add_row_count_in_map = false;
-        match &mut self.logical_plan {
+        let add_row_count_in_map = match &mut self.logical_plan {
             // Do the row count at scan
             #[cfg(feature = "csv-file")]
             LogicalPlan::CsvScan { options, .. } => {
@@ -1183,6 +1144,7 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
+                false
             }
             #[cfg(feature = "ipc")]
             LogicalPlan::IpcScan { options, .. } => {
@@ -1190,6 +1152,7 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
+                false
             }
             #[cfg(feature = "parquet")]
             LogicalPlan::ParquetScan { options, .. } => {
@@ -1197,16 +1160,17 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
+                false
             }
-            _ => {
-                add_row_count_in_map = true;
-            }
-        }
+            _ => true,
+        };
 
-        let new_schema = self
-            .schema()
-            .insert_index(0, name.to_string(), IDX_DTYPE)
-            .unwrap();
+        let name2: SmartString = name.into();
+        let udf_schema = move |s: &Schema| {
+            let new = s.insert_index(0, name2.clone(), IDX_DTYPE).unwrap();
+            Ok(Arc::new(new))
+        };
+
         let name = name.to_owned();
 
         // if we do the row count at scan we add a dummy map, to update the schema
@@ -1214,6 +1178,7 @@ impl LazyFrame {
             AllowedOptimizations {
                 slice_pushdown: false,
                 predicate_pushdown: false,
+                streaming: false,
                 ..Default::default()
             }
         } else {
@@ -1228,8 +1193,8 @@ impl LazyFrame {
                     Ok(df)
                 }
             },
-            Some(opt),
-            Some(new_schema),
+            opt,
+            Some(Arc::new(udf_schema)),
             Some("WITH ROW COUNT"),
         )
     }
@@ -1237,48 +1202,36 @@ impl LazyFrame {
     /// Unnest the given `Struct` columns. This means that the fields of the `Struct` type will be
     /// inserted as columns.
     #[cfg(feature = "dtype-struct")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dtype-struct")))]
-    pub fn unnest<I: IntoVec<String>>(self, cols: I) -> Self {
-        let cols = cols.into_vec();
-        self.unnest_impl(cols.into_iter().collect())
+    pub fn unnest<I: IntoIterator<Item = S>, S: AsRef<str>>(self, cols: I) -> Self {
+        self.map_private(FunctionNode::Unnest {
+            columns: cols.into_iter().map(|s| Arc::from(s.as_ref())).collect(),
+        })
     }
 
-    #[cfg(feature = "dtype-struct")]
-    fn unnest_impl(self, cols: PlHashSet<String>) -> Self {
-        let schema = self.schema();
-
-        let mut new_schema = Schema::with_capacity(schema.len() * 2);
-        for (name, dtype) in schema.iter() {
-            if cols.contains(name) {
-                if let DataType::Struct(flds) = dtype {
-                    for fld in flds {
-                        new_schema.with_column(fld.name().clone(), fld.data_type().clone())
-                    }
-                } else {
-                    // todo: return lazy error here.
-                    panic!("expected struct dtype")
-                }
-            } else {
-                new_schema.with_column(name.clone(), dtype.clone())
-            }
-        }
-        self.map(
-            move |df| df.unnest(&cols),
-            Some(AllowedOptimizations::default()),
-            Some(new_schema),
-            Some("unnest"),
-        )
+    #[cfg(feature = "merge_sorted")]
+    pub fn merge_sorted(self, other: LazyFrame, key: &str) -> PolarsResult<LazyFrame> {
+        // The two DataFrames are temporary concatenated
+        // this indicates until which chunk the data is from the left df
+        // this trick allows us to reuse the `Union` architecture to get map over
+        // two DataFrames
+        let left = self.map_private(FunctionNode::Rechunk);
+        let q = concat(&[left, other], false, true)?;
+        Ok(q.map_private(FunctionNode::MergeSorted {
+            column: Arc::from(key),
+        }))
     }
 }
 
 /// Utility struct for lazy groupby operation.
 #[derive(Clone)]
 pub struct LazyGroupBy {
-    pub(crate) logical_plan: LogicalPlan,
+    pub logical_plan: LogicalPlan,
     opt_state: OptState,
     keys: Vec<Expr>,
     maintain_order: bool,
+    #[cfg(feature = "dynamic_groupby")]
     dynamic_options: Option<DynamicGroupOptions>,
+    #[cfg(feature = "dynamic_groupby")]
     rolling_options: Option<RollingGroupOptions>,
 }
 
@@ -1301,20 +1254,26 @@ impl LazyGroupBy {
     ///        .agg([
     ///            col("rain").min(),
     ///            col("rain").sum(),
-    ///            col("rain").quantile(0.5, QuantileInterpolOptions::Nearest).alias("median_rain"),
+    ///            col("rain").quantile(lit(0.5), QuantileInterpolOptions::Nearest).alias("median_rain"),
     ///        ])
     /// }
     /// ```
     pub fn agg<E: AsRef<[Expr]>>(self, aggs: E) -> LazyFrame {
+        #[cfg(feature = "dynamic_groupby")]
         let lp = LogicalPlanBuilder::from(self.logical_plan)
             .groupby(
-                Arc::new(self.keys),
+                self.keys,
                 aggs,
                 None,
                 self.maintain_order,
                 self.dynamic_options,
                 self.rolling_options,
             )
+            .build();
+
+        #[cfg(not(feature = "dynamic_groupby"))]
+        let lp = LogicalPlanBuilder::from(self.logical_plan)
+            .groupby(self.keys, aggs, None, self.maintain_order)
             .build();
         LazyFrame::from_logical_plan(lp, self.opt_state)
     }
@@ -1324,10 +1283,10 @@ impl LazyGroupBy {
         let keys = self
             .keys
             .iter()
-            .flat_map(|k| expr_to_root_column_names(k).into_iter())
+            .flat_map(|k| expr_to_leaf_column_names(k).into_iter())
             .collect::<Vec<_>>();
 
-        self.agg([col("*").exclude(&keys).head(n).list().keep_name()])
+        self.agg([col("*").exclude(&keys).head(n).keep_name()])
             .explode([col("*").exclude(&keys)])
     }
 
@@ -1336,29 +1295,38 @@ impl LazyGroupBy {
         let keys = self
             .keys
             .iter()
-            .flat_map(|k| expr_to_root_column_names(k).into_iter())
+            .flat_map(|k| expr_to_leaf_column_names(k).into_iter())
             .collect::<Vec<_>>();
 
-        self.agg([col("*").exclude(&keys).tail(n).list().keep_name()])
+        self.agg([col("*").exclude(&keys).tail(n).keep_name()])
             .explode([col("*").exclude(&keys)])
     }
 
     /// Apply a function over the groups as a new `DataFrame`. It is not recommended that you use
-    /// this as materializing the `DataFrame` is quite expensive.
-    pub fn apply<F>(self, f: F) -> LazyFrame
+    /// this as materializing the `DataFrame` is very expensive.
+    pub fn apply<F>(self, f: F, schema: SchemaRef) -> LazyFrame
     where
-        F: 'static + Fn(DataFrame) -> Result<DataFrame> + Send + Sync,
+        F: 'static + Fn(DataFrame) -> PolarsResult<DataFrame> + Send + Sync,
     {
-        let lp = LogicalPlanBuilder::from(self.logical_plan)
-            .groupby(
-                Arc::new(self.keys),
-                vec![],
-                Some(Arc::new(f)),
-                self.maintain_order,
-                None,
-                None,
-            )
-            .build();
+        #[cfg(feature = "dynamic_groupby")]
+        let options = GroupbyOptions {
+            dynamic: None,
+            rolling: None,
+            slice: None,
+        };
+
+        #[cfg(not(feature = "dynamic_groupby"))]
+        let options = GroupbyOptions { slice: None };
+
+        let lp = LogicalPlan::Aggregate {
+            input: Box::new(self.logical_plan),
+            keys: Arc::new(self.keys),
+            aggs: vec![],
+            schema,
+            apply: Some(Arc::new(f)),
+            maintain_order: self.maintain_order,
+            options,
+        };
         LazyFrame::from_logical_plan(lp, self.opt_state)
     }
 }
@@ -1400,6 +1368,14 @@ impl JoinBuilder {
         self
     }
 
+    /// The columns you want to join both tables on.
+    pub fn on<E: AsRef<[Expr]>>(mut self, on: E) -> Self {
+        let on = on.as_ref().to_vec();
+        self.left_on = on.clone();
+        self.right_on = on;
+        self
+    }
+
     /// The columns you want to join the left table on.
     pub fn left_on<E: AsRef<[Expr]>>(mut self, on: E) -> Self {
         self.left_on = on.as_ref().to_vec();
@@ -1432,7 +1408,11 @@ impl JoinBuilder {
 
     /// Finish builder
     pub fn finish(self) -> LazyFrame {
-        let opt_state = self.lf.opt_state;
+        let mut opt_state = self.lf.opt_state;
+        let other = self.other.expect("with not set");
+
+        // if any of the nodes reads from files we must activate this this plan as well.
+        opt_state.file_caching |= other.opt_state.file_caching;
 
         let suffix = match self.suffix {
             None => Cow::Borrowed("_right"),
@@ -1443,7 +1423,7 @@ impl JoinBuilder {
             .lf
             .get_plan_builder()
             .join(
-                self.other.expect("with not set").logical_plan,
+                other.logical_plan,
                 self.left_on,
                 self.right_on,
                 JoinOptions {
@@ -1451,7 +1431,7 @@ impl JoinBuilder {
                     force_parallel: self.force_parallel,
                     how: self.how,
                     suffix,
-                    slice: None,
+                    ..Default::default()
                 },
             )
             .build();

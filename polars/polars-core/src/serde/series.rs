@@ -1,9 +1,11 @@
-use crate::prelude::*;
-use crate::serde::DeDataType;
-use serde::de::{MapAccess, Visitor};
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::fmt::Formatter;
+
+use serde::de::{MapAccess, Visitor};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::prelude::*;
+use crate::serde::DeDataType;
 
 impl Serialize for Series {
     fn serialize<S>(
@@ -33,6 +35,15 @@ impl Serialize for Series {
             ca.serialize(serializer)
         } else {
             match self.dtype() {
+                DataType::Binary => {
+                    let ca = self.binary().unwrap();
+                    ca.serialize(serializer)
+                }
+                #[cfg(feature = "dtype-struct")]
+                DataType::Struct(_) => {
+                    let ca = self.struct_().unwrap();
+                    ca.serialize(serializer)
+                }
                 #[cfg(feature = "dtype-date")]
                 DataType::Date => {
                     let ca = self.date().unwrap();
@@ -40,15 +51,22 @@ impl Serialize for Series {
                 }
                 #[cfg(feature = "dtype-datetime")]
                 DataType::Datetime(_, _) => {
-                    let s = self
-                        .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
-                        .unwrap();
-                    let ca = s.datetime().unwrap();
+                    let ca = self.datetime().unwrap();
                     ca.serialize(serializer)
                 }
                 #[cfg(feature = "dtype-categorical")]
                 DataType::Categorical(_) => {
                     let ca = self.categorical().unwrap();
+                    ca.serialize(serializer)
+                }
+                #[cfg(feature = "dtype-duration")]
+                DataType::Duration(_) => {
+                    let ca = self.duration().unwrap();
+                    ca.serialize(serializer)
+                }
+                #[cfg(feature = "dtype-time")]
+                DataType::Time => {
+                    let ca = self.time().unwrap();
                     ca.serialize(serializer)
                 }
                 _ => {
@@ -149,11 +167,23 @@ impl<'de> Deserialize<'de> for Series {
                         Ok(Series::new(&name, values).cast(&DataType::Date).unwrap())
                     }
                     #[cfg(feature = "dtype-datetime")]
-                    DeDataType::Datetime => {
+                    DeDataType::Datetime(tu, tz) => {
                         let values: Vec<Option<i64>> = map.next_value()?;
                         Ok(Series::new(&name, values)
-                            .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
+                            .cast(&DataType::Datetime(tu, tz))
                             .unwrap())
+                    }
+                    #[cfg(feature = "dtype-duration")]
+                    DeDataType::Duration(tu) => {
+                        let values: Vec<Option<i64>> = map.next_value()?;
+                        Ok(Series::new(&name, values)
+                            .cast(&DataType::Duration(tu))
+                            .unwrap())
+                    }
+                    #[cfg(feature = "dtype-time")]
+                    DeDataType::Time => {
+                        let values: Vec<Option<i64>> = map.next_value()?;
+                        Ok(Series::new(&name, values).cast(&DataType::Time).unwrap())
                     }
                     DeDataType::Boolean => {
                         let values: Vec<Option<bool>> = map.next_value()?;
@@ -175,8 +205,27 @@ impl<'de> Deserialize<'de> for Series {
                         let values: Vec<Option<Series>> = map.next_value()?;
                         Ok(Series::new(&name, values))
                     }
+                    DeDataType::Binary => {
+                        let values: Vec<Option<Cow<[u8]>>> = map.next_value()?;
+                        Ok(Series::new(&name, values))
+                    }
+                    #[cfg(feature = "dtype-struct")]
+                    DeDataType::Struct => {
+                        let values: Vec<Series> = map.next_value()?;
+                        let ca = StructChunked::new(&name, &values).unwrap();
+                        let mut s = ca.into_series();
+                        s.rename(&name);
+                        Ok(s)
+                    }
+                    #[cfg(feature = "dtype-categorical")]
+                    DeDataType::Categorical => {
+                        let values: Vec<Option<Cow<str>>> = map.next_value()?;
+                        Ok(Series::new(&name, values)
+                            .cast(&DataType::Categorical(None))
+                            .unwrap())
+                    }
                     dt => {
-                        panic!("{:?} dtype deserialization not yet implemented", dt)
+                        panic!("{dt:?} dtype deserialization not yet implemented")
                     }
                 }
             }

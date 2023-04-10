@@ -61,27 +61,46 @@
 //! +-----+--------+-------+--------+
 //! ```
 //!
-use crate::mmap::{MmapBytesReader, ReaderBytes};
-use crate::prelude::*;
-use arrow::array::StructArray;
-use arrow::io::ndjson::read::FallibleStreamingIterator;
-pub use arrow::{
-    error::Result as ArrowResult,
-    io::{json, ndjson},
-};
-use polars_arrow::conversion::chunk_to_struct;
-use polars_arrow::kernels::concatenate::concatenate_owned_unchecked;
-use polars_core::prelude::*;
 use std::convert::TryFrom;
-use std::io::{Cursor, Seek, Write};
+use std::io::Write;
 use std::ops::Deref;
 
+use arrow::array::StructArray;
+pub use arrow::error::Result as ArrowResult;
+pub use arrow::io::json;
+use polars_arrow::conversion::chunk_to_struct;
+use polars_core::error::to_compute_err;
+use polars_core::prelude::*;
+
+use crate::mmap::{MmapBytesReader, ReaderBytes};
+use crate::prelude::*;
+
+/// The format to use to write the DataFrame to JSON: `Json` (a JSON array) or `JsonLines` (each row output on a
+/// separate line). In either case, each row is serialized as a JSON object whose keys are the column names and whose
+/// values are the row's corresponding values.
 pub enum JsonFormat {
+    /// A single JSON array containing each DataFrame row as an object. The length of the array is the number of rows in
+    /// the DataFrame.
+    ///
+    /// Use this to create valid JSON that can be deserialized back into an array in one fell swoop.
     Json,
+    /// Each DataFrame row is serialized as a JSON object on a separate line. The number of lines in the output is the
+    /// number of rows in the DataFrame.
+    ///
+    /// The [JSON Lines](https://jsonlines.org) format makes it easy to read records in a streaming fashion, one (line)
+    /// at a time. But the output in its entirety is not valid JSON; only the individual lines are.
+    ///
+    /// It is recommended to use the file extension `.jsonl` when saving as JSON Lines.
     JsonLines,
 }
 
-// Write a DataFrame to JSON
+/// Writes a DataFrame to JSON.
+///
+/// Under the hood, this uses [`arrow2::io::json`](https://docs.rs/arrow2/latest/arrow2/io/json/write/fn.write.html).
+/// `arrow2` generally serializes types that are not JSON primitives, such as Date and DateTime, as their
+/// `Display`-formatted versions. For instance, a (naive) DateTime column is formatted as the String `"yyyy-mm-dd
+/// HH:MM:SS"`. To control how non-primitive columns are serialized, convert them to String or another primitive type
+/// before serializing.
 #[must_use]
 pub struct JsonWriter<W: Write> {
     /// File or Stream handler
@@ -100,6 +119,8 @@ impl<W> SerWriter<W> for JsonWriter<W>
 where
     W: Write,
 {
+    /// Create a new `JsonWriter` writing to `buffer` with format `JsonFormat::JsonLines`. To specify a different
+    /// format, use e.g., [`JsonWriter::new(buffer).with_json_format(JsonFormat::Json)`](JsonWriter::with_json_format).
     fn new(buffer: W) -> Self {
         JsonWriter {
             buffer,
@@ -107,7 +128,7 @@ where
         }
     }
 
-    fn finish(&mut self, df: &mut DataFrame) -> Result<()> {
+    fn finish(&mut self, df: &mut DataFrame) -> PolarsResult<()> {
         df.rechunk();
         let fields = df.iter().map(|s| s.field().to_arrow()).collect::<Vec<_>>();
         let batches = df
@@ -116,8 +137,8 @@ where
 
         match self.json_format {
             JsonFormat::JsonLines => {
-                let serializer = ndjson::write::Serializer::new(batches, vec![]);
-                let writer = ndjson::write::FileWriter::new(&mut self.buffer, serializer);
+                let serializer = arrow_ndjson::write::Serializer::new(batches, vec![]);
+                let writer = arrow_ndjson::write::FileWriter::new(&mut self.buffer, serializer);
                 writer.collect::<ArrowResult<()>>()?;
             }
             JsonFormat::Json => {
@@ -130,6 +151,7 @@ where
     }
 }
 
+/// Reads JSON in one of the formats in [`JsonFormat`] into a DataFrame.
 #[must_use]
 pub struct JsonReader<R>
 where
@@ -165,45 +187,43 @@ where
         self
     }
 
-    fn finish(self) -> Result<DataFrame> {
-        let mmap_read: ReaderBytes = (&self.reader).into();
-        let bytes = mmap_read.deref();
+    /// Take the SerReader and return a parsed DataFrame.
+    ///
+    /// Because JSON values specify their types (number, string, etc), no upcasting or conversion is performed between
+    /// incompatible types in the input. In the event that a column contains mixed dtypes, is it unspecified whether an
+    /// error is returned or whether elements of incompatible dtypes are replaced with `null`.
+    fn finish(self) -> PolarsResult<DataFrame> {
+        let rb: ReaderBytes = (&self.reader).into();
 
         let out = match self.json_format {
             JsonFormat::Json => {
-                let json_value = arrow::io::json::read::json_deserializer::parse(bytes)
-                    .map_err(|err| PolarsError::ComputeError(format!("{:?}", err).into()))?;
+                let bytes = rb.deref();
+                let json_value =
+                    json::read::json_deserializer::parse(bytes).map_err(to_compute_err)?;
                 // likely struct type
                 let dtype = json::read::infer(&json_value)?;
                 let arr = json::read::deserialize(&json_value, dtype)?;
-                let arr = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                    PolarsError::ComputeError("only can deserialize json objects".into())
-                })?;
+                let arr = arr.as_any().downcast_ref::<StructArray>().ok_or_else(
+                    || polars_err!(ComputeError: "can only deserialize json objects"),
+                )?;
                 DataFrame::try_from(arr.clone())
             }
             JsonFormat::JsonLines => {
-                let mut file = Cursor::new(bytes);
-
-                let dtype = ndjson::read::infer(&mut file, self.infer_schema_len)?;
-                file.rewind()?;
-
-                let mut reader = ndjson::read::FileReader::new(
-                    &mut file,
-                    vec!["".to_string(); self.batch_size],
+                let mut json_reader = CoreJsonReader::new(
+                    rb,
                     None,
-                );
-                let mut arrays = vec![];
-                // `next` is IO-bounded
-                while let Some(rows) = reader.next()? {
-                    // `deserialize` is CPU-bounded
-                    let array = ndjson::read::deserialize(rows, dtype.clone())?;
-                    arrays.push(array);
+                    None,
+                    None,
+                    1024, // sample size
+                    1 << 18,
+                    false,
+                    self.infer_schema_len,
+                )?;
+                let mut df: DataFrame = json_reader.as_df()?;
+                if self.rechunk {
+                    df.as_single_chunk_par();
                 }
-                let arr = concatenate_owned_unchecked(&arrays)?;
-                let arr = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                    PolarsError::ComputeError("only can deserialize json objects".into())
-                })?;
-                DataFrame::try_from(arr.clone())
+                Ok(df)
             }
         }?;
 
@@ -225,20 +245,32 @@ where
         self
     }
 
-    /// Set the JSON reader to infer the schema of the file
+    /// Set the JSON reader to infer the schema of the file. Currently, this is only used when reading from
+    /// [`JsonFormat::JsonLines`], as [`JsonFormat::Json`] reads in the entire array anyway.
+    ///
+    /// When using [`JsonFormat::JsonLines`], `max_records = None` will read the entire buffer in order to infer the
+    /// schema, `Some(1)` would look only at the first record, `Some(2)` the first two records, etc.
+    ///
+    /// It is an error to pass `max_records = Some(0)`, as a schema cannot be inferred from 0 records when deserializing
+    /// from JSON (unlike CSVs, there is no header row to inspect for column names).
     pub fn infer_schema_len(mut self, max_records: Option<usize>) -> Self {
         self.infer_schema_len = max_records;
         self
     }
 
     /// Set the batch size (number of records to load at one time)
+    ///
     /// This heavily influences loading time.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
     }
 
-    /// Set the reader's column projection
+    /// Set the reader's column projection: the names of the columns to keep after deserialization. If `None`, all
+    /// columns are kept.
+    ///
+    /// Setting `projection` to the columns you want to keep is more efficient than deserializing all of the columns and
+    /// then dropping the ones you don't want.
     pub fn with_projection(mut self, projection: Option<Vec<String>>) -> Self {
         self.projection = projection;
         self
@@ -247,38 +279,5 @@ where
     pub fn with_json_format(mut self, format: JsonFormat) -> Self {
         self.json_format = format;
         self
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::prelude::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn read_json() {
-        let basic_json = r#"{"a":1, "b":2.0, "c":false, "d":"4"}
-{"a":-10, "b":-3.5, "c":true, "d":"4"}
-{"a":2, "b":0.6, "c":false, "d":"text"}
-{"a":1, "b":2.0, "c":false, "d":"4"}
-{"a":7, "b":-3.5, "c":true, "d":"4"}
-{"a":1, "b":0.6, "c":false, "d":"text"}
-{"a":1, "b":2.0, "c":false, "d":"4"}
-{"a":5, "b":-3.5, "c":true, "d":"4"}
-{"a":1, "b":0.6, "c":false, "d":"text"}
-{"a":1, "b":2.0, "c":false, "d":"4"}
-{"a":1, "b":-3.5, "c":true, "d":"4"}
-{"a":100000000000000, "b":0.6, "c":false, "d":"text"}"#;
-        let file = Cursor::new(basic_json);
-        let df = JsonReader::new(file)
-            .infer_schema_len(Some(3))
-            .with_json_format(JsonFormat::JsonLines)
-            .with_batch_size(3)
-            .finish()
-            .unwrap();
-
-        assert_eq!("a", df.get_columns()[0].name());
-        assert_eq!("d", df.get_columns()[3].name());
-        assert_eq!((12, 4), df.shape());
     }
 }

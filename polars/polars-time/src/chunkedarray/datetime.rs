@@ -1,10 +1,11 @@
-use super::*;
 use arrow::array::{Array, PrimitiveArray};
-use arrow::compute::cast::CastOptions;
-use arrow::compute::{cast::cast, temporal};
+use arrow::compute::cast::{cast, CastOptions};
+use arrow::compute::temporal;
 use arrow::error::Result as ArrowResult;
 use polars_arrow::export::arrow;
 use polars_core::prelude::*;
+
+use super::*;
 
 fn cast_and_apply<
     F: Fn(&dyn Array) -> ArrowResult<PrimitiveArray<T::Native>>,
@@ -30,7 +31,7 @@ fn cast_and_apply<
         })
         .collect();
 
-    ChunkedArray::from_chunks(ca.name(), chunks)
+    unsafe { ChunkedArray::from_chunks(ca.name(), chunks) }
 }
 
 pub trait DatetimeMethods: AsDatetime {
@@ -38,6 +39,28 @@ pub trait DatetimeMethods: AsDatetime {
     /// Returns the year number in the calendar date.
     fn year(&self) -> Int32Chunked {
         cast_and_apply(self.as_datetime(), temporal::year)
+    }
+
+    /// Extract year from underlying NaiveDate representation.
+    /// Returns whether the year is a leap year.
+    fn is_leap_year(&self) -> BooleanChunked {
+        let ca = self.as_datetime();
+        let f = match ca.time_unit() {
+            TimeUnit::Nanoseconds => datetime_to_is_leap_year_ns,
+            TimeUnit::Microseconds => datetime_to_is_leap_year_us,
+            TimeUnit::Milliseconds => datetime_to_is_leap_year_ms,
+        };
+        ca.apply_kernel_cast::<BooleanType>(&f)
+    }
+
+    fn iso_year(&self) -> Int32Chunked {
+        let ca = self.as_datetime();
+        let f = match ca.time_unit() {
+            TimeUnit::Nanoseconds => datetime_to_iso_year_ns,
+            TimeUnit::Microseconds => datetime_to_iso_year_us,
+            TimeUnit::Milliseconds => datetime_to_iso_year_ms,
+        };
+        ca.apply_kernel_cast::<Int32Type>(&f)
     }
 
     /// Extract quarter from underlying NaiveDateTime representation.
@@ -55,8 +78,8 @@ pub trait DatetimeMethods: AsDatetime {
         cast_and_apply(self.as_datetime(), temporal::month)
     }
 
-    /// Extract weekday from underlying NaiveDateTime representation.
-    /// Returns the weekday number where monday = 0 and sunday = 6
+    /// Extract ISO weekday from underlying NaiveDateTime representation.
+    /// Returns the weekday number where monday = 1 and sunday = 7
     fn weekday(&self) -> UInt32Chunked {
         cast_and_apply(self.as_datetime(), temporal::weekday)
     }
@@ -143,8 +166,9 @@ impl DatetimeMethods for DatetimeChunked {}
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use chrono::NaiveDateTime;
+
+    use super::*;
 
     #[test]
     fn from_datetime() {
@@ -165,9 +189,9 @@ mod test {
         );
         assert_eq!(
             [
-                588470416000_000_000,
-                1441497364000_000_000,
-                1356048000000_000_000
+                588_470_416_000_000_000,
+                1_441_497_364_000_000_000,
+                1_356_048_000_000_000_000
             ],
             dt.cont_slice().unwrap()
         );

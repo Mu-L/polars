@@ -1,149 +1,159 @@
 use super::*;
 
-pub trait NumOpsDispatch: Debug {
-    fn subtract(&self, rhs: &Series) -> Result<Series> {
-        Err(PolarsError::InvalidOperation(
-            format!(
-                "subtraction operation not supported for {:?} and {:?}",
-                self, rhs
-            )
-            .into(),
-        ))
+pub trait NumOpsDispatchInner: PolarsDataType + Sized {
+    fn subtract(lhs: &ChunkedArray<Self>, rhs: &Series) -> PolarsResult<Series> {
+        polars_bail!(opq = sub, lhs.dtype(), rhs.dtype());
     }
-    fn add_to(&self, rhs: &Series) -> Result<Series> {
-        Err(PolarsError::InvalidOperation(
-            format!(
-                "addition operation not supported for {:?} and {:?}",
-                self, rhs
-            )
-            .into(),
-        ))
+    fn add_to(lhs: &ChunkedArray<Self>, rhs: &Series) -> PolarsResult<Series> {
+        polars_bail!(opq = add, lhs.dtype(), rhs.dtype());
     }
-    fn multiply(&self, rhs: &Series) -> Result<Series> {
-        Err(PolarsError::InvalidOperation(
-            format!(
-                "multiplication operation not supported for {:?} and {:?}",
-                self, rhs
-            )
-            .into(),
-        ))
+    fn multiply(lhs: &ChunkedArray<Self>, rhs: &Series) -> PolarsResult<Series> {
+        polars_bail!(opq = mul, lhs.dtype(), rhs.dtype());
     }
-    fn divide(&self, rhs: &Series) -> Result<Series> {
-        Err(PolarsError::InvalidOperation(
-            format!(
-                "division operation not supported for {:?} and {:?}",
-                self, rhs
-            )
-            .into(),
-        ))
+    fn divide(lhs: &ChunkedArray<Self>, rhs: &Series) -> PolarsResult<Series> {
+        polars_bail!(opq = div, lhs.dtype(), rhs.dtype());
     }
-    fn remainder(&self, rhs: &Series) -> Result<Series> {
-        Err(PolarsError::InvalidOperation(
-            format!(
-                "remainder operation not supported for {:?} and {:?}",
-                self, rhs
-            )
-            .into(),
-        ))
+    fn remainder(lhs: &ChunkedArray<Self>, rhs: &Series) -> PolarsResult<Series> {
+        polars_bail!(opq = rem, lhs.dtype(), rhs.dtype());
     }
 }
 
-impl<T> NumOpsDispatch for ChunkedArray<T>
+pub trait NumOpsDispatch {
+    fn subtract(&self, rhs: &Series) -> PolarsResult<Series>;
+    fn add_to(&self, rhs: &Series) -> PolarsResult<Series>;
+    fn multiply(&self, rhs: &Series) -> PolarsResult<Series>;
+    fn divide(&self, rhs: &Series) -> PolarsResult<Series>;
+    fn remainder(&self, rhs: &Series) -> PolarsResult<Series>;
+}
+
+impl<T: NumOpsDispatchInner> NumOpsDispatch for ChunkedArray<T> {
+    fn subtract(&self, rhs: &Series) -> PolarsResult<Series> {
+        T::subtract(self, rhs)
+    }
+    fn add_to(&self, rhs: &Series) -> PolarsResult<Series> {
+        T::add_to(self, rhs)
+    }
+    fn multiply(&self, rhs: &Series) -> PolarsResult<Series> {
+        T::multiply(self, rhs)
+    }
+    fn divide(&self, rhs: &Series) -> PolarsResult<Series> {
+        T::divide(self, rhs)
+    }
+    fn remainder(&self, rhs: &Series) -> PolarsResult<Series> {
+        T::remainder(self, rhs)
+    }
+}
+
+impl<T> NumOpsDispatchInner for T
 where
     T: PolarsNumericType,
     ChunkedArray<T>: IntoSeries,
 {
-    fn subtract(&self, rhs: &Series) -> Result<Series> {
+    fn subtract(lhs: &ChunkedArray<T>, rhs: &Series) -> PolarsResult<Series> {
         // Safety:
         // There will be UB if a ChunkedArray is alive with the wrong datatype.
         // we now only create the potentially wrong dtype for a short time.
         // Note that the physical type correctness is checked!
         // The ChunkedArray with the wrong dtype is dropped after this operation
-        let rhs = unsafe { self.unpack_series_matching_physical_type(rhs) };
-        let out = self - rhs;
+        let rhs = unsafe { lhs.unpack_series_matching_physical_type(rhs) };
+        let out = lhs - rhs;
         Ok(out.into_series())
     }
-    fn add_to(&self, rhs: &Series) -> Result<Series> {
+    fn add_to(lhs: &ChunkedArray<T>, rhs: &Series) -> PolarsResult<Series> {
         // Safety:
         // see subtract
-        let rhs = unsafe { self.unpack_series_matching_physical_type(rhs) };
-        let out = self + rhs;
+        let rhs = unsafe { lhs.unpack_series_matching_physical_type(rhs) };
+        let out = lhs + rhs;
         Ok(out.into_series())
     }
-    fn multiply(&self, rhs: &Series) -> Result<Series> {
+    fn multiply(lhs: &ChunkedArray<T>, rhs: &Series) -> PolarsResult<Series> {
         // Safety:
         // see subtract
-        let rhs = unsafe { self.unpack_series_matching_physical_type(rhs) };
-        let out = self * rhs;
+        let rhs = unsafe { lhs.unpack_series_matching_physical_type(rhs) };
+        let out = lhs * rhs;
         Ok(out.into_series())
     }
-    fn divide(&self, rhs: &Series) -> Result<Series> {
+    fn divide(lhs: &ChunkedArray<T>, rhs: &Series) -> PolarsResult<Series> {
         // Safety:
         // see subtract
-        let rhs = unsafe { self.unpack_series_matching_physical_type(rhs) };
-        let out = self / rhs;
+        let rhs = unsafe { lhs.unpack_series_matching_physical_type(rhs) };
+        let out = lhs / rhs;
         Ok(out.into_series())
     }
-    fn remainder(&self, rhs: &Series) -> Result<Series> {
+    fn remainder(lhs: &ChunkedArray<T>, rhs: &Series) -> PolarsResult<Series> {
         // Safety:
         // see subtract
-        let rhs = unsafe { self.unpack_series_matching_physical_type(rhs) };
-        let out = self % rhs;
+        let rhs = unsafe { lhs.unpack_series_matching_physical_type(rhs) };
+        let out = lhs % rhs;
         Ok(out.into_series())
     }
 }
 
-impl NumOpsDispatch for Utf8Chunked {
-    fn add_to(&self, rhs: &Series) -> Result<Series> {
-        let rhs = self.unpack_series_matching_type(rhs)?;
-        let out = self + rhs;
+impl NumOpsDispatchInner for Utf8Type {
+    fn add_to(lhs: &Utf8Chunked, rhs: &Series) -> PolarsResult<Series> {
+        let rhs = lhs.unpack_series_matching_type(rhs)?;
+        let out = lhs + rhs;
+        Ok(out.into_series())
+    }
+}
+
+impl NumOpsDispatchInner for BinaryType {
+    fn add_to(lhs: &BinaryChunked, rhs: &Series) -> PolarsResult<Series> {
+        let rhs = lhs.unpack_series_matching_type(rhs)?;
+        let out = lhs + rhs;
         Ok(out.into_series())
     }
 }
 
 #[cfg(feature = "checked_arithmetic")]
 pub mod checked {
+    use num_traits::{CheckedDiv, One, ToPrimitive, Zero};
+
     use super::*;
     use crate::utils::align_chunks_binary;
-    use num::{CheckedDiv, ToPrimitive, Zero};
 
-    pub trait NumOpsDispatchChecked: Debug {
+    pub trait NumOpsDispatchCheckedInner: PolarsDataType + Sized {
         /// Checked integer division. Computes self / rhs, returning None if rhs == 0 or the division results in overflow.
-        fn checked_div(&self, rhs: &Series) -> Result<Series> {
-            Err(PolarsError::InvalidOperation(
-                format!(
-                    "checked division operation not supported for {:?} and {:?}",
-                    self, rhs
-                )
-                .into(),
-            ))
+        fn checked_div(lhs: &ChunkedArray<Self>, rhs: &Series) -> PolarsResult<Series> {
+            polars_bail!(opq = checked_div, lhs.dtype(), rhs.dtype());
         }
-        fn checked_div_num<T: ToPrimitive>(&self, _rhs: T) -> Result<Series> {
-            Err(PolarsError::InvalidOperation(
-                format!(
-                    "checked division by number operation not supported for {:?}",
-                    self
-                )
-                .into(),
-            ))
+        fn checked_div_num<T: ToPrimitive>(
+            lhs: &ChunkedArray<Self>,
+            _rhs: T,
+        ) -> PolarsResult<Series> {
+            polars_bail!(opq = checked_div_num, lhs.dtype(), Self::get_dtype());
         }
     }
 
-    impl<T> NumOpsDispatchChecked for ChunkedArray<T>
+    pub trait NumOpsDispatchChecked {
+        /// Checked integer division. Computes self / rhs, returning None if rhs == 0 or the division results in overflow.
+        fn checked_div(&self, rhs: &Series) -> PolarsResult<Series>;
+        fn checked_div_num<T: ToPrimitive>(&self, _rhs: T) -> PolarsResult<Series>;
+    }
+
+    impl<S: NumOpsDispatchCheckedInner> NumOpsDispatchChecked for ChunkedArray<S> {
+        fn checked_div(&self, rhs: &Series) -> PolarsResult<Series> {
+            S::checked_div(self, rhs)
+        }
+        fn checked_div_num<T: ToPrimitive>(&self, rhs: T) -> PolarsResult<Series> {
+            S::checked_div_num(self, rhs)
+        }
+    }
+
+    impl<T> NumOpsDispatchCheckedInner for T
     where
         T: PolarsIntegerType,
-        T::Native:
-            CheckedDiv<Output = T::Native> + CheckedDiv<Output = T::Native> + num::Zero + num::One,
+        T::Native: CheckedDiv<Output = T::Native> + CheckedDiv<Output = T::Native> + Zero + One,
         ChunkedArray<T>: IntoSeries,
     {
-        fn checked_div(&self, rhs: &Series) -> Result<Series> {
+        fn checked_div(lhs: &ChunkedArray<T>, rhs: &Series) -> PolarsResult<Series> {
             // Safety:
             // There will be UB if a ChunkedArray is alive with the wrong datatype.
             // we now only create the potentially wrong dtype for a short time.
             // Note that the physical type correctness is checked!
             // The ChunkedArray with the wrong dtype is dropped after this operation
-            let rhs = unsafe { self.unpack_series_matching_physical_type(rhs) };
-            let (l, r) = align_chunks_binary(self, rhs);
+            let rhs = unsafe { lhs.unpack_series_matching_physical_type(rhs) };
+            let (l, r) = align_chunks_binary(lhs, rhs);
 
             Ok((l)
                 .downcast_iter()
@@ -164,12 +174,12 @@ pub mod checked {
         }
     }
 
-    impl NumOpsDispatchChecked for Float32Chunked {
-        fn checked_div(&self, rhs: &Series) -> Result<Series> {
+    impl NumOpsDispatchCheckedInner for Float32Type {
+        fn checked_div(lhs: &Float32Chunked, rhs: &Series) -> PolarsResult<Series> {
             // Safety:
             // see check_div for chunkedarray<T>
-            let rhs = unsafe { self.unpack_series_matching_physical_type(rhs) };
-            let (l, r) = align_chunks_binary(self, rhs);
+            let rhs = unsafe { lhs.unpack_series_matching_physical_type(rhs) };
+            let (l, r) = align_chunks_binary(lhs, rhs);
 
             Ok((l)
                 .downcast_iter()
@@ -196,12 +206,12 @@ pub mod checked {
         }
     }
 
-    impl NumOpsDispatchChecked for Float64Chunked {
-        fn checked_div(&self, rhs: &Series) -> Result<Series> {
+    impl NumOpsDispatchCheckedInner for Float64Type {
+        fn checked_div(lhs: &Float64Chunked, rhs: &Series) -> PolarsResult<Series> {
             // Safety:
             // see check_div
-            let rhs = unsafe { self.unpack_series_matching_physical_type(rhs) };
-            let (l, r) = align_chunks_binary(self, rhs);
+            let rhs = unsafe { lhs.unpack_series_matching_physical_type(rhs) };
+            let (l, r) = align_chunks_binary(lhs, rhs);
 
             Ok((l)
                 .downcast_iter()
@@ -229,12 +239,12 @@ pub mod checked {
     }
 
     impl NumOpsDispatchChecked for Series {
-        fn checked_div(&self, rhs: &Series) -> Result<Series> {
+        fn checked_div(&self, rhs: &Series) -> PolarsResult<Series> {
             let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
             lhs.as_ref().as_ref().checked_div(rhs.as_ref())
         }
 
-        fn checked_div_num<T: ToPrimitive>(&self, rhs: T) -> Result<Series> {
+        fn checked_div_num<T: ToPrimitive>(&self, rhs: T) -> PolarsResult<Series> {
             use DataType::*;
             let s = self.to_physical_repr();
 
@@ -321,12 +331,18 @@ pub mod checked {
 pub(crate) fn coerce_lhs_rhs<'a>(
     lhs: &'a Series,
     rhs: &'a Series,
-) -> Result<(Cow<'a, Series>, Cow<'a, Series>)> {
-    if let Ok(result) = coerce_time_units(lhs, rhs) {
+) -> PolarsResult<(Cow<'a, Series>, Cow<'a, Series>)> {
+    if let Some(result) = coerce_time_units(lhs, rhs) {
         return Ok(result);
     }
+    let dtype = match (lhs.dtype(), rhs.dtype()) {
+        #[cfg(feature = "dtype-struct")]
+        (DataType::Struct(_), DataType::Struct(_)) => {
+            return Ok((Cow::Borrowed(lhs), Cow::Borrowed(rhs)))
+        }
+        _ => try_get_supertype(lhs.dtype(), rhs.dtype())?,
+    };
 
-    let dtype = get_supertype(lhs.dtype(), rhs.dtype())?;
     let left = if lhs.dtype() == &dtype {
         Cow::Borrowed(lhs)
     } else {
@@ -347,72 +363,120 @@ pub(crate) fn coerce_lhs_rhs<'a>(
 fn coerce_time_units<'a>(
     lhs: &'a Series,
     rhs: &'a Series,
-) -> Result<(Cow<'a, Series>, Cow<'a, Series>)> {
-    return if let (DataType::Datetime(lu, t), DataType::Duration(ru)) = (lhs.dtype(), rhs.dtype()) {
-        let units = get_time_units(lu, ru);
-        let left = if *lu == units {
-            Cow::Borrowed(lhs)
-        } else {
-            Cow::Owned(lhs.cast(&DataType::Datetime(units, t.clone()))?)
-        };
-        let right = if *ru == units {
-            Cow::Borrowed(rhs)
-        } else {
-            Cow::Owned(rhs.cast(&DataType::Duration(units))?)
-        };
-        Ok((left, right))
-    } else if let (DataType::Duration(lu), DataType::Duration(ru)) = (lhs.dtype(), rhs.dtype()) {
-        let units = get_time_units(lu, ru);
-        let left = if *lu == units {
-            Cow::Borrowed(lhs)
-        } else {
-            Cow::Owned(lhs.cast(&DataType::Duration(units))?)
-        };
-        let right = if *ru == units {
-            Cow::Borrowed(rhs)
-        } else {
-            Cow::Owned(rhs.cast(&DataType::Duration(units))?)
-        };
-        Ok((left, right))
-    } else if let (DataType::Date, DataType::Duration(units)) = (lhs.dtype(), rhs.dtype()) {
-        let left = Cow::Owned(lhs.cast(&DataType::Datetime(*units, None))?);
-        Ok((left, Cow::Borrowed(rhs)))
-    } else if let (DataType::Duration(_), DataType::Datetime(_, _))
-    | (DataType::Duration(_), DataType::Date) = (lhs.dtype(), rhs.dtype())
-    {
-        let (right, left) = coerce_time_units(rhs, lhs)?;
-        Ok((left, right))
-    } else {
-        Err(PolarsError::InvalidOperation(
-            format!(
-                "Cannot coerce time units for {} {}",
-                lhs.dtype(),
-                rhs.dtype()
-            )
-            .into(),
-        ))
-    };
+) -> Option<(Cow<'a, Series>, Cow<'a, Series>)> {
+    match (lhs.dtype(), rhs.dtype()) {
+        (DataType::Datetime(lu, t), DataType::Duration(ru)) => {
+            let units = get_time_units(lu, ru);
+            let left = if *lu == units {
+                Cow::Borrowed(lhs)
+            } else {
+                Cow::Owned(lhs.cast(&DataType::Datetime(units, t.clone())).ok()?)
+            };
+            let right = if *ru == units {
+                Cow::Borrowed(rhs)
+            } else {
+                Cow::Owned(rhs.cast(&DataType::Duration(units)).ok()?)
+            };
+            Some((left, right))
+        }
+        // make sure to return Some here, so we don't cast to supertype.
+        (DataType::Date, DataType::Duration(_)) => Some((Cow::Borrowed(lhs), Cow::Borrowed(rhs))),
+        (DataType::Duration(lu), DataType::Duration(ru)) => {
+            let units = get_time_units(lu, ru);
+            let left = if *lu == units {
+                Cow::Borrowed(lhs)
+            } else {
+                Cow::Owned(lhs.cast(&DataType::Duration(units)).ok()?)
+            };
+            let right = if *ru == units {
+                Cow::Borrowed(rhs)
+            } else {
+                Cow::Owned(rhs.cast(&DataType::Duration(units)).ok()?)
+            };
+            Some((left, right))
+        }
+        // swap the order
+        (DataType::Duration(_), DataType::Datetime(_, _))
+        | (DataType::Duration(_), DataType::Date) => {
+            let (right, left) = coerce_time_units(rhs, lhs)?;
+            Some((left, right))
+        }
+        _ => None,
+    }
 }
 
-impl ops::Sub for &Series {
+#[cfg(feature = "dtype-struct")]
+pub fn _struct_arithmetic<F: FnMut(&Series, &Series) -> Series>(
+    s: &Series,
+    rhs: &Series,
+    mut func: F,
+) -> Series {
+    let s = s.struct_().unwrap();
+    let rhs = rhs.struct_().unwrap();
+    let s_fields = s.fields();
+    let rhs_fields = rhs.fields();
+
+    match (s_fields.len(), rhs_fields.len()) {
+        (_, 1) => {
+            let rhs = &rhs.fields()[0];
+            s.apply_fields(|s| func(s, rhs)).into_series()
+        }
+        (1, _) => {
+            let s = &s.fields()[0];
+            rhs.apply_fields(|rhs| func(s, rhs)).into_series()
+        }
+        _ => {
+            let mut rhs_iter = rhs.fields().iter();
+
+            s.apply_fields(|s| match rhs_iter.next() {
+                Some(rhs) => func(s, rhs),
+                None => s.clone(),
+            })
+            .into_series()
+        }
+    }
+}
+
+impl Sub for &Series {
     type Output = Series;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
-        lhs.subtract(rhs.as_ref()).expect("data types don't match")
+        match (self.dtype(), rhs.dtype()) {
+            #[cfg(feature = "dtype-struct")]
+            (DataType::Struct(_), DataType::Struct(_)) => {
+                _struct_arithmetic(self, rhs, |a, b| a.sub(b))
+            }
+            _ => {
+                let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
+                lhs.subtract(rhs.as_ref()).expect("data types don't match")
+            }
+        }
     }
 }
 
-impl ops::Add for &Series {
+impl Series {
+    pub fn try_add(&self, rhs: &Series) -> PolarsResult<Series> {
+        match (self.dtype(), rhs.dtype()) {
+            #[cfg(feature = "dtype-struct")]
+            (DataType::Struct(_), DataType::Struct(_)) => {
+                Ok(_struct_arithmetic(self, rhs, |a, b| a.add(b)))
+            }
+            _ => {
+                let (lhs, rhs) = coerce_lhs_rhs(self, rhs)?;
+                lhs.add_to(rhs.as_ref())
+            }
+        }
+    }
+}
+impl Add for &Series {
     type Output = Series;
 
     fn add(self, rhs: Self) -> Self::Output {
-        let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
-        lhs.add_to(rhs.as_ref()).expect("data types don't match")
+        self.try_add(rhs).unwrap()
     }
 }
 
-impl ops::Mul for &Series {
+impl Mul for &Series {
     type Output = Series;
 
     /// ```
@@ -421,12 +485,20 @@ impl ops::Mul for &Series {
     /// let out = &s * &s;
     /// ```
     fn mul(self, rhs: Self) -> Self::Output {
-        let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
-        lhs.multiply(rhs.as_ref()).expect("data types don't match")
+        match (self.dtype(), rhs.dtype()) {
+            #[cfg(feature = "dtype-struct")]
+            (DataType::Struct(_), DataType::Struct(_)) => {
+                _struct_arithmetic(self, rhs, |a, b| a.mul(b))
+            }
+            _ => {
+                let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
+                lhs.multiply(rhs.as_ref()).expect("data types don't match")
+            }
+        }
     }
 }
 
-impl ops::Div for &Series {
+impl Div for &Series {
     type Output = Series;
 
     /// ```
@@ -435,12 +507,20 @@ impl ops::Div for &Series {
     /// let out = &s / &s;
     /// ```
     fn div(self, rhs: Self) -> Self::Output {
-        let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
-        lhs.divide(rhs.as_ref()).expect("data types don't match")
+        match (self.dtype(), rhs.dtype()) {
+            #[cfg(feature = "dtype-struct")]
+            (DataType::Struct(_), DataType::Struct(_)) => {
+                _struct_arithmetic(self, rhs, |a, b| a.div(b))
+            }
+            _ => {
+                let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
+                lhs.divide(rhs.as_ref()).expect("data types don't match")
+            }
+        }
     }
 }
 
-impl ops::Rem for &Series {
+impl Rem for &Series {
     type Output = Series;
 
     /// ```
@@ -449,8 +529,16 @@ impl ops::Rem for &Series {
     /// let out = &s / &s;
     /// ```
     fn rem(self, rhs: Self) -> Self::Output {
-        let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
-        lhs.remainder(rhs.as_ref()).expect("data types don't match")
+        match (self.dtype(), rhs.dtype()) {
+            #[cfg(feature = "dtype-struct")]
+            (DataType::Struct(_), DataType::Struct(_)) => {
+                _struct_arithmetic(self, rhs, |a, b| a.rem(b))
+            }
+            _ => {
+                let (lhs, rhs) = coerce_lhs_rhs(self, rhs).expect("cannot coerce datatypes");
+                lhs.remainder(rhs.as_ref()).expect("data types don't match")
+            }
+        }
     }
 }
 
@@ -470,7 +558,7 @@ fn finish_cast(inp: &Series, out: Series) -> Series {
     }
 }
 
-impl<T> ops::Sub<T> for &Series
+impl<T> Sub<T> for &Series
 where
     T: Num + NumCast,
 {
@@ -484,12 +572,12 @@ where
             }};
         }
 
-        let out = match_arrow_data_type_apply_macro_ca_logical_num!(s, sub);
+        let out = downcast_as_macro_arg_physical!(s, sub);
         finish_cast(self, out)
     }
 }
 
-impl<T> ops::Sub<T> for Series
+impl<T> Sub<T> for Series
 where
     T: Num + NumCast,
 {
@@ -500,7 +588,7 @@ where
     }
 }
 
-impl<T> ops::Add<T> for &Series
+impl<T> Add<T> for &Series
 where
     T: Num + NumCast,
 {
@@ -513,12 +601,12 @@ where
                 $ca.add(rhs).into_series()
             }};
         }
-        let out = match_arrow_data_type_apply_macro_ca_logical_num!(s, add);
+        let out = downcast_as_macro_arg_physical!(s, add);
         finish_cast(self, out)
     }
 }
 
-impl<T> ops::Add<T> for Series
+impl<T> Add<T> for Series
 where
     T: Num + NumCast,
 {
@@ -529,7 +617,7 @@ where
     }
 }
 
-impl<T> ops::Div<T> for &Series
+impl<T> Div<T> for &Series
 where
     T: Num + NumCast,
 {
@@ -543,12 +631,12 @@ where
             }};
         }
 
-        let out = match_arrow_data_type_apply_macro_ca_logical_num!(s, div);
+        let out = downcast_as_macro_arg_physical!(s, div);
         finish_cast(self, out)
     }
 }
 
-impl<T> ops::Div<T> for Series
+impl<T> Div<T> for Series
 where
     T: Num + NumCast,
 {
@@ -559,7 +647,7 @@ where
     }
 }
 
-impl<T> ops::Mul<T> for &Series
+impl<T> Mul<T> for &Series
 where
     T: Num + NumCast,
 {
@@ -572,12 +660,12 @@ where
                 $ca.mul(rhs).into_series()
             }};
         }
-        let out = match_arrow_data_type_apply_macro_ca_logical_num!(s, mul);
+        let out = downcast_as_macro_arg_physical!(s, mul);
         finish_cast(self, out)
     }
 }
 
-impl<T> ops::Mul<T> for Series
+impl<T> Mul<T> for Series
 where
     T: Num + NumCast,
 {
@@ -588,7 +676,7 @@ where
     }
 }
 
-impl<T> ops::Rem<T> for &Series
+impl<T> Rem<T> for &Series
 where
     T: Num + NumCast,
 {
@@ -601,12 +689,12 @@ where
                 $ca.rem(rhs).into_series()
             }};
         }
-        let out = match_arrow_data_type_apply_macro_ca_logical_num!(s, rem);
+        let out = downcast_as_macro_arg_physical!(s, rem);
         finish_cast(self, out)
     }
 }
 
-impl<T> ops::Rem<T> for Series
+impl<T> Rem<T> for Series
 where
     T: Num + NumCast,
 {
@@ -674,7 +762,7 @@ where
                 $rhs.lhs_sub(self).into_series()
             }};
         }
-        let out = match_arrow_data_type_apply_macro_ca_logical_num!(s, sub);
+        let out = downcast_as_macro_arg_physical!(s, sub);
 
         finish_cast(rhs, out)
     }
@@ -685,7 +773,7 @@ where
                 $rhs.lhs_div(self).into_series()
             }};
         }
-        let out = match_arrow_data_type_apply_macro_ca_logical_num!(s, div);
+        let out = downcast_as_macro_arg_physical!(s, div);
 
         finish_cast(rhs, out)
     }
@@ -701,7 +789,7 @@ where
             }};
         }
 
-        let out = match_arrow_data_type_apply_macro_ca_logical_num!(s, rem);
+        let out = downcast_as_macro_arg_physical!(s, rem);
 
         finish_cast(rhs, out)
     }

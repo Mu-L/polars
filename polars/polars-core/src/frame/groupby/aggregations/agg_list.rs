@@ -1,3 +1,5 @@
+use arrow::offset::Offsets;
+
 use super::*;
 #[cfg(feature = "dtype-struct")]
 use crate::chunked_array::builder::AnonymousOwnedListBuilder;
@@ -67,22 +69,19 @@ where
                     None
                 };
 
-                let array = PrimitiveArray::from_data(
-                    T::get_dtype().to_arrow(),
-                    list_values.into(),
-                    validity,
-                );
+                let array =
+                    PrimitiveArray::new(T::get_dtype().to_arrow(), list_values.into(), validity);
                 let data_type = ListArray::<i64>::default_datatype(T::get_dtype().to_arrow());
                 // Safety:
                 // offsets are monotonically increasing
-                let arr = ListArray::<i64>::new_unchecked(
+                let arr = ListArray::<i64>::new(
                     data_type,
-                    offsets.into(),
+                    Offsets::new_unchecked(offsets).into(),
                     Box::new(array),
                     None,
                 );
 
-                let mut ca = ListChunked::from_chunks(self.name(), vec![Box::new(arr)]);
+                let mut ca = unsafe { ListChunked::from_chunks(self.name(), vec![Box::new(arr)]) };
                 if can_fast_explode {
                     ca.set_fast_explode()
                 }
@@ -130,19 +129,16 @@ where
                     None
                 };
 
-                let array = PrimitiveArray::from_data(
-                    T::get_dtype().to_arrow(),
-                    list_values.into(),
-                    validity,
-                );
+                let array =
+                    PrimitiveArray::new(T::get_dtype().to_arrow(), list_values.into(), validity);
                 let data_type = ListArray::<i64>::default_datatype(T::get_dtype().to_arrow());
-                let arr = ListArray::<i64>::new_unchecked(
+                let arr = ListArray::<i64>::new(
                     data_type,
-                    offsets.into(),
+                    Offsets::new_unchecked(offsets).into(),
                     Box::new(array),
                     None,
                 );
-                let mut ca = ListChunked::from_chunks(self.name(), vec![Box::new(arr)]);
+                let mut ca = unsafe { ListChunked::from_chunks(self.name(), vec![Box::new(arr)]) };
                 if can_fast_explode {
                     ca.set_fast_explode()
                 }
@@ -179,6 +175,7 @@ impl AggList for BooleanChunked {
 
 impl AggList for Utf8Chunked {
     unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+        // TODO: dispatch via binary
         match groups {
             GroupsProxy::Idx(groups) => {
                 let mut builder =
@@ -202,11 +199,38 @@ impl AggList for Utf8Chunked {
     }
 }
 
+impl AggList for BinaryChunked {
+    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+        match groups {
+            GroupsProxy::Idx(groups) => {
+                let mut builder =
+                    ListBinaryChunkedBuilder::new(self.name(), groups.len(), self.len());
+                for idx in groups.all().iter() {
+                    let ca = { self.take_unchecked(idx.into()) };
+                    builder.append(&ca)
+                }
+                builder.finish().into_series()
+            }
+            GroupsProxy::Slice { groups, .. } => {
+                let mut builder =
+                    ListBinaryChunkedBuilder::new(self.name(), groups.len(), self.len());
+                for [first, len] in groups {
+                    let ca = self.slice(*first as i64, *len as usize);
+                    builder.append(&ca)
+                }
+                builder.finish().into_series()
+            }
+        }
+    }
+}
+
 fn agg_list_list<F: Fn(&ListChunked, bool, &mut Vec<i64>, &mut i64, &mut Vec<ArrayRef>) -> bool>(
     ca: &ListChunked,
     groups_len: usize,
     func: F,
 ) -> Series {
+    let inner_dtype = ca.inner_dtype();
+    let inner_dtype_physical = inner_dtype.to_physical();
     let can_fast_explode = true;
     let mut offsets = Vec::<i64>::with_capacity(groups_len + 1);
     let mut length_so_far = 0i64;
@@ -222,7 +246,7 @@ fn agg_list_list<F: Fn(&ListChunked, bool, &mut Vec<i64>, &mut i64, &mut Vec<Arr
         &mut list_values,
     );
     if groups_len == 0 {
-        list_values.push(ca.chunks[0].slice(0, 0))
+        list_values.push(ca.chunks[0].sliced(0, 0))
     }
     let arrays = list_values.iter().map(|arr| &**arr).collect::<Vec<_>>();
     let list_values: ArrayRef = arrow::compute::concatenate::concatenate(&arrays).unwrap();
@@ -230,16 +254,19 @@ fn agg_list_list<F: Fn(&ListChunked, bool, &mut Vec<i64>, &mut i64, &mut Vec<Arr
     // Safety:
     // offsets are monotonically increasing
     let arr = unsafe {
-        Box::new(ListArray::<i64>::new_unchecked(
+        Box::new(ListArray::<i64>::new(
             data_type,
-            offsets.into(),
+            Offsets::new_unchecked(offsets).into(),
             list_values,
             None,
         )) as ArrayRef
     };
-    let mut listarr = ListChunked::from_chunks(ca.name(), vec![arr]);
+    let mut listarr = unsafe { ListChunked::from_chunks(ca.name(), vec![arr]) };
     if can_fast_explode {
         listarr.set_fast_explode()
+    }
+    if inner_dtype_physical != inner_dtype {
+        listarr.to_logical(DataType::List(Box::new(inner_dtype)));
     }
     listarr.into_series()
 }
@@ -330,7 +357,7 @@ impl<T: PolarsObject> AggList for ObjectChunked<T> {
                             (group_vals, idx.len() as IdxSize)
                         }
                         GroupsIndicator::Slice([first, len]) => {
-                            let group_vals = slice_from_offsets(self, first, len);
+                            let group_vals = _slice_from_offsets(self, first, len);
 
                             (group_vals, len)
                         }
@@ -363,14 +390,14 @@ impl<T: PolarsObject> AggList for ObjectChunked<T> {
         let data_type = ListArray::<i64>::default_datatype(extension_dtype.clone());
         // Safety:
         // offsets are monotonically increasing
-        let arr = Box::new(ListArray::<i64>::new_unchecked(
+        let arr = Box::new(ListArray::<i64>::new(
             data_type,
-            offsets.into(),
+            Offsets::new_unchecked(offsets).into(),
             extension_array,
             None,
         )) as ArrayRef;
 
-        let mut listarr = ListChunked::from_chunks(self.name(), vec![arr]);
+        let mut listarr = unsafe { ListChunked::from_chunks(self.name(), vec![arr]) };
         if can_fast_explode {
             listarr.set_fast_explode()
         }

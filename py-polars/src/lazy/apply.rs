@@ -1,9 +1,11 @@
-use crate::lazy::dsl::PyExpr;
-use crate::prelude::PyDataType;
-use crate::series::PySeries;
 use polars::prelude::*;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+
+use crate::lazy::dsl::PyExpr;
+use crate::py_modules::POLARS;
+use crate::series::PySeries;
+use crate::Wrap;
 
 trait ToSeries {
     fn to_series(&self, py: Python, py_polars_module: &PyObject, name: &str) -> Series;
@@ -37,20 +39,13 @@ impl ToSeries for PyObject {
     }
 }
 
-fn get_output_type(obj: &PyAny) -> Option<DataType> {
-    match obj.is_none() {
-        true => None,
-        false => Some(obj.extract::<PyDataType>().unwrap().into()),
-    }
-}
-
 pub(crate) fn call_lambda_with_series(
     py: Python,
     s: Series,
     lambda: &PyObject,
     polars_module: &PyObject,
-) -> PyObject {
-    let pypolars = polars_module.cast_as::<PyModule>(py).unwrap();
+) -> PyResult<PyObject> {
+    let pypolars = polars_module.downcast::<PyModule>(py).unwrap();
 
     // create a PySeries struct/object for Python
     let pyseries = PySeries::new(s);
@@ -61,112 +56,102 @@ pub(crate) fn call_lambda_with_series(
         .call1((pyseries,))
         .unwrap();
     // call the lambda and get a python side Series wrapper
-    match lambda.call1(py, (python_series_wrapper,)) {
-        Ok(pyobj) => pyobj,
-        Err(e) => panic!("python apply failed: {}", e.value(py)),
-    }
+    lambda.call1(py, (python_series_wrapper,))
 }
 
 /// A python lambda taking two Series
-pub(crate) fn binary_lambda(lambda: &PyObject, a: Series, b: Series) -> Result<Series> {
-    let gil = Python::acquire_gil();
-    let py = gil.python();
-    // get the pypolars module
-    let pypolars = PyModule::import(py, "polars").unwrap();
-    // create a PySeries struct/object for Python
-    let pyseries_a = PySeries::new(a);
-    let pyseries_b = PySeries::new(b);
+pub(crate) fn binary_lambda(
+    lambda: &PyObject,
+    a: Series,
+    b: Series,
+) -> PolarsResult<Option<Series>> {
+    Python::with_gil(|py| {
+        // get the pypolars module
+        let pypolars = PyModule::import(py, "polars").unwrap();
+        // create a PySeries struct/object for Python
+        let pyseries_a = PySeries::new(a);
+        let pyseries_b = PySeries::new(b);
 
-    // Wrap this PySeries object in the python side Series wrapper
-    let python_series_wrapper_a = pypolars
-        .getattr("wrap_s")
-        .unwrap()
-        .call1((pyseries_a,))
-        .unwrap();
-    let python_series_wrapper_b = pypolars
-        .getattr("wrap_s")
-        .unwrap()
-        .call1((pyseries_b,))
-        .unwrap();
+        // Wrap this PySeries object in the python side Series wrapper
+        let python_series_wrapper_a = pypolars
+            .getattr("wrap_s")
+            .unwrap()
+            .call1((pyseries_a,))
+            .unwrap();
+        let python_series_wrapper_b = pypolars
+            .getattr("wrap_s")
+            .unwrap()
+            .call1((pyseries_b,))
+            .unwrap();
 
-    // call the lambda and get a python side Series wrapper
-    let result_series_wrapper =
-        match lambda.call1(py, (python_series_wrapper_a, python_series_wrapper_b)) {
-            Ok(pyobj) => pyobj,
-            Err(e) => panic!("custom python function failed: {}", e.value(py)),
+        // call the lambda and get a python side Series wrapper
+        let result_series_wrapper =
+            match lambda.call1(py, (python_series_wrapper_a, python_series_wrapper_b)) {
+                Ok(pyobj) => pyobj,
+                Err(e) => polars_bail!(
+                    ComputeError: "custom python function failed: {}", e.value(py),
+                ),
+            };
+        let pyseries = if let Ok(expr) = result_series_wrapper.getattr(py, "_pyexpr") {
+            let pyexpr = expr.extract::<PyExpr>(py).unwrap();
+            let expr = pyexpr.inner;
+            let df = DataFrame::new_no_checks(vec![]);
+            let out = df
+                .lazy()
+                .select([expr])
+                .with_predicate_pushdown(false)
+                .with_projection_pushdown(false)
+                .collect()?;
+
+            let s = out.select_at_idx(0).unwrap().clone();
+            PySeries::new(s)
+        } else {
+            return Ok(Some(result_series_wrapper.to_series(
+                py,
+                &pypolars.into_py(py),
+                "",
+            )));
         };
-    let pyseries = if let Ok(expr) = result_series_wrapper.getattr(py, "_pyexpr") {
-        let pyexpr = expr.extract::<PyExpr>(py).unwrap();
-        let expr = pyexpr.inner;
-        let df = DataFrame::new_no_checks(vec![]);
-        let out = df
-            .lazy()
-            .select([expr])
-            .with_predicate_pushdown(false)
-            .with_projection_pushdown(false)
-            .with_aggregate_pushdown(false)
-            .collect()?;
 
-        let s = out.select_at_idx(0).unwrap().clone();
-        PySeries::new(s)
-    } else {
-        return Ok(result_series_wrapper.to_series(py, &pypolars.into_py(py), ""));
-    };
-
-    // Finally get the actual Series
-    Ok(pyseries.series)
-}
-
-pub fn binary_function(
-    input_a: PyExpr,
-    input_b: PyExpr,
-    lambda: PyObject,
-    output_type: Option<DataType>,
-) -> PyExpr {
-    let input_a = input_a.inner;
-    let input_b = input_b.inner;
-
-    let output_field = match output_type {
-        None => Field::new("binary_function", DataType::Null),
-        Some(dt) => Field::new("binary_function", dt),
-    };
-
-    let func = move |a: Series, b: Series| binary_lambda(&lambda, a, b);
-
-    polars::lazy::dsl::map_binary(
-        input_a,
-        input_b,
-        func,
-        GetOutput::map_field(move |_| output_field.clone()),
-    )
-    .into()
+        // Finally get the actual Series
+        Ok(Some(pyseries.series))
+    })
 }
 
 pub fn map_single(
     pyexpr: &PyExpr,
-    py: Python,
     lambda: PyObject,
-    output_type: &PyAny,
+    output_type: Option<Wrap<DataType>>,
     agg_list: bool,
 ) -> PyExpr {
-    let output_type = get_output_type(output_type);
-    // get the pypolars module
-    // do the import outside of the function to prevent import side effects in a hot loop.
-    let pypolars = PyModule::import(py, "polars").unwrap().to_object(py);
+    let output_type = output_type.map(|wrap| wrap.0);
 
+    let output_type2 = output_type.clone();
     let function = move |s: Series| {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        Python::with_gil(|py| {
+            let output_type = output_type2.clone().unwrap_or(DataType::Unknown);
 
-        // this is a python Series
-        let out = call_lambda_with_series(py, s.clone(), &lambda, &pypolars);
-
-        Ok(out.to_series(py, &pypolars, s.name()))
+            // this is a python Series
+            let out = call_lambda_with_series(py, s.clone(), &lambda, &POLARS)
+                .map_err(|e| polars_err!(ComputeError: "{}", e))?;
+            let s = out.to_series(py, &POLARS, s.name());
+            polars_ensure!(
+                matches!(output_type, DataType::Unknown) || s.dtype() == &output_type,
+                SchemaMismatch:
+                "expected output type '{:?}', got '{:?}'; set `return_dtype` to the proper datatype",
+                output_type, s.dtype(),
+            );
+            Ok(Some(s))
+        })
     };
 
     let output_map = GetOutput::map_field(move |fld| match output_type {
         Some(ref dt) => Field::new(fld.name(), dt.clone()),
-        None => fld.clone(),
+        None => {
+            let mut fld = fld.clone();
+            fld.coerce(DataType::Unknown);
+            fld
+        }
     });
     if agg_list {
         pyexpr.clone().inner.map_list(function, output_map).into()
@@ -181,7 +166,7 @@ pub(crate) fn call_lambda_with_series_slice(
     lambda: &PyObject,
     polars_module: &PyObject,
 ) -> PyObject {
-    let pypolars = polars_module.cast_as::<PyModule>(py).unwrap();
+    let pypolars = polars_module.downcast::<PyModule>(py).unwrap();
 
     // create a PySeries struct/object for Python
     let iter = s.iter().map(|s| {
@@ -205,38 +190,36 @@ pub fn map_mul(
     pyexpr: &[PyExpr],
     py: Python,
     lambda: PyObject,
-    output_type: &PyAny,
+    output_type: Option<Wrap<DataType>>,
     apply_groups: bool,
+    returns_scalar: bool,
 ) -> PyExpr {
-    let output_type = get_output_type(output_type);
-
     // get the pypolars module
     // do the import outside of the function to prevent import side effects in a hot loop.
     let pypolars = PyModule::import(py, "polars").unwrap().to_object(py);
 
     let function = move |s: &mut [Series]| {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        Python::with_gil(|py| {
+            // this is a python Series
+            let out = call_lambda_with_series_slice(py, s, &lambda, &pypolars);
 
-        // this is a python Series
-        let out = call_lambda_with_series_slice(py, s, &lambda, &pypolars);
+            // we return an error, because that will become a null value polars lazy apply list
+            if apply_groups && out.is_none(py) {
+                return Ok(None);
+            }
 
-        // we return an error, because that will become a null value polars lazy apply list
-        if apply_groups && out.is_none(py) {
-            return Err(PolarsError::NoData("".into()));
-        }
-
-        Ok(out.to_series(py, &pypolars, ""))
+            Ok(Some(out.to_series(py, &pypolars, "")))
+        })
     };
 
     let exprs = pyexpr.iter().map(|pe| pe.clone().inner).collect::<Vec<_>>();
 
     let output_map = GetOutput::map_field(move |fld| match output_type {
-        Some(ref dt) => Field::new(fld.name(), dt.clone()),
+        Some(ref dt) => Field::new(fld.name(), dt.0.clone()),
         None => fld.clone(),
     });
     if apply_groups {
-        polars::lazy::dsl::apply_multiple(function, exprs, output_map).into()
+        polars::lazy::dsl::apply_multiple(function, exprs, output_map, returns_scalar).into()
     } else {
         polars::lazy::dsl::map_multiple(function, exprs, output_map).into()
     }

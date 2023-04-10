@@ -1,6 +1,8 @@
-use super::*;
-use polars_core::series::unstable::UnstableSeries;
 use std::pin::Pin;
+
+use polars_core::series::unstable::UnstableSeries;
+
+use super::*;
 
 impl<'a> AggregationContext<'a> {
     pub(super) fn iter_groups(
@@ -8,13 +10,18 @@ impl<'a> AggregationContext<'a> {
     ) -> Box<dyn Iterator<Item = Option<UnstableSeries<'_>>> + '_> {
         match self.agg_state() {
             AggState::Literal(_) => {
-                let s = self.series();
-                let s = UnstableSeries::new(s);
-                Box::new(LitIter::new(s, self.groups.len()))
+                self.groups();
+                let s = self.series().rechunk();
+                Box::new(LitIter::new(s.array_ref(0).clone(), self.groups.len()))
             }
             AggState::AggregatedFlat(_) => {
+                self.groups();
                 let s = self.series();
-                Box::new(FlatIter::new(s.array_ref(0).clone(), self.groups.len()))
+                Box::new(FlatIter::new(
+                    s.array_ref(0).clone(),
+                    self.groups.len(),
+                    s.dtype(),
+                ))
             }
             AggState::AggregatedList(_) => {
                 let s = self.series();
@@ -35,15 +42,22 @@ impl<'a> AggregationContext<'a> {
 struct LitIter<'a> {
     len: usize,
     offset: usize,
+    // UnstableSeries referenced that series
+    #[allow(dead_code)]
+    series_container: Pin<Box<Series>>,
     item: UnstableSeries<'a>,
 }
 
 impl<'a> LitIter<'a> {
-    fn new(s: UnstableSeries<'a>, len: usize) -> Self {
+    fn new(array: ArrayRef, len: usize) -> Self {
+        let mut series_container = Box::pin(Series::try_from(("", array.clone())).unwrap());
+        let ref_s = &mut *series_container as *mut Series;
         Self {
-            len,
             offset: 0,
-            item: s,
+            len,
+            series_container,
+            // Safety: we pinned the series so the location is still valid
+            item: UnstableSeries::new(unsafe { &mut *ref_s }),
         }
     }
 }
@@ -59,6 +73,10 @@ impl<'a> Iterator for LitIter<'a> {
             Some(Some(self.item))
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
 }
 
 struct FlatIter<'a> {
@@ -72,16 +90,21 @@ struct FlatIter<'a> {
 }
 
 impl<'a> FlatIter<'a> {
-    fn new(array: ArrayRef, len: usize) -> Self {
-        let series_container = Box::pin(Series::try_from(("", array.clone())).unwrap());
-        let ref_s = &*series_container as *const Series;
+    fn new(array: ArrayRef, len: usize, logical: &DataType) -> Self {
+        let mut series_container = Box::pin(
+            Series::try_from(("", array.clone()))
+                .unwrap()
+                .cast(logical)
+                .unwrap(),
+        );
+        let ref_s = &mut *series_container as *mut Series;
         Self {
             array,
             offset: 0,
             len,
             series_container,
             // Safety: we pinned the series so the location is still valid
-            item: UnstableSeries::new(unsafe { &*ref_s }),
+            item: UnstableSeries::new(unsafe { &mut *ref_s }),
         }
     }
 }
@@ -93,10 +116,13 @@ impl<'a> Iterator for FlatIter<'a> {
         if self.len == self.offset {
             None
         } else {
-            let arr = unsafe { self.array.slice_unchecked(self.offset, 1) };
+            let mut arr = unsafe { self.array.sliced_unchecked(self.offset, 1) };
             self.offset += 1;
-            self.item.swap(arr);
+            self.item.swap(&mut arr);
             Some(Some(self.item))
         }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.offset))
     }
 }

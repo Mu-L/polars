@@ -1,3 +1,6 @@
+use num_traits::NumCast;
+
+use super::single_keys_inner::hash_join_tuples_inner;
 use super::*;
 #[cfg(feature = "chunked_ids")]
 use crate::utils::create_chunked_index_mapping;
@@ -11,8 +14,16 @@ impl Series {
         use DataType::*;
         match lhs.dtype() {
             Utf8 => {
-                let lhs = lhs.utf8().unwrap();
-                let rhs = rhs.utf8().unwrap();
+                let lhs = lhs.cast(&Binary).unwrap();
+                let rhs = rhs.cast(&Binary).unwrap();
+
+                let lhs = lhs.binary().unwrap();
+                let rhs = rhs.binary().unwrap();
+                lhs.hash_join_left(rhs)
+            }
+            Binary => {
+                let lhs = lhs.binary().unwrap();
+                let rhs = rhs.binary().unwrap();
                 lhs.hash_join_left(rhs)
             }
             _ => {
@@ -36,8 +47,16 @@ impl Series {
         use DataType::*;
         match lhs.dtype() {
             Utf8 => {
-                let lhs = lhs.utf8().unwrap();
-                let rhs = rhs.utf8().unwrap();
+                let lhs = lhs.cast(&Binary).unwrap();
+                let rhs = rhs.cast(&Binary).unwrap();
+
+                let lhs = lhs.binary().unwrap();
+                let rhs = rhs.binary().unwrap();
+                lhs.hash_join_semi_anti(rhs, anti)
+            }
+            Binary => {
+                let lhs = lhs.binary().unwrap();
+                let rhs = rhs.binary().unwrap();
                 lhs.hash_join_semi_anti(rhs, anti)
             }
             _ => {
@@ -54,14 +73,23 @@ impl Series {
         }
     }
 
-    pub(super) fn hash_join_inner(&self, other: &Series) -> (Vec<IdxSize>, Vec<IdxSize>) {
+    // returns the join tuples and whether or not the lhs tuples are sorted
+    pub(super) fn hash_join_inner(&self, other: &Series) -> ((Vec<IdxSize>, Vec<IdxSize>), bool) {
         let (lhs, rhs) = (self.to_physical_repr(), other.to_physical_repr());
 
         use DataType::*;
         match lhs.dtype() {
             Utf8 => {
-                let lhs = lhs.utf8().unwrap();
-                let rhs = rhs.utf8().unwrap();
+                let lhs = lhs.cast(&Binary).unwrap();
+                let rhs = rhs.cast(&Binary).unwrap();
+
+                let lhs = lhs.binary().unwrap();
+                let rhs = rhs.binary().unwrap();
+                lhs.hash_join_inner(rhs)
+            }
+            Binary => {
+                let lhs = lhs.binary().unwrap();
+                let rhs = rhs.binary().unwrap();
                 lhs.hash_join_inner(rhs)
             }
             _ => {
@@ -87,8 +115,16 @@ impl Series {
         use DataType::*;
         match lhs.dtype() {
             Utf8 => {
-                let lhs = lhs.utf8().unwrap();
-                let rhs = rhs.utf8().unwrap();
+                let lhs = lhs.cast(&Binary).unwrap();
+                let rhs = rhs.cast(&Binary).unwrap();
+
+                let lhs = lhs.binary().unwrap();
+                let rhs = rhs.binary().unwrap();
+                lhs.hash_join_outer(rhs)
+            }
+            Binary => {
+                let lhs = lhs.binary().unwrap();
+                let rhs = rhs.binary().unwrap();
                 lhs.hash_join_outer(rhs)
             }
             _ => {
@@ -133,10 +169,11 @@ where
         .collect()
 }
 
+// returns the join tuples and whether or not the lhs tuples are sorted
 fn num_group_join_inner<T>(
     left: &ChunkedArray<T>,
     right: &ChunkedArray<T>,
-) -> (Vec<IdxSize>, Vec<IdxSize>)
+) -> ((Vec<IdxSize>, Vec<IdxSize>), bool)
 where
     T: PolarsIntegerType,
     T::Native: Hash + Eq + Send + AsU64 + Copy,
@@ -155,17 +192,17 @@ where
         (true, true, 1, 1) => {
             let keys_a = splitted_to_slice(&splitted_a);
             let keys_b = splitted_to_slice(&splitted_b);
-            hash_join_tuples_inner(keys_a, keys_b, swap)
+            (hash_join_tuples_inner(keys_a, keys_b, swap), !swap)
         }
         (true, true, _, _) => {
             let keys_a = splitted_by_chunks(&splitted_a);
             let keys_b = splitted_by_chunks(&splitted_b);
-            hash_join_tuples_inner(keys_a, keys_b, swap)
+            (hash_join_tuples_inner(keys_a, keys_b, swap), !swap)
         }
         _ => {
             let keys_a = splitted_to_opt_vec(&splitted_a);
             let keys_b = splitted_to_opt_vec(&splitted_b);
-            hash_join_tuples_inner(keys_a, keys_b, swap)
+            (hash_join_tuples_inner(keys_a, keys_b, swap), !swap)
         }
     }
 }
@@ -257,12 +294,12 @@ where
 impl<T> ChunkedArray<T>
 where
     T: PolarsIntegerType + Sync,
-    T::Native: Eq + Hash + num::NumCast,
+    T::Native: Eq + Hash + NumCast,
 {
     fn hash_join_outer(&self, other: &ChunkedArray<T>) -> Vec<(Option<IdxSize>, Option<IdxSize>)> {
         let (a, b, swap) = det_hash_prone_order!(self, other);
 
-        let n_partitions = set_partition_size();
+        let n_partitions = _set_partition_size();
         let splitted_a = split_ca(a, n_partitions).unwrap();
         let splitted_b = split_ca(b, n_partitions).unwrap();
 
@@ -293,20 +330,20 @@ where
     }
 }
 
-pub(crate) fn prepare_strs<'a>(
-    been_split: &'a [Utf8Chunked],
+pub(crate) fn prepare_bytes<'a>(
+    been_split: &'a [BinaryChunked],
     hb: &RandomState,
-) -> Vec<Vec<StrHash<'a>>> {
+) -> Vec<Vec<BytesHash<'a>>> {
     POOL.install(|| {
         been_split
             .par_iter()
             .map(|ca| {
                 ca.into_iter()
-                    .map(|opt_s| {
+                    .map(|opt_b| {
                         let mut state = hb.build_hasher();
-                        opt_s.hash(&mut state);
+                        opt_b.hash(&mut state);
                         let hash = state.finish();
-                        StrHash::new(opt_s, hash)
+                        BytesHash::new(opt_b, hash)
                     })
                     .collect::<Vec<_>>()
             })
@@ -314,10 +351,10 @@ pub(crate) fn prepare_strs<'a>(
     })
 }
 
-impl Utf8Chunked {
+impl BinaryChunked {
     fn prepare(
         &self,
-        other: &Utf8Chunked,
+        other: &BinaryChunked,
         swapped: bool,
     ) -> (Vec<Self>, Vec<Self>, bool, RandomState) {
         let n_threads = POOL.current_num_threads();
@@ -335,17 +372,21 @@ impl Utf8Chunked {
         (splitted_a, splitted_b, swap, hb)
     }
 
-    fn hash_join_inner(&self, other: &Utf8Chunked) -> (Vec<IdxSize>, Vec<IdxSize>) {
+    // returns the join tuples and whether or not the lhs tuples are sorted
+    fn hash_join_inner(&self, other: &BinaryChunked) -> ((Vec<IdxSize>, Vec<IdxSize>), bool) {
         let (splitted_a, splitted_b, swap, hb) = self.prepare(other, true);
-        let str_hashes_a = prepare_strs(&splitted_a, &hb);
-        let str_hashes_b = prepare_strs(&splitted_b, &hb);
-        hash_join_tuples_inner(str_hashes_a, str_hashes_b, swap)
+        let str_hashes_a = prepare_bytes(&splitted_a, &hb);
+        let str_hashes_b = prepare_bytes(&splitted_b, &hb);
+        (
+            hash_join_tuples_inner(str_hashes_a, str_hashes_b, swap),
+            !swap,
+        )
     }
 
-    fn hash_join_left(&self, other: &Utf8Chunked) -> LeftJoinIds {
+    fn hash_join_left(&self, other: &BinaryChunked) -> LeftJoinIds {
         let (splitted_a, splitted_b, _, hb) = self.prepare(other, false);
-        let str_hashes_a = prepare_strs(&splitted_a, &hb);
-        let str_hashes_b = prepare_strs(&splitted_b, &hb);
+        let str_hashes_a = prepare_bytes(&splitted_a, &hb);
+        let str_hashes_b = prepare_bytes(&splitted_b, &hb);
 
         let (mapping_left, mapping_right) =
             create_mappings(self.chunks(), other.chunks(), self.len(), other.len());
@@ -358,10 +399,10 @@ impl Utf8Chunked {
     }
 
     #[cfg(feature = "semi_anti_join")]
-    fn hash_join_semi_anti(&self, other: &Utf8Chunked, anti: bool) -> Vec<IdxSize> {
+    fn hash_join_semi_anti(&self, other: &BinaryChunked, anti: bool) -> Vec<IdxSize> {
         let (splitted_a, splitted_b, _, hb) = self.prepare(other, false);
-        let str_hashes_a = prepare_strs(&splitted_a, &hb);
-        let str_hashes_b = prepare_strs(&splitted_b, &hb);
+        let str_hashes_a = prepare_bytes(&splitted_a, &hb);
+        let str_hashes_b = prepare_bytes(&splitted_b, &hb);
         if anti {
             hash_join_tuples_left_anti(str_hashes_a, str_hashes_b)
         } else {
@@ -369,10 +410,10 @@ impl Utf8Chunked {
         }
     }
 
-    fn hash_join_outer(&self, other: &Utf8Chunked) -> Vec<(Option<IdxSize>, Option<IdxSize>)> {
+    fn hash_join_outer(&self, other: &BinaryChunked) -> Vec<(Option<IdxSize>, Option<IdxSize>)> {
         let (a, b, swap) = det_hash_prone_order!(self, other);
 
-        let n_partitions = set_partition_size();
+        let n_partitions = _set_partition_size();
         let splitted_a = split_ca(a, n_partitions).unwrap();
         let splitted_b = split_ca(b, n_partitions).unwrap();
 

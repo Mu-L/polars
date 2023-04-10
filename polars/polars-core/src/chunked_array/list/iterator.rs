@@ -1,8 +1,9 @@
+use std::marker::PhantomData;
+use std::ptr::NonNull;
+
 use crate::prelude::*;
 use crate::series::unstable::{ArrayBox, UnstableSeries};
 use crate::utils::CustomIterTools;
-use std::marker::PhantomData;
-use std::ptr::NonNull;
 
 #[cfg(feature = "private")]
 pub struct AmortizedListIter<'a, I: Iterator<Item = Option<ArrayBox>>> {
@@ -38,19 +39,24 @@ impl<'a, I: Iterator<Item = Option<ArrayBox>>> Iterator for AmortizedListIter<'a
                         std::mem::swap(&mut *self.series_container, &mut s);
                         // return a reference to the container
                         // this lifetime is now bound to 'a
-                        return UnstableSeries::new(&*(&*self.series_container as *const Series));
+                        return UnstableSeries::new(
+                            &mut *(&mut *self.series_container as *mut Series),
+                        );
                     }
                 }
 
                 // update the inner state
                 unsafe { *self.inner.as_mut() = array_ref };
 
+                // make sure that the length is correct
+                self.series_container._get_inner_mut().compute_len();
+
                 // Safety
                 // we cannot control the lifetime of an iterators `next` method.
                 // but as long as self is alive the reference to the series container is valid
-                let refer = &*self.series_container;
+                let refer = &mut *self.series_container;
                 unsafe {
-                    let s = std::mem::transmute::<&Series, &'a Series>(refer);
+                    let s = std::mem::transmute::<&mut Series, &'a mut Series>(refer);
                     UnstableSeries::new_with_chunk(s, self.inner.as_ref())
                 }
             })
@@ -123,7 +129,7 @@ impl ListChunked {
         if self.is_empty() {
             return self.clone();
         }
-        let mut fast_explode = true;
+        let mut fast_explode = self.null_count() == 0;
         let mut ca: ListChunked = self
             .amortized_iter()
             .map(|opt_v| {
@@ -144,14 +150,14 @@ impl ListChunked {
         ca
     }
 
-    pub fn try_apply_amortized<'a, F>(&'a self, mut f: F) -> Result<Self>
+    pub fn try_apply_amortized<'a, F>(&'a self, mut f: F) -> PolarsResult<Self>
     where
-        F: FnMut(UnstableSeries<'a>) -> Result<Series>,
+        F: FnMut(UnstableSeries<'a>) -> PolarsResult<Series>,
     {
         if self.is_empty() {
             return Ok(self.clone());
         }
-        let mut fast_explode = true;
+        let mut fast_explode = self.null_count() == 0;
         let mut ca: ListChunked = self
             .amortized_iter()
             .map(|opt_v| {
@@ -167,7 +173,7 @@ impl ListChunked {
                     })
                     .transpose()
             })
-            .collect::<Result<_>>()?;
+            .collect::<PolarsResult<_>>()?;
         ca.rename(self.name());
         if fast_explode {
             ca.set_fast_explode();

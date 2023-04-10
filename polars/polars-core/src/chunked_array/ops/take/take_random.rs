@@ -1,17 +1,21 @@
-#[cfg(feature = "object")]
-use crate::chunked_array::object::ObjectArray;
-use crate::prelude::downcast::Chunks;
-use crate::prelude::*;
+use std::convert::TryFrom;
+
 use arrow::array::{Array, BooleanArray, ListArray, PrimitiveArray, Utf8Array};
 use arrow::bitmap::utils::get_bit_unchecked;
 use arrow::bitmap::Bitmap;
 use polars_arrow::is_valid::*;
-use std::convert::TryFrom;
+
+#[cfg(feature = "object")]
+use crate::chunked_array::object::ObjectArray;
+use crate::prelude::downcast::Chunks;
+use crate::prelude::*;
 
 macro_rules! take_random_get {
     ($self:ident, $index:ident) => {{
-        let (chunk_idx, arr_idx) =
-            crate::utils::index_to_chunked_index($self.chunk_lens.iter().copied(), $index as u32);
+        let (chunk_idx, arr_idx) = crate::utils::index_to_chunked_index(
+            $self.chunk_lens.iter().copied(),
+            $index as IdxSize,
+        );
 
         // Safety:
         // bounds are checked above
@@ -29,8 +33,10 @@ macro_rules! take_random_get {
 
 macro_rules! take_random_get_unchecked {
     ($self:ident, $index:ident) => {{
-        let (chunk_idx, arr_idx) =
-            crate::utils::index_to_chunked_index($self.chunk_lens.iter().copied(), $index as u32);
+        let (chunk_idx, arr_idx) = crate::utils::index_to_chunked_index(
+            $self.chunk_lens.iter().copied(),
+            $index as IdxSize,
+        );
 
         // Safety:
         // bounds are checked above
@@ -80,6 +86,7 @@ where
 {
     type Item = I;
 
+    #[inline]
     fn get(&self, index: usize) -> Option<Self::Item> {
         match self {
             Self::SingleNoNull(s) => s.get(index),
@@ -88,6 +95,7 @@ where
         }
     }
 
+    #[inline]
     unsafe fn get_unchecked(&self, index: usize) -> Option<Self::Item> {
         match self {
             Self::SingleNoNull(s) => s.get_unchecked(index),
@@ -155,7 +163,7 @@ where
         } else {
             let t = NumTakeRandomChunked {
                 chunks: chunks.collect(),
-                chunk_lens: self.chunks.iter().map(|a| a.len() as u32).collect(),
+                chunk_lens: self.chunks.iter().map(|a| a.len() as IdxSize).collect(),
             };
             TakeRandBranch3::Multi(t)
         }
@@ -164,7 +172,7 @@ where
 
 pub struct Utf8TakeRandom<'a> {
     pub(crate) chunks: Chunks<'a, Utf8Array<i64>>,
-    pub(crate) chunk_lens: Vec<u32>,
+    pub(crate) chunk_lens: Vec<IdxSize>,
 }
 
 impl<'a> TakeRandom for Utf8TakeRandom<'a> {
@@ -218,7 +226,71 @@ impl<'a> IntoTakeRandom<'a> for &'a Utf8Chunked {
                 let chunks = self.downcast_chunks();
                 let t = Utf8TakeRandom {
                     chunks,
-                    chunk_lens: self.chunks.iter().map(|a| a.len() as u32).collect(),
+                    chunk_lens: self.chunks.iter().map(|a| a.len() as IdxSize).collect(),
+                };
+                TakeRandBranch2::Multi(t)
+            }
+        }
+    }
+}
+
+pub struct BinaryTakeRandom<'a> {
+    pub(crate) chunks: Chunks<'a, BinaryArray<i64>>,
+    pub(crate) chunk_lens: Vec<IdxSize>,
+}
+
+impl<'a> TakeRandom for BinaryTakeRandom<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<Self::Item> {
+        take_random_get!(self, index)
+    }
+
+    #[inline]
+    unsafe fn get_unchecked(&self, index: usize) -> Option<Self::Item> {
+        take_random_get_unchecked!(self, index)
+    }
+}
+
+pub struct BinaryTakeRandomSingleChunk<'a> {
+    pub(crate) arr: &'a BinaryArray<i64>,
+}
+
+impl<'a> TakeRandom for BinaryTakeRandomSingleChunk<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<Self::Item> {
+        take_random_get_single!(self, index)
+    }
+
+    #[inline]
+    unsafe fn get_unchecked(&self, index: usize) -> Option<Self::Item> {
+        if self.arr.is_valid_unchecked(index) {
+            Some(self.arr.value_unchecked(index))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> IntoTakeRandom<'a> for &'a BinaryChunked {
+    type Item = &'a [u8];
+    type TakeRandom = TakeRandBranch2<BinaryTakeRandomSingleChunk<'a>, BinaryTakeRandom<'a>>;
+
+    fn take_rand(&self) -> Self::TakeRandom {
+        match self.chunks.len() {
+            1 => {
+                let arr = self.downcast_iter().next().unwrap();
+                let t = BinaryTakeRandomSingleChunk { arr };
+                TakeRandBranch2::Single(t)
+            }
+            _ => {
+                let chunks = self.downcast_chunks();
+                let t = BinaryTakeRandom {
+                    chunks,
+                    chunk_lens: self.chunks.iter().map(|a| a.len() as IdxSize).collect(),
                 };
                 TakeRandBranch2::Multi(t)
             }
@@ -241,7 +313,7 @@ impl<'a> IntoTakeRandom<'a> for &'a BooleanChunked {
                 let chunks = self.downcast_chunks();
                 let t = BoolTakeRandom {
                     chunks,
-                    chunk_lens: self.chunks.iter().map(|a| a.len() as u32).collect(),
+                    chunk_lens: self.chunks.iter().map(|a| a.len() as IdxSize).collect(),
                 };
                 TakeRandBranch2::Multi(t)
             }
@@ -265,7 +337,7 @@ impl<'a> IntoTakeRandom<'a> for &'a ListChunked {
             let t = ListTakeRandom {
                 ca: self,
                 chunks: chunks.collect(),
-                chunk_lens: self.chunks.iter().map(|a| a.len() as u32).collect(),
+                chunk_lens: self.chunks.iter().map(|a| a.len() as IdxSize).collect(),
             };
             TakeRandBranch2::Multi(t)
         }
@@ -277,7 +349,7 @@ where
     T: NumericNative,
 {
     pub(crate) chunks: Vec<&'a PrimitiveArray<T>>,
-    pub(crate) chunk_lens: Vec<u32>,
+    pub(crate) chunk_lens: Vec<IdxSize>,
 }
 
 impl<'a, T> TakeRandom for NumTakeRandomChunked<'a, T>
@@ -377,7 +449,7 @@ where
 
 pub struct BoolTakeRandom<'a> {
     pub(crate) chunks: Chunks<'a, BooleanArray>,
-    pub(crate) chunk_lens: Vec<u32>,
+    pub(crate) chunk_lens: Vec<IdxSize>,
 }
 
 impl<'a> TakeRandom for BoolTakeRandom<'a> {
@@ -419,7 +491,7 @@ impl<'a> TakeRandom for BoolTakeRandomSingleChunk<'a> {
 pub struct ListTakeRandom<'a> {
     ca: &'a ListChunked,
     chunks: Vec<&'a ListArray<i64>>,
-    chunk_lens: Vec<u32>,
+    chunk_lens: Vec<IdxSize>,
 }
 
 impl<'a> TakeRandom for ListTakeRandom<'a> {
@@ -476,7 +548,7 @@ impl<'a> TakeRandom for ListTakeRandomSingleChunk<'a> {
 #[cfg(feature = "object")]
 pub struct ObjectTakeRandom<'a, T: PolarsObject> {
     pub(crate) chunks: Chunks<'a, ObjectArray<T>>,
-    pub(crate) chunk_lens: Vec<u32>,
+    pub(crate) chunk_lens: Vec<IdxSize>,
 }
 
 #[cfg(feature = "object")]
@@ -533,7 +605,7 @@ impl<'a, T: PolarsObject> IntoTakeRandom<'a> for &'a ObjectChunked<T> {
         } else {
             let t = ObjectTakeRandom {
                 chunks,
-                chunk_lens: self.chunks.iter().map(|a| a.len() as u32).collect(),
+                chunk_lens: self.chunks.iter().map(|a| a.len() as IdxSize).collect(),
             };
             TakeRandBranch2::Multi(t)
         }

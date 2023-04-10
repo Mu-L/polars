@@ -1,8 +1,5 @@
 //! Lazy API of Polars
 //!
-//! *Credits to the work of Andy Grove and Ballista/ DataFusion / Apache Arrow, which served as
-//! inspiration for the lazy API.*
-//!
 //! The lazy api of Polars supports a subset of the eager api. Apart from the distributed compute,
 //! it is very similar to [Apache Spark](https://spark.apache.org/). You write queries in a
 //! domain specific language. These queries translate to a logical plan, which represent your query steps.
@@ -94,7 +91,7 @@
 //! use polars_lazy::prelude::*;
 //! use polars_arrow::prelude::QuantileInterpolOptions;
 //!
-//! fn example() -> Result<DataFrame> {
+//! fn example() -> PolarsResult<DataFrame> {
 //!     let df = df!(
 //!     "date" => ["2020-08-21", "2020-08-21", "2020-08-22", "2020-08-23", "2020-08-22"],
 //!     "temp" => [20, 10, 7, 9, 1],
@@ -106,7 +103,7 @@
 //!     .agg([
 //!         col("rain").min(),
 //!         col("rain").sum(),
-//!         col("rain").quantile(0.5, QuantileInterpolOptions::Nearest).alias("median_rain"),
+//!         col("rain").quantile(lit(0.5), QuantileInterpolOptions::Nearest).alias("median_rain"),
 //!     ])
 //!     .sort("date", Default::default())
 //!     .collect()
@@ -136,7 +133,7 @@
 //!         col("column_a")
 //!         // apply a custom closure Series => Result<Series>
 //!         .map(|_s| {
-//!             Ok(Series::new("", &[6.0f32, 6.0, 6.0, 6.0, 6.0]))
+//!             Ok(Some(Series::new("", &[6.0f32, 6.0, 6.0, 6.0, 6.0])))
 //!         },
 //!         // return type of the closure
 //!         GetOutput::from_type(DataType::Float64)).alias("new_column")
@@ -185,24 +182,16 @@
 //!      )
 //! }
 //! ```
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![allow(ambiguous_glob_reexports)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 extern crate core;
 
-#[cfg(all(feature = "dot_diagram", feature = "compile"))]
+#[cfg(feature = "dot_diagram")]
 mod dot;
-#[cfg(feature = "compile")]
 pub mod dsl;
-#[cfg(feature = "compile")]
-mod dummies;
-#[cfg(feature = "compile")]
 pub mod frame;
-#[cfg(feature = "compile")]
-pub mod logical_plan;
-#[cfg(feature = "compile")]
 pub mod physical_plan;
-#[cfg(feature = "compile")]
 pub mod prelude;
 #[cfg(test)]
 mod tests;
-#[cfg(feature = "compile")]
-pub(crate) mod utils;
+pub mod utils;

@@ -1,3 +1,9 @@
+use std::path::{Path, PathBuf};
+
+use dirs::home_dir;
+use polars_core::frame::DataFrame;
+use polars_core::prelude::*;
+
 #[cfg(any(
     feature = "ipc",
     feature = "ipc_streaming",
@@ -5,10 +11,6 @@
     feature = "avro"
 ))]
 use crate::ArrowSchema;
-use dirs::home_dir;
-use polars_core::frame::DataFrame;
-use polars_core::prelude::*;
-use std::path::{Path, PathBuf};
 
 // used by python polars
 pub fn resolve_homedir(path: &Path) -> PathBuf {
@@ -44,18 +46,10 @@ pub(crate) fn apply_projection(schema: &ArrowSchema, projection: &[usize]) -> Ar
     feature = "parquet"
 ))]
 pub(crate) fn columns_to_projection(
-    columns: Vec<String>,
+    columns: &[String],
     schema: &ArrowSchema,
-) -> Result<Vec<usize>> {
+) -> PolarsResult<Vec<usize>> {
     use ahash::AHashMap;
-
-    let err = |column: &str| {
-        let valid_fields: Vec<String> = schema.fields.iter().map(|f| f.name.clone()).collect();
-        PolarsError::NotFound(format!(
-            "Unable to get field named \"{}\". Valid fields: {:?}",
-            column, valid_fields
-        ))
-    };
 
     let mut prj = Vec::with_capacity(columns.len());
     if columns.len() > 100 {
@@ -65,11 +59,14 @@ pub(crate) fn columns_to_projection(
         });
 
         for column in columns.iter() {
-            if let Some(&i) = column_names.get(column.as_str()) {
-                prj.push(i)
-            } else {
-                return Err(err(column));
-            }
+            let Some(&i) = column_names.get(column.as_str()) else {
+                let valid_columns: Vec<String> = schema.fields.iter().map(|f| f.name.clone()).collect();
+                polars_bail!(
+                    ColumnNotFound:
+                    "unable to find {:?}; valid columns: {:?}", column, valid_columns,
+                );
+            };
+            prj.push(i);
         }
     } else {
         for column in columns.iter() {
@@ -83,22 +80,38 @@ pub(crate) fn columns_to_projection(
 
 /// Because of threading every row starts from `0` or from `offset`.
 /// We must correct that so that they are monotonically increasing.
-pub(crate) fn update_row_counts(dfs: &mut [(DataFrame, IdxSize)]) {
+pub(crate) fn update_row_counts(dfs: &mut [(DataFrame, IdxSize)], offset: IdxSize) {
     if !dfs.is_empty() {
-        let mut previous = dfs[0].1;
+        let mut previous = dfs[0].1 + offset;
         for (df, n_read) in &mut dfs[1..] {
-            if let Some(s) = df.get_columns_mut().get_mut(0) {
+            if let Some(s) = unsafe { df.get_columns_mut() }.get_mut(0) {
                 *s = &*s + previous;
             }
-            previous = *n_read;
+            previous += *n_read;
+        }
+    }
+}
+
+/// Because of threading every row starts from `0` or from `offset`.
+/// We must correct that so that they are monotonically increasing.
+pub(crate) fn update_row_counts2(dfs: &mut [DataFrame], offset: IdxSize) {
+    if !dfs.is_empty() {
+        let mut previous = dfs[0].height() as IdxSize + offset;
+        for df in &mut dfs[1..] {
+            let n_read = df.height() as IdxSize;
+            if let Some(s) = unsafe { df.get_columns_mut() }.get_mut(0) {
+                *s = &*s + previous;
+            }
+            previous += n_read;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_homedir;
     use std::path::PathBuf;
+
+    use super::resolve_homedir;
 
     #[cfg(not(target_os = "windows"))]
     #[test]

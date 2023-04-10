@@ -1,6 +1,7 @@
-use super::*;
 use nulls;
 use nulls::{rolling_apply_agg_window, RollingAggWindowNulls};
+
+use super::*;
 
 pub struct SumWindow<'a, T> {
     slice: &'a [T],
@@ -17,7 +18,7 @@ impl<'a, T: NativeType + IsFloat + Add<Output = T> + Sub<Output = T>> SumWindow<
         let mut sum = None;
         let mut idx = start;
         self.null_count = 0;
-        for value in (&self.slice[start..end]).iter() {
+        for value in &self.slice[start..end] {
             let valid = self.validity.get_bit_unchecked(idx);
             if valid {
                 match sum {

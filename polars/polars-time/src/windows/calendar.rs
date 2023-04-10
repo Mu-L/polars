@@ -1,25 +1,7 @@
-use crate::prelude::*;
+use polars_arrow::time_zone::PolarsTimeZone;
 use polars_core::prelude::*;
 
-const LAST_DAYS_MONTH: [u32; 12] = [
-    31, // January:   31,
-    28, // February:  28,
-    31, // March:     31,
-    30, // April:     30,
-    31, // May:       31,
-    30, // June:      30,
-    31, // July:      31,
-    31, // August:    31,
-    30, // September: 30,
-    31, // October:   31,
-    30, // November:  30,
-    31, // December:  31,
-];
-
-pub(crate) const fn last_day_of_month(month: i32) -> u32 {
-    // month is 1 indexed
-    LAST_DAYS_MONTH[(month - 1) as usize]
-}
+use crate::prelude::*;
 
 pub(crate) const fn is_leap_year(year: i32) -> bool {
     year % 400 == 0 || (year % 4 == 0 && year % 100 != 0)
@@ -39,7 +21,8 @@ pub fn date_range(
     every: Duration,
     closed: ClosedWindow,
     tu: TimeUnit,
-) -> Vec<i64> {
+    tz: Option<&impl PolarsTimeZone>,
+) -> PolarsResult<Vec<i64>> {
     let size = match tu {
         TimeUnit::Nanoseconds => ((stop - start) / every.duration_ns() + 1) as usize,
         TimeUnit::Microseconds => ((stop - start) / every.duration_us() + 1) as usize,
@@ -57,30 +40,30 @@ pub fn date_range(
         ClosedWindow::Both => {
             while t <= stop {
                 ts.push(t);
-                t = f(&every, t)
+                t = f(&every, t, tz)?
             }
         }
         ClosedWindow::Left => {
             while t < stop {
                 ts.push(t);
-                t = f(&every, t)
+                t = f(&every, t, tz)?
             }
         }
         ClosedWindow::Right => {
-            t = f(&every, t);
+            t = f(&every, t, tz)?;
             while t <= stop {
                 ts.push(t);
-                t = f(&every, t)
+                t = f(&every, t, tz)?
             }
         }
         ClosedWindow::None => {
-            t = f(&every, t);
+            t = f(&every, t, tz)?;
             while t < stop {
                 ts.push(t);
-                t = f(&every, t)
+                t = f(&every, t, tz)?
             }
         }
     }
     debug_assert!(size >= ts.len());
-    ts
+    Ok(ts)
 }

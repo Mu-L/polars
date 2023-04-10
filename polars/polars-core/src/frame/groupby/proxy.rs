@@ -1,11 +1,13 @@
-use crate::prelude::*;
-use crate::utils::{slice_slice, NoNull};
-use crate::POOL;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
+
 use polars_arrow::utils::CustomIterTools;
 use rayon::iter::plumbing::UnindexedConsumer;
 use rayon::prelude::*;
-use std::mem::ManuallyDrop;
-use std::ops::Deref;
+
+use crate::prelude::*;
+use crate::utils::{slice_slice, NoNull};
+use crate::POOL;
 
 /// Indexes of the groups, the first index is stored separately.
 /// this make sorting fast.
@@ -24,11 +26,15 @@ impl Drop for GroupsIdx {
         let v = std::mem::take(&mut self.all);
         // ~65k took approximately 1ms on local machine, so from that point we drop on other thread
         // to stop query from being blocked
+        #[cfg(not(target_family = "wasm"))]
         if v.len() > 1 << 16 {
             std::thread::spawn(move || drop(v));
         } else {
             drop(v);
         }
+
+        #[cfg(target_family = "wasm")]
+        drop(v);
     }
 }
 
@@ -40,7 +46,51 @@ impl From<Vec<IdxItem>> for GroupsIdx {
 
 impl From<Vec<Vec<IdxItem>>> for GroupsIdx {
     fn from(v: Vec<Vec<IdxItem>>) -> Self {
-        v.into_iter().flatten().collect()
+        // single threaded flatten: 10% faster than `iter().flatten().collect()
+        // this is the multi-threaded impl of that
+        let cap = v.iter().map(|v| v.len()).sum::<usize>();
+        let offsets = v
+            .iter()
+            .scan(0_usize, |acc, v| {
+                let out = *acc;
+                *acc += v.len();
+                Some(out)
+            })
+            .collect::<Vec<_>>();
+        let mut first = Vec::with_capacity(cap);
+        let first_ptr = first.as_ptr() as usize;
+        let mut all = Vec::with_capacity(cap);
+        let all_ptr = all.as_ptr() as usize;
+
+        POOL.install(|| {
+            v.into_par_iter()
+                .zip(offsets)
+                .for_each(|(mut inner, offset)| {
+                    unsafe {
+                        let first = (first_ptr as *const IdxSize as *mut IdxSize).add(offset);
+                        let all = (all_ptr as *const Vec<IdxSize> as *mut Vec<IdxSize>).add(offset);
+
+                        let inner_ptr = inner.as_mut_ptr();
+                        for i in 0..inner.len() {
+                            let (first_val, vals) = std::ptr::read(inner_ptr.add(i));
+                            std::ptr::write(first.add(i), first_val);
+                            std::ptr::write(all.add(i), vals);
+                        }
+                        // set len to 0 so that the contents will not get dropped
+                        // they are moved to `first` and `all`
+                        inner.set_len(0);
+                    }
+                });
+        });
+        unsafe {
+            all.set_len(cap);
+            first.set_len(cap);
+        }
+        GroupsIdx {
+            sorted: false,
+            first,
+            all,
+        }
     }
 }
 
@@ -78,7 +128,7 @@ impl GroupsIdx {
         self.all = all;
         self.sorted = true
     }
-    pub fn is_sorted(&self) -> bool {
+    pub fn is_sorted_flag(&self) -> bool {
         self.sorted
     }
 
@@ -212,9 +262,7 @@ impl GroupsProxy {
         match self {
             GroupsProxy::Idx(groups) => groups,
             GroupsProxy::Slice { groups, .. } => {
-                if std::env::var("POLARS_VERBOSE").is_ok() {
-                    println!("had to reallocate groups, missed an optimization opportunity.")
-                }
+                eprintln!("Had to reallocate groups, missed an optimization opportunity. Please open an issue.");
                 groups
                     .iter()
                     .map(|&[first, len]| (first, (first..first + len).collect_trusted::<Vec<_>>()))
@@ -230,7 +278,11 @@ impl GroupsProxy {
     #[cfg(feature = "private")]
     pub fn sort(&mut self) {
         match self {
-            GroupsProxy::Idx(groups) => groups.sort(),
+            GroupsProxy::Idx(groups) => {
+                if !groups.is_sorted_flag() {
+                    groups.sort()
+                }
+            }
             GroupsProxy::Slice { groups, rolling } => {
                 if !*rolling {
                     groups.sort_unstable_by_key(|[first, _]| *first);
@@ -380,7 +432,7 @@ impl GroupsProxy {
                 ManuallyDrop::new(GroupsProxy::Idx(GroupsIdx::new(
                     first,
                     all,
-                    groups.is_sorted(),
+                    groups.is_sorted_flag(),
                 )))
             }
             GroupsProxy::Slice { groups, rolling } => {
@@ -422,6 +474,12 @@ impl<'a> GroupsIndicator<'a> {
             GroupsIndicator::Slice([_, len]) => *len as usize,
         }
     }
+    pub fn first(&self) -> IdxSize {
+        match self {
+            GroupsIndicator::Idx(g) => g.0,
+            GroupsIndicator::Slice([first, _]) => *first,
+        }
+    }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -444,8 +502,13 @@ impl<'a> GroupsProxyIter<'a> {
 impl<'a> Iterator for GroupsProxyIter<'a> {
     type Item = GroupsIndicator<'a>;
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.idx = self.idx.saturating_add(n);
+        self.next()
+    }
+
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx == self.len {
+        if self.idx >= self.len {
             return None;
         }
 

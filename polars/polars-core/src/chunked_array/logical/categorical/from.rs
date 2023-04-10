@@ -1,7 +1,9 @@
-use super::*;
 use arrow::array::DictionaryArray;
 use arrow::datatypes::IntegerType;
 use polars_arrow::compute::cast::cast;
+
+use super::*;
+use crate::using_string_cache;
 
 impl From<&CategoricalChunked> for DictionaryArray<u32> {
     fn from(ca: &CategoricalChunked) -> Self {
@@ -77,6 +79,28 @@ impl From<&CategoricalChunked> for DictionaryArray<i64> {
                         .unwrap()
                 }
             }
+        }
+    }
+}
+
+impl CategoricalChunked {
+    /// # Safety
+    /// The caller must ensure that index values in the `keys` are in within bounds of the `values` length.
+    pub(crate) unsafe fn from_keys_and_values(
+        name: &str,
+        keys: &PrimitiveArray<u32>,
+        values: &Utf8Array<i64>,
+    ) -> Self {
+        if using_string_cache() {
+            let mut builder = CategoricalChunkedBuilder::new(name, keys.len());
+            builder.global_map_from_local(keys, values.clone());
+            builder.finish()
+        } else {
+            CategoricalChunked::from_chunks_original(
+                name,
+                vec![Box::new(keys.clone())],
+                RevMapping::Local(values.clone()),
+            )
         }
     }
 }

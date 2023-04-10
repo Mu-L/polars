@@ -1,9 +1,10 @@
-use polars::export::chrono::{NaiveDate, NaiveDateTime};
+use polars::export::chrono::NaiveDate;
 use polars::prelude::*;
+use polars_ops::pivot::{pivot, pivot_stable, PivotAgg};
 
 #[test]
 #[cfg(feature = "dtype-date")]
-fn test_pivot_date() -> Result<()> {
+fn test_pivot_date() -> PolarsResult<()> {
     let mut df = df![
         "A" => [1, 1, 1, 1, 1, 1, 1, 1],
         "B" => [8, 2, 3, 6, 3, 6, 2, 2],
@@ -11,7 +12,7 @@ fn test_pivot_date() -> Result<()> {
     ]?;
     df.try_apply("C", |s| s.cast(&DataType::Date))?;
 
-    let out = df.pivot(["A"], ["B"], ["C"], PivotAgg::Count, true)?;
+    let out = pivot(&df, ["A"], ["B"], ["C"], true, Some(PivotAgg::Count), None)?;
 
     let first = 1 as IdxSize;
     let expected = df![
@@ -20,7 +21,7 @@ fn test_pivot_date() -> Result<()> {
     ]?;
     assert!(out.frame_equal_missing(&expected));
 
-    let mut out = df.groupby_stable(["B"])?.pivot(["A"], ["C"]).first()?;
+    let mut out = pivot_stable(&df, ["C"], ["B"], ["A"], true, Some(PivotAgg::First), None)?;
     out.try_apply("1", |s| {
         let ca = s.date()?;
         Ok(ca.strftime("%Y-%d-%m"))
@@ -42,53 +43,73 @@ fn test_pivot_old() {
     let s2 = Series::new("bar", ["k", "l", "m", "m", "l"].as_ref());
     let df = DataFrame::new(vec![s0, s1, s2]).unwrap();
 
-    let pvt = df
-        .groupby(["foo"])
-        .unwrap()
-        .pivot(["bar"], ["N"])
-        .sum()
-        .unwrap();
+    let pvt = pivot(
+        &df,
+        ["N"],
+        ["foo"],
+        ["bar"],
+        false,
+        Some(PivotAgg::Sum),
+        None,
+    )
+    .unwrap();
     assert_eq!(pvt.get_column_names(), &["foo", "k", "l", "m"]);
     assert_eq!(
         Vec::from(&pvt.column("m").unwrap().i32().unwrap().sort(false)),
         &[None, None, Some(6)]
     );
-    let pvt = df
-        .groupby(["foo"])
-        .unwrap()
-        .pivot(["bar"], ["N"])
-        .min()
-        .unwrap();
+    let pvt = pivot(
+        &df,
+        ["N"],
+        ["foo"],
+        ["bar"],
+        false,
+        Some(PivotAgg::Min),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         Vec::from(&pvt.column("m").unwrap().i32().unwrap().sort(false)),
         &[None, None, Some(2)]
     );
-    let pvt = df
-        .groupby(["foo"])
-        .unwrap()
-        .pivot(["bar"], ["N"])
-        .max()
-        .unwrap();
+    let pvt = pivot(
+        &df,
+        ["N"],
+        ["foo"],
+        ["bar"],
+        false,
+        Some(PivotAgg::Max),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         Vec::from(&pvt.column("m").unwrap().i32().unwrap().sort(false)),
         &[None, None, Some(4)]
     );
-    let pvt = df
-        .groupby(["foo"])
-        .unwrap()
-        .pivot(["bar"], ["N"])
-        .mean()
-        .unwrap();
+    let pvt = pivot(
+        &df,
+        ["N"],
+        ["foo"],
+        ["bar"],
+        false,
+        Some(PivotAgg::Mean),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         Vec::from(&pvt.column("m").unwrap().f64().unwrap().sort(false)),
         &[None, None, Some(3.0)]
     );
-    let pvt = df
-        .groupby(["foo"])
-        .unwrap()
-        .pivot(["bar"], ["N"])
-        .count()
-        .unwrap();
+    let pvt = pivot(
+        &df,
+        ["N"],
+        ["foo"],
+        ["bar"],
+        false,
+        Some(PivotAgg::Count),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         Vec::from(&pvt.column("m").unwrap().idx().unwrap().sort(false)),
         &[None, None, Some(2)]
@@ -97,7 +118,7 @@ fn test_pivot_old() {
 
 #[test]
 #[cfg(feature = "dtype-categorical")]
-fn test_pivot_categorical() -> Result<()> {
+fn test_pivot_categorical() -> PolarsResult<()> {
     let mut df = df![
         "A" => [1, 1, 1, 1, 1, 1, 1, 1],
         "B" => [8, 2, 3, 6, 3, 6, 2, 2],
@@ -105,14 +126,14 @@ fn test_pivot_categorical() -> Result<()> {
     ]?;
     df.try_apply("C", |s| s.cast(&DataType::Categorical(None)))?;
 
-    let out = df.groupby(["B"])?.pivot(["C"], ["A"]).count()?;
+    let out = pivot(&df, ["A"], ["B"], ["C"], true, Some(PivotAgg::Count), None)?;
     assert_eq!(out.get_column_names(), &["B", "a", "b", "c"]);
 
     Ok(())
 }
 
 #[test]
-fn test_pivot_new() -> Result<()> {
+fn test_pivot_new() -> PolarsResult<()> {
     let df = df!["A"=> ["foo", "foo", "foo", "foo", "foo",
         "bar", "bar", "bar", "bar"],
         "B"=> ["one", "one", "one", "two", "two",
@@ -125,7 +146,15 @@ fn test_pivot_new() -> Result<()> {
         "E"=> [2, 4, 5, 5, 6, 6, 8, 9, 9]
     ]?;
 
-    let out = (df.pivot_stable(["D"], ["A", "B"], ["C"], PivotAgg::Sum, true))?;
+    let out = (pivot_stable(
+        &df,
+        ["D"],
+        ["A", "B"],
+        ["C"],
+        true,
+        Some(PivotAgg::Sum),
+        None,
+    ))?;
     let expected = df![
         "A" => ["foo", "foo", "bar", "bar"],
         "B" => ["one", "two", "one", "two"],
@@ -134,7 +163,15 @@ fn test_pivot_new() -> Result<()> {
     ]?;
     assert!(out.frame_equal_missing(&expected));
 
-    let out = df.pivot_stable(["D"], ["A", "B"], ["C", "breaky"], PivotAgg::Sum, true)?;
+    let out = pivot_stable(
+        &df,
+        ["D"],
+        ["A", "B"],
+        ["C", "breaky"],
+        true,
+        Some(PivotAgg::Sum),
+        None,
+    )?;
     let expected = df![
         "A" => ["foo", "foo", "bar", "bar"],
         "B" => ["one", "two", "one", "two"],
@@ -150,14 +187,22 @@ fn test_pivot_new() -> Result<()> {
 }
 
 #[test]
-fn test_pivot_2() -> Result<()> {
+fn test_pivot_2() -> PolarsResult<()> {
     let df = df![
         "name"=> ["avg", "avg", "act", "test", "test"],
         "err" => [Some("name1"), Some("name2"), None, Some("name1"), Some("name2")],
         "wght"=> [0.0, 0.1, 1.0, 0.4, 0.2]
     ]?;
 
-    let out = df.pivot_stable(["wght"], ["err"], ["name"], PivotAgg::First, false)?;
+    let out = pivot_stable(
+        &df,
+        ["wght"],
+        ["err"],
+        ["name"],
+        false,
+        Some(PivotAgg::First),
+        None,
+    )?;
     let expected = df![
         "err" => [Some("name1"), Some("name2"), None],
         "avg" => [Some(0.0), Some(0.1), None],
@@ -171,15 +216,26 @@ fn test_pivot_2() -> Result<()> {
 
 #[test]
 #[cfg(feature = "dtype-datetime")]
-fn test_pivot_datetime() -> Result<()> {
-    let dt = NaiveDate::from_ymd(2021, 1, 1).and_hms(12, 15, 0);
+fn test_pivot_datetime() -> PolarsResult<()> {
+    let dt = NaiveDate::from_ymd_opt(2021, 1, 1)
+        .unwrap()
+        .and_hms_opt(12, 15, 0)
+        .unwrap();
     let df = df![
         "dt" => [dt, dt, dt, dt],
         "key" => ["x", "x", "y", "y"],
         "val" => [100, 50, 500, -80]
     ]?;
 
-    let out = df.pivot(["val"], ["dt"], ["key"], PivotAgg::Sum, false)?;
+    let out = pivot(
+        &df,
+        ["val"],
+        ["dt"],
+        ["key"],
+        false,
+        Some(PivotAgg::Sum),
+        None,
+    )?;
     let expected = df![
         "dt" => [dt],
         "x" => [150],

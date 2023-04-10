@@ -2,17 +2,12 @@
 mod csv;
 #[cfg(feature = "ipc")]
 mod ipc;
+#[cfg(feature = "json")]
+mod ndjson;
 #[cfg(feature = "parquet")]
 mod parquet;
 
-use super::*;
-use crate::prelude::*;
-use polars_io::aggregations::ScanAggregation;
-use polars_io::csv::CsvEncoding;
-use polars_io::prelude::*;
-use std::fs::File;
 use std::mem;
-use std::path::Path;
 
 #[cfg(feature = "csv-file")]
 pub(crate) use csv::CsvExec;
@@ -20,26 +15,37 @@ pub(crate) use csv::CsvExec;
 pub(crate) use ipc::IpcExec;
 #[cfg(feature = "parquet")]
 pub(crate) use parquet::ParquetExec;
+#[cfg(any(feature = "ipc", feature = "parquet"))]
+use polars_io::predicates::PhysicalIoExpr;
+use polars_io::prelude::*;
+use polars_plan::global::_set_n_rows_for_scan;
+#[cfg(any(
+    feature = "parquet",
+    feature = "csv-file",
+    feature = "ipc",
+    feature = "cse"
+))]
+use polars_plan::logical_plan::FileFingerPrint;
+
+use super::*;
+use crate::prelude::*;
 
 #[cfg(any(feature = "ipc", feature = "parquet"))]
 type Projection = Option<Vec<usize>>;
 #[cfg(any(feature = "ipc", feature = "parquet"))]
 type StopNRows = Option<usize>;
 #[cfg(any(feature = "ipc", feature = "parquet"))]
-type Aggregation<'a> = Option<&'a [ScanAggregation]>;
-#[cfg(any(feature = "ipc", feature = "parquet"))]
 type Predicate = Option<Arc<dyn PhysicalIoExpr>>;
 
 #[cfg(any(feature = "ipc", feature = "parquet"))]
-fn prepare_scan_args<'a>(
-    path: &Path,
+fn prepare_scan_args(
+    path: &std::path::Path,
     predicate: &Option<Arc<dyn PhysicalExpr>>,
     with_columns: &mut Option<Arc<Vec<String>>>,
     schema: &mut SchemaRef,
     n_rows: Option<usize>,
-    aggregate: &'a [ScanAggregation],
-) -> (File, Projection, StopNRows, Aggregation<'a>, Predicate) {
-    let file = std::fs::File::open(&path).unwrap();
+) -> (std::fs::File, Projection, StopNRows, Predicate) {
+    let file = std::fs::File::open(path).unwrap();
 
     let with_columns = mem::take(with_columns);
     let schema = mem::take(schema);
@@ -51,53 +57,44 @@ fn prepare_scan_args<'a>(
             .collect()
     });
 
-    let n_rows = set_n_rows(n_rows);
-    let aggregate = if aggregate.is_empty() {
-        None
-    } else {
-        Some(aggregate)
-    };
+    let n_rows = _set_n_rows_for_scan(n_rows);
     let predicate = predicate
         .clone()
         .map(|expr| Arc::new(PhysicalIoHelper { expr }) as Arc<dyn PhysicalIoExpr>);
 
-    (file, projection, n_rows, aggregate, predicate)
+    (file, projection, n_rows, predicate)
 }
 
 /// Producer of an in memory DataFrame
 pub struct DataFrameExec {
     pub(crate) df: Arc<DataFrame>,
-    pub(crate) projection: Option<Vec<Arc<dyn PhysicalExpr>>>,
     pub(crate) selection: Option<Arc<dyn PhysicalExpr>>,
-    pub(crate) has_windows: bool,
+    pub(crate) projection: Option<Arc<Vec<String>>>,
 }
 
 impl Executor for DataFrameExec {
-    fn execute(&mut self, state: &ExecutionState) -> Result<DataFrame> {
+    fn execute(&mut self, state: &mut ExecutionState) -> PolarsResult<DataFrame> {
         let df = mem::take(&mut self.df);
         let mut df = Arc::try_unwrap(df).unwrap_or_else(|df| (*df).clone());
 
         // projection should be before selection as those are free
         // TODO: this is only the case if we don't create new columns
         if let Some(projection) = &self.projection {
-            state.may_set_schema(&df, projection.len());
-            df = evaluate_physical_expressions(&df, projection, state, self.has_windows)?;
+            df = df.select(projection.as_ref())?;
         }
 
         if let Some(selection) = &self.selection {
             let s = selection.evaluate(&df, state)?;
-            let mask = s.bool().map_err(|_| {
-                PolarsError::ComputeError("filter predicate was not of type boolean".into())
-            })?;
+            let mask = s.bool().map_err(
+                |_| polars_err!(ComputeError: "filter predicate was not of type boolean"),
+            )?;
             df = df.filter(mask)?;
         }
-        state.clear_schema_cache();
 
-        if let Some(limit) = set_n_rows(None) {
-            Ok(df.head(Some(limit)))
-        } else {
-            Ok(df)
-        }
+        Ok(match _set_n_rows_for_scan(None) {
+            Some(limit) => df.head(Some(limit)),
+            None => df,
+        })
     }
 }
 
@@ -108,15 +105,26 @@ pub(crate) struct AnonymousScanExec {
 }
 
 impl Executor for AnonymousScanExec {
-    fn execute(&mut self, state: &ExecutionState) -> Result<DataFrame> {
-        let mut df = self.function.scan(self.options.clone())?;
-        if let Some(predicate) = &self.predicate {
-            let s = predicate.evaluate(&df, state)?;
-            let mask = s.bool().map_err(|_| {
-                PolarsError::ComputeError("filter predicate was not of type boolean".into())
-            })?;
-            df = df.filter(mask)?;
-        }
-        Ok(df)
+    fn execute(&mut self, state: &mut ExecutionState) -> PolarsResult<DataFrame> {
+        state.record(
+            || match (self.function.allows_predicate_pushdown(), &self.predicate) {
+                (true, Some(predicate)) => {
+                    self.options.predicate = predicate.as_expression().cloned();
+                    self.function.scan(self.options.clone())
+                }
+                (false, Some(predicate)) => {
+                    let mut df = self.function.scan(self.options.clone())?;
+                    let s = predicate.evaluate(&df, state)?;
+                    let mask = s.bool().map_err(
+                        |_| polars_err!(ComputeError: "filter predicate was not of type boolean"),
+                    )?;
+                    df = df.filter(mask)?;
+
+                    Ok(df)
+                }
+                _ => self.function.scan(self.options.clone()),
+            },
+            "anonymous_scan".into(),
+        )
     }
 }

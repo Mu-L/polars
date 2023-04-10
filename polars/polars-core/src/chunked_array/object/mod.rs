@@ -12,6 +12,7 @@ pub mod builder;
 pub(crate) mod extension;
 mod is_valid;
 mod iterator;
+pub mod registry;
 
 #[derive(Debug, Clone)]
 pub struct ObjectArray<T>
@@ -27,6 +28,10 @@ where
 /// Trimmed down object safe polars object
 pub trait PolarsObjectSafe: Any + Debug + Send + Sync + Display {
     fn type_name(&self) -> &'static str;
+
+    fn as_any(&self) -> &dyn Any;
+
+    fn to_boxed(&self) -> Box<dyn PolarsObjectSafe>;
 }
 
 /// Values need to implement this so that they can be stored into a Series and DataFrame
@@ -40,6 +45,14 @@ pub trait PolarsObject:
 impl<T: PolarsObject> PolarsObjectSafe for T {
     fn type_name(&self) -> &'static str {
         T::type_name()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn to_boxed(&self) -> Box<dyn PolarsObjectSafe> {
+        Box::new(self.clone())
     }
 }
 
@@ -111,7 +124,7 @@ where
         unimplemented!()
     }
 
-    fn slice(&self, offset: usize, length: usize) -> Box<dyn Array> {
+    fn slice(&mut self, offset: usize, length: usize) {
         assert!(
             offset + length <= self.len(),
             "the offset of the new Buffer cannot exceed the existing length"
@@ -119,14 +132,11 @@ where
         unsafe { self.slice_unchecked(offset, length) }
     }
 
-    unsafe fn slice_unchecked(&self, offset: usize, length: usize) -> Box<dyn Array> {
-        let mut new = self.clone();
-        let len = std::cmp::min(new.len - offset, length);
+    unsafe fn slice_unchecked(&mut self, offset: usize, length: usize) {
+        let len = std::cmp::min(self.len - offset, length);
 
-        new.len = len;
-        new.offset = offset;
-        new.null_bitmap = new.null_bitmap.map(|x| x.slice_unchecked(offset, len));
-        Box::new(new)
+        self.len = len;
+        self.offset = offset;
     }
 
     fn len(&self) -> usize {
@@ -147,6 +157,13 @@ where
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         unimplemented!()
+    }
+
+    fn null_count(&self) -> usize {
+        match &self.null_bitmap {
+            None => 0,
+            Some(validity) => validity.unset_bits(),
+        }
     }
 }
 

@@ -1,18 +1,20 @@
+use std::hash::{BuildHasher, Hash};
+
+use hashbrown::hash_map::{Entry, RawEntryMut};
+use hashbrown::HashMap;
+use polars_utils::{flatten, HashSingle};
+use rayon::prelude::*;
+
 use super::GroupsProxy;
+use crate::datatypes::PlHashMap;
 use crate::frame::groupby::{GroupsIdx, IdxItem};
+use crate::hashing::{
+    df_rows_to_hashes_threaded_vertical, this_partition, AsU64, IdBuildHasher, IdxHash,
+};
 use crate::prelude::compare_inner::PartialEqInner;
 use crate::prelude::*;
-use crate::utils::CustomIterTools;
-use crate::vector_hasher::{df_rows_to_hashes_threaded, IdBuildHasher, IdxHash};
-use crate::vector_hasher::{this_partition, AsU64};
+use crate::utils::{split_df, CustomIterTools};
 use crate::POOL;
-use crate::{datatypes::PlHashMap, utils::split_df};
-use ahash::CallHasher;
-use hashbrown::hash_map::Entry;
-use hashbrown::{hash_map::RawEntryMut, HashMap};
-use polars_utils::flatten;
-use rayon::prelude::*;
-use std::hash::{BuildHasher, Hash};
 
 fn finish_group_order(mut out: Vec<Vec<IdxItem>>, sorted: bool) -> GroupsProxy {
     if sorted {
@@ -20,6 +22,13 @@ fn finish_group_order(mut out: Vec<Vec<IdxItem>>, sorted: bool) -> GroupsProxy {
         let mut out = if out.len() == 1 {
             out.pop().unwrap()
         } else {
+            // pre-sort every array
+            // this will make the final single threaded sort much faster
+            POOL.install(|| {
+                out.par_iter_mut()
+                    .for_each(|g| g.sort_unstable_by_key(|g| g.0))
+            });
+
             flatten(&out, None)
         };
         out.sort_unstable_by_key(|g| g.0);
@@ -77,55 +86,48 @@ where
     }
 }
 
-/// Determine group tuples over different threads. The hash of the key is used to determine the partitions.
-/// Note that rehashing of the keys should be cheap and the keys small to allow efficient rehashing and improved cache locality.
-///
-/// Besides numeric values, we can also use this for pre hashed strings. The keys are simply a ptr to the str + precomputed hash.
-/// The hash will be used to rehash, and the str will be used for equality.
-pub(crate) fn groupby_threaded_num<T, IntoSlice>(
-    keys: Vec<IntoSlice>,
-    group_size_hint: usize,
+pub(crate) fn groupby_threaded_num2<T, I>(
+    keys: &[I],
     n_partitions: u64,
     sorted: bool,
 ) -> GroupsProxy
 where
-    T: Send + Hash + Eq + Sync + Copy + AsU64 + CallHasher,
-    IntoSlice: AsRef<[T]> + Send + Sync,
+    I: IntoIterator<Item = T> + Send + Sync + Copy,
+    I::IntoIter: ExactSizeIterator,
+    T: Send + Hash + Eq + Sync + Copy + AsU64,
 {
     assert!(n_partitions.is_power_of_two());
 
     // We will create a hashtable in every thread.
     // We use the hash to partition the keys to the matching hashtable.
     // Every thread traverses all keys/hashes and ignores the ones that doesn't fall in that partition.
-    let out = POOL
-        .install(|| {
-            (0..n_partitions).into_par_iter().map(|thread_no| {
-                let thread_no = thread_no as u64;
-
+    let out = POOL.install(|| {
+        (0..n_partitions)
+            .into_par_iter()
+            .map(|thread_no| {
                 let mut hash_tbl: PlHashMap<T, (IdxSize, Vec<IdxSize>)> =
                     PlHashMap::with_capacity(HASHMAP_INIT_SIZE);
 
                 let mut offset = 0;
-                for keys in &keys {
-                    let keys = keys.as_ref();
+                for keys in keys {
+                    let keys = keys.into_iter();
                     let len = keys.len() as IdxSize;
                     let hasher = hash_tbl.hasher().clone();
 
                     let mut cnt = 0;
-                    keys.iter().for_each(|k| {
+                    keys.for_each(|k| {
                         let idx = cnt + offset;
                         cnt += 1;
 
                         if this_partition(k.as_u64(), thread_no, n_partitions) {
-                            let hash = T::get_hash(k, &hasher);
-                            let entry = hash_tbl.raw_entry_mut().from_key_hashed_nocheck(hash, k);
+                            let hash = hasher.hash_single(k);
+                            let entry = hash_tbl.raw_entry_mut().from_key_hashed_nocheck(hash, &k);
 
                             match entry {
                                 RawEntryMut::Vacant(entry) => {
-                                    let mut tuples = Vec::with_capacity(group_size_hint);
-                                    tuples.push(idx);
-                                    entry.insert_with_hasher(hash, *k, (idx, tuples), |k| {
-                                        T::get_hash(k, &hasher)
+                                    let tuples = vec![idx];
+                                    entry.insert_with_hasher(hash, k, (idx, tuples), |k| {
+                                        hasher.hash_single(k)
                                     });
                                 }
                                 RawEntryMut::Occupied(mut entry) => {
@@ -142,8 +144,8 @@ where
                     .map(|(_k, v)| v)
                     .collect_trusted::<Vec<_>>()
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    });
     finish_group_order(out, sorted)
 }
 
@@ -196,10 +198,14 @@ pub(crate) fn populate_multiple_key_hashmap<V, H, F, G>(
         // during rehashing/resize (then the keys are already known to be unique).
         // Only during insertion and probing an equality function is needed
         .from_hash(original_h, |idx_hash| {
-            let key_idx = idx_hash.idx;
-            // Safety:
-            // indices in a groupby operation are always in bounds.
-            unsafe { compare_df_rows(keys, key_idx as usize, idx as usize) }
+            // first check the hash values
+            // before we incur a cache miss
+            idx_hash.hash == original_h && {
+                let key_idx = idx_hash.idx;
+                // Safety:
+                // indices in a groupby operation are always in bounds.
+                unsafe { compare_df_rows(keys, key_idx as usize, idx as usize) }
+            }
         });
     match entry {
         RawEntryMut::Vacant(entry) => {
@@ -254,10 +260,14 @@ pub(crate) fn populate_multiple_key_hashmap2<'a, V, H, F, G>(
         // during rehashing/resize (then the keys are already known to be unique).
         // Only during insertion and probing an equality function is needed
         .from_hash(original_h, |idx_hash| {
-            let key_idx = idx_hash.idx;
-            // Safety:
-            // indices in a groupby operation are always in bounds.
-            unsafe { compare_keys(keys_cmp, key_idx as usize, idx as usize) }
+            // first check the hash values before we incur
+            // cache misses
+            original_h == idx_hash.hash && {
+                let key_idx = idx_hash.idx;
+                // Safety:
+                // indices in a groupby operation are always in bounds.
+                unsafe { compare_keys(keys_cmp, key_idx as usize, idx as usize) }
+            }
         });
     match entry {
         RawEntryMut::Vacant(entry) => {
@@ -271,12 +281,12 @@ pub(crate) fn populate_multiple_key_hashmap2<'a, V, H, F, G>(
 }
 
 pub(crate) fn groupby_threaded_multiple_keys_flat(
-    keys: DataFrame,
+    mut keys: DataFrame,
     n_partitions: usize,
     sorted: bool,
-) -> GroupsProxy {
-    let dfs = split_df(&keys, n_partitions).unwrap();
-    let (hashes, _random_state) = df_rows_to_hashes_threaded(&dfs, None);
+) -> PolarsResult<GroupsProxy> {
+    let dfs = split_df(&mut keys, n_partitions).unwrap();
+    let (hashes, _random_state) = df_rows_to_hashes_threaded_vertical(&dfs, None)?;
     let n_partitions = n_partitions as u64;
 
     // trait object to compare inner types.
@@ -288,11 +298,11 @@ pub(crate) fn groupby_threaded_multiple_keys_flat(
     // We will create a hashtable in every thread.
     // We use the hash to partition the keys to the matching hashtable.
     // Every thread traverses all keys/hashes and ignores the ones that doesn't fall in that partition.
-    let groups = POOL
-        .install(|| {
-            (0..n_partitions).into_par_iter().map(|thread_no| {
+    let groups = POOL.install(|| {
+        (0..n_partitions)
+            .into_par_iter()
+            .map(|thread_no| {
                 let hashes = &hashes;
-                let thread_no = thread_no as u64;
 
                 let mut hash_tbl: HashMap<IdxHash, (IdxSize, Vec<IdxSize>), IdBuildHasher> =
                     HashMap::with_capacity_and_hasher(HASHMAP_INIT_SIZE, Default::default());
@@ -325,7 +335,7 @@ pub(crate) fn groupby_threaded_multiple_keys_flat(
                 }
                 hash_tbl.into_iter().map(|(_k, v)| v).collect::<Vec<_>>()
             })
-        })
-        .collect::<Vec<_>>();
-    finish_group_order(groups, sorted)
+            .collect::<Vec<_>>()
+    });
+    Ok(finish_group_order(groups, sorted))
 }

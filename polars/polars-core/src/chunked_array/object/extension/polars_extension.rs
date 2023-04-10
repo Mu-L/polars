@@ -1,13 +1,23 @@
+use std::mem::ManuallyDrop;
+
+use arrow::array::FixedSizeBinaryArray;
+
 use super::*;
 use crate::prelude::*;
-use arrow::array::FixedSizeBinaryArray;
-use std::mem::ManuallyDrop;
 
 pub struct PolarsExtension {
     array: Option<FixedSizeBinaryArray>,
 }
 
 impl PolarsExtension {
+    /// This is very expensive
+    pub(crate) unsafe fn arr_to_av(arr: &FixedSizeBinaryArray, i: usize) -> AnyValue {
+        let arr = arr.slice_typed_unchecked(i, 1);
+        let pe = Self::new(arr);
+        let pe = ManuallyDrop::new(pe);
+        pe.get_series("").get(0).unwrap().into_static().unwrap()
+    }
+
     pub(crate) unsafe fn new(array: FixedSizeBinaryArray) -> Self {
         Self { array: Some(array) }
     }

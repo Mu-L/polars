@@ -1,9 +1,11 @@
-use crate::prelude::*;
 use arrow::array::{Array, ListArray};
 use arrow::bitmap::MutableBitmap;
 use arrow::compute::concatenate;
 use arrow::datatypes::DataType;
 use arrow::error::Result;
+use arrow::offset::Offsets;
+
+use crate::prelude::*;
 
 pub struct AnonymousBuilder<'a> {
     arrays: Vec<&'a dyn Array>,
@@ -36,8 +38,9 @@ impl<'a> AnonymousBuilder<'a> {
         &self.offsets
     }
 
-    pub fn take_offsets(self) -> Vec<i64> {
-        self.offsets
+    pub fn take_offsets(self) -> Offsets<i64> {
+        // safety: offsets are correct
+        unsafe { Offsets::new_unchecked(self.offsets) }
     }
 
     #[inline]
@@ -57,9 +60,7 @@ impl<'a> AnonymousBuilder<'a> {
             self.arrays.push(arr.as_ref());
         }
         self.offsets.push(self.size);
-        if let Some(validity) = &mut self.validity {
-            validity.push(true)
-        }
+        self.update_validity()
     }
 
     pub fn push_null(&mut self) {
@@ -72,6 +73,7 @@ impl<'a> AnonymousBuilder<'a> {
 
     pub fn push_empty(&mut self) {
         self.offsets.push(self.last_offset());
+        self.update_validity()
     }
 
     fn init_validity(&mut self) {
@@ -82,18 +84,22 @@ impl<'a> AnonymousBuilder<'a> {
         validity.set(len - 1, false);
         self.validity = Some(validity)
     }
+    fn update_validity(&mut self) {
+        if let Some(validity) = &mut self.validity {
+            validity.push(true)
+        }
+    }
 
     pub fn finish(self, inner_dtype: Option<&DataType>) -> Result<ListArray<i64>> {
         let inner_dtype = inner_dtype.unwrap_or_else(|| self.arrays[0].data_type());
         let values = concatenate::concatenate(&self.arrays)?;
-
         let dtype = ListArray::<i64>::default_datatype(inner_dtype.clone());
         // Safety:
         // offsets are monotonically increasing
         unsafe {
-            Ok(ListArray::<i64>::new_unchecked(
+            Ok(ListArray::<i64>::new(
                 dtype,
-                self.offsets.into(),
+                Offsets::new_unchecked(self.offsets).into(),
                 values,
                 self.validity.map(|validity| validity.into()),
             ))

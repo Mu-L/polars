@@ -1,35 +1,33 @@
-#![cfg_attr(docsrs, feature(doc_cfg))]
-
-#[cfg(feature = "private")]
-pub mod aggregations;
-#[cfg(not(feature = "private"))]
-pub(crate) mod aggregations;
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(feature = "simd", feature(portable_simd))]
+#![allow(ambiguous_glob_reexports)]
 
 #[cfg(feature = "avro")]
-#[cfg_attr(docsrs, doc(cfg(feature = "avro")))]
 pub mod avro;
-#[cfg(feature = "csv-file")]
-#[cfg_attr(docsrs, doc(cfg(feature = "csv-file")))]
+#[cfg(feature = "cloud")]
+mod cloud;
+#[cfg(any(feature = "csv-file", feature = "json"))]
 pub mod csv;
-#[cfg(feature = "csv-file")]
-#[cfg_attr(docsrs, doc(cfg(feature = "csv-file")))]
-pub mod csv_core;
+#[cfg(feature = "parquet")]
 pub mod export;
 #[cfg(any(feature = "ipc", feature = "ipc_streaming"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "ipc", feature = "ipc_streaming"))))]
 pub mod ipc;
 #[cfg(feature = "json")]
-#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 pub mod json;
 #[cfg(feature = "json")]
-#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 pub mod ndjson_core;
+#[cfg(feature = "cloud")]
+pub use crate::cloud::glob as async_glob;
 
-#[cfg(any(feature = "csv-file", feature = "parquet"))]
+#[cfg(any(
+    feature = "csv-file",
+    feature = "parquet",
+    feature = "ipc",
+    feature = "json"
+))]
 pub mod mmap;
 mod options;
 #[cfg(feature = "parquet")]
-#[cfg_attr(docsrs, doc(cfg(feature = "feature")))]
 pub mod parquet;
 #[cfg(feature = "private")]
 pub mod predicates;
@@ -43,37 +41,33 @@ pub(crate) mod utils;
 #[cfg(feature = "partition")]
 pub mod partition;
 
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
+
+#[allow(unused)] // remove when updating to rust nightly >= 1.61
+use arrow::array::new_empty_array;
+use arrow::error::Result as ArrowResult;
 pub use options::*;
+use polars_core::frame::ArrowChunk;
+use polars_core::prelude::*;
 
 #[cfg(any(
     feature = "ipc",
     feature = "json",
     feature = "avro",
-    feature = "ipc_streaming"
-))]
-use crate::aggregations::{apply_aggregations, ScanAggregation};
-#[cfg(any(
-    feature = "ipc",
-    feature = "json",
-    feature = "avro",
-    feature = "ipc_streaming"
+    feature = "ipc_streaming",
 ))]
 use crate::predicates::PhysicalIoExpr;
-#[allow(unused)] // remove when updating to rust nightly >= 1.61
-use arrow::array::new_empty_array;
-use arrow::error::Result as ArrowResult;
-use polars_core::frame::ArrowChunk;
-use polars_core::prelude::*;
-use std::io::{Read, Seek, Write};
-use std::path::PathBuf;
 
 pub trait SerReader<R>
 where
     R: Read + Seek,
 {
+    /// Create a new instance of the `[SerReader]`
     fn new(reader: R) -> Self;
 
-    /// Rechunk to a single chunk after Reading file.
+    /// Make sure that all columns are contiguous in memory by
+    /// aggregating the chunks into a single array.
     #[must_use]
     fn set_rechunk(self, _rechunk: bool) -> Self
     where
@@ -83,7 +77,7 @@ where
     }
 
     /// Take the SerReader and return a parsed DataFrame.
-    fn finish(self) -> Result<DataFrame>;
+    fn finish(self) -> PolarsResult<DataFrame>;
 }
 
 pub trait SerWriter<W>
@@ -93,7 +87,7 @@ where
     fn new(writer: W) -> Self
     where
         Self: Sized;
-    fn finish(&mut self, df: &mut DataFrame) -> Result<()>;
+    fn finish(&mut self, df: &mut DataFrame) -> PolarsResult<()>;
 }
 
 pub trait WriterFactory {
@@ -109,17 +103,16 @@ pub trait ArrowReader {
     feature = "ipc",
     feature = "json",
     feature = "avro",
-    feature = "ipc_streaming"
+    feature = "ipc_streaming",
 ))]
 pub(crate) fn finish_reader<R: ArrowReader>(
     mut reader: R,
     rechunk: bool,
     n_rows: Option<usize>,
     predicate: Option<Arc<dyn PhysicalIoExpr>>,
-    aggregate: Option<&[ScanAggregation]>,
     arrow_schema: &ArrowSchema,
     row_count: Option<RowCount>,
-) -> Result<DataFrame> {
+) -> PolarsResult<DataFrame> {
     use polars_core::utils::accumulate_dataframes_vertical;
 
     let mut num_rows = 0;
@@ -140,15 +133,13 @@ pub(crate) fn finish_reader<R: ArrowReader>(
             df = df.filter(mask)?;
         }
 
-        apply_aggregations(&mut df, aggregate)?;
-
         if let Some(n) = n_rows {
             if num_rows >= n {
                 let len = n - parsed_dfs
                     .iter()
                     .map(|df: &DataFrame| df.height())
                     .sum::<usize>();
-                if std::env::var("POLARS_VERBOSE").is_ok() {
+                if polars_core::config::verbose() {
                     eprintln!("sliced off {} rows of the 'DataFrame'. These lines were read because they were in a single chunk.", df.height() - n)
                 }
                 parsed_dfs.push(df.slice(0, len));
@@ -167,14 +158,11 @@ pub(crate) fn finish_reader<R: ArrowReader>(
                 .map(|fld| {
                     Series::try_from((fld.name.as_str(), new_empty_array(fld.data_type.clone())))
                 })
-                .collect::<Result<_>>()?;
+                .collect::<PolarsResult<_>>()?;
             DataFrame::new(empty_cols)?
         } else {
             // If there are any rows, accumulate them into a df
-            let mut df = accumulate_dataframes_vertical(parsed_dfs)?;
-            // Aggregations must be applied a final time to aggregate the partitions
-            apply_aggregations(&mut df, aggregate)?;
-            df
+            accumulate_dataframes_vertical(parsed_dfs)?
         }
     };
 
@@ -182,4 +170,11 @@ pub(crate) fn finish_reader<R: ArrowReader>(
         true => Ok(df.agg_chunks()),
         false => Ok(df),
     }
+}
+
+/// Check if the path is a cloud url.
+pub fn is_cloud_url<P: AsRef<Path>>(p: P) -> bool {
+    p.as_ref().starts_with("s3://")
+        || p.as_ref().starts_with("file://")
+        || p.as_ref().starts_with("gcs://")
 }

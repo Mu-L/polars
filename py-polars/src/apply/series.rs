@@ -1,12 +1,13 @@
+use polars::chunked_array::builder::get_list_builder;
+use polars::prelude::*;
+use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyCFunction, PyDict, PyFloat, PyList, PyString, PyTuple};
+
 use super::*;
 use crate::conversion::slice_to_wrapped;
 use crate::py_modules::SERIES;
 use crate::series::PySeries;
 use crate::{PyPolarsErr, Wrap};
-use polars::chunked_array::builder::get_list_builder;
-use polars::prelude::*;
-use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyCFunction, PyDict, PyFloat, PyList, PyString, PyTuple};
 
 /// Find the output type and dispatch to that implementation.
 fn infer_and_finish<'a, A: ApplyLambda<'a>>(
@@ -62,15 +63,12 @@ fn infer_and_finish<'a, A: ApplyLambda<'a>>(
         // def new_lambda(lambda: Callable):
         //     pl.Series(lambda(value))
         let lambda_owned = lambda.to_object(py);
-        let new_lambda = PyCFunction::new_closure(
-            move |args, _kwargs| {
-                Python::with_gil(|py| {
-                    let out = lambda_owned.call1(py, args)?;
-                    SERIES.call1(py, (out,))
-                })
-            },
-            py,
-        )?
+        let new_lambda = PyCFunction::new_closure(py, None, None, move |args, _kwargs| {
+            Python::with_gil(|py| {
+                let out = lambda_owned.call1(py, args)?;
+                SERIES.call1(py, (out,))
+            })
+        })?
         .to_object(py);
 
         let result = applyer
@@ -107,14 +105,21 @@ fn infer_and_finish<'a, A: ApplyLambda<'a>>(
             .apply_extract_any_values(py, lambda, null_count, av.0)
             .map(|s| s.into())
     } else {
-        applyer
-            .apply_lambda_with_object_out_type(
-                py,
-                lambda,
-                null_count,
-                Some(out.to_object(py).into()),
-            )
-            .map(|ca| ca.into_series().into())
+        #[cfg(feature = "object")]
+        {
+            applyer
+                .apply_lambda_with_object_out_type(
+                    py,
+                    lambda,
+                    null_count,
+                    Some(out.to_object(py).into()),
+                )
+                .map(|ca| ca.into_series().into())
+        }
+        #[cfg(not(feature = "object"))]
+        {
+            todo!()
+        }
     }
 }
 
@@ -182,6 +187,7 @@ pub trait ApplyLambda<'a> {
     ) -> PyResult<Series>;
 
     /// Apply a lambda with list output type
+    #[cfg(feature = "object")]
     fn apply_lambda_with_object_out_type(
         &'a self,
         py: Python,
@@ -210,7 +216,7 @@ where
 {
     match call_lambda(py, lambda, in_val) {
         Ok(out) => out.extract::<S>(),
-        Err(e) => panic!("python function failed {}", e),
+        Err(e) => panic!("python function failed {e}"),
     }
 }
 
@@ -229,7 +235,7 @@ impl<'a> ApplyLambda<'a> for BooleanChunked {
         let mut null_count = 0;
         for opt_v in self.into_iter() {
             if let Some(v) = opt_v {
-                let arg = PyTuple::new(py, &[v]);
+                let arg = PyTuple::new(py, [v]);
                 let out = lambda.call1(arg)?;
                 if out.is_none() {
                     null_count += 1;
@@ -284,7 +290,7 @@ impl<'a> ApplyLambda<'a> for BooleanChunked {
         D: PyArrowPrimitiveType,
         D::Native: ToPyObject + FromPyObject<'a>,
     {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -323,7 +329,7 @@ impl<'a> ApplyLambda<'a> for BooleanChunked {
         init_null_count: usize,
         first_value: Option<bool>,
     ) -> PyResult<BooleanChunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -362,7 +368,7 @@ impl<'a> ApplyLambda<'a> for BooleanChunked {
         init_null_count: usize,
         first_value: Option<&str>,
     ) -> PyResult<Utf8Chunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -473,6 +479,7 @@ impl<'a> ApplyLambda<'a> for BooleanChunked {
         Ok(Series::new(self.name(), &avs))
     }
 
+    #[cfg(feature = "object")]
     fn apply_lambda_with_object_out_type(
         &'a self,
         py: Python,
@@ -480,7 +487,7 @@ impl<'a> ApplyLambda<'a> for BooleanChunked {
         init_null_count: usize,
         first_value: Option<ObjectValue>,
     ) -> PyResult<ObjectChunked<ObjectValue>> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -524,7 +531,7 @@ where
         let mut null_count = 0;
         for opt_v in self.into_iter() {
             if let Some(v) = opt_v {
-                let arg = PyTuple::new(py, &[v]);
+                let arg = PyTuple::new(py, [v]);
                 let out = lambda.call1(arg)?;
                 if out.is_none() {
                     null_count += 1;
@@ -579,7 +586,7 @@ where
         D: PyArrowPrimitiveType,
         D::Native: ToPyObject + FromPyObject<'a>,
     {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -618,7 +625,7 @@ where
         init_null_count: usize,
         first_value: Option<bool>,
     ) -> PyResult<BooleanChunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -657,7 +664,7 @@ where
         init_null_count: usize,
         first_value: Option<&str>,
     ) -> PyResult<Utf8Chunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -768,6 +775,7 @@ where
         Ok(Series::new(self.name(), &avs))
     }
 
+    #[cfg(feature = "object")]
     fn apply_lambda_with_object_out_type(
         &'a self,
         py: Python,
@@ -775,7 +783,7 @@ where
         init_null_count: usize,
         first_value: Option<ObjectValue>,
     ) -> PyResult<ObjectChunked<ObjectValue>> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -814,7 +822,7 @@ impl<'a> ApplyLambda<'a> for Utf8Chunked {
         let mut null_count = 0;
         for opt_v in self.into_iter() {
             if let Some(v) = opt_v {
-                let arg = PyTuple::new(py, &[v]);
+                let arg = PyTuple::new(py, [v]);
                 let out = lambda.call1(arg)?;
                 if out.is_none() {
                     null_count += 1;
@@ -869,7 +877,7 @@ impl<'a> ApplyLambda<'a> for Utf8Chunked {
         D: PyArrowPrimitiveType,
         D::Native: ToPyObject + FromPyObject<'a>,
     {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -908,7 +916,7 @@ impl<'a> ApplyLambda<'a> for Utf8Chunked {
         init_null_count: usize,
         first_value: Option<bool>,
     ) -> PyResult<BooleanChunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -947,7 +955,7 @@ impl<'a> ApplyLambda<'a> for Utf8Chunked {
         init_null_count: usize,
         first_value: Option<&str>,
     ) -> PyResult<Utf8Chunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -1057,6 +1065,7 @@ impl<'a> ApplyLambda<'a> for Utf8Chunked {
         Ok(Series::new(self.name(), &avs))
     }
 
+    #[cfg(feature = "object")]
     fn apply_lambda_with_object_out_type(
         &'a self,
         py: Python,
@@ -1064,7 +1073,7 @@ impl<'a> ApplyLambda<'a> for Utf8Chunked {
         init_null_count: usize,
         first_value: Option<ObjectValue>,
     ) -> PyResult<ObjectChunked<ObjectValue>> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -1307,7 +1316,7 @@ impl<'a> ApplyLambda<'a> for ListChunked {
         D: PyArrowPrimitiveType,
         D::Native: ToPyObject + FromPyObject<'a>,
     {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         let pypolars = PyModule::import(py, "polars")?;
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
@@ -1367,7 +1376,7 @@ impl<'a> ApplyLambda<'a> for ListChunked {
         init_null_count: usize,
         first_value: Option<bool>,
     ) -> PyResult<BooleanChunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         let pypolars = PyModule::import(py, "polars")?;
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
@@ -1427,7 +1436,7 @@ impl<'a> ApplyLambda<'a> for ListChunked {
         init_null_count: usize,
         first_value: Option<&str>,
     ) -> PyResult<Utf8Chunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         // get the pypolars module
         let pypolars = PyModule::import(py, "polars")?;
 
@@ -1564,12 +1573,13 @@ impl<'a> ApplyLambda<'a> for ListChunked {
             let iter = self
                 .into_no_null_iter()
                 .skip(init_null_count + 1)
-                .map(|val| call_with_value(val));
+                .map(call_with_value);
             avs.extend(iter);
         }
         Ok(Series::new(self.name(), &avs))
     }
 
+    #[cfg(feature = "object")]
     fn apply_lambda_with_object_out_type(
         &'a self,
         py: Python,
@@ -1577,7 +1587,7 @@ impl<'a> ApplyLambda<'a> for ListChunked {
         init_null_count: usize,
         first_value: Option<ObjectValue>,
     ) -> PyResult<ObjectChunked<ObjectValue>> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         let pypolars = PyModule::import(py, "polars")?;
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
@@ -1632,12 +1642,13 @@ impl<'a> ApplyLambda<'a> for ListChunked {
     }
 }
 
+#[cfg(feature = "object")]
 impl<'a> ApplyLambda<'a> for ObjectChunked<ObjectValue> {
     fn apply_lambda_unknown(&'a self, py: Python, lambda: &'a PyAny) -> PyResult<PySeries> {
         let mut null_count = 0;
         for opt_v in self.into_iter() {
             if let Some(v) = opt_v {
-                let arg = PyTuple::new(py, &[v]);
+                let arg = PyTuple::new(py, [v]);
                 let out = lambda.call1(arg)?;
                 if out.is_none() {
                     null_count += 1;
@@ -1654,8 +1665,15 @@ impl<'a> ApplyLambda<'a> for ObjectChunked<ObjectValue> {
     }
 
     fn apply_lambda(&'a self, py: Python, lambda: &'a PyAny) -> PyResult<PySeries> {
-        self.apply_lambda_with_object_out_type(py, lambda, 0, None)
-            .map(|ca| PySeries::new(ca.into_series()))
+        #[cfg(feature = "object")]
+        {
+            self.apply_lambda_with_object_out_type(py, lambda, 0, None)
+                .map(|ca| PySeries::new(ca.into_series()))
+        }
+        #[cfg(not(feature = "object"))]
+        {
+            todo!()
+        }
     }
 
     fn apply_to_struct(
@@ -1679,7 +1697,7 @@ impl<'a> ApplyLambda<'a> for ObjectChunked<ObjectValue> {
         D: PyArrowPrimitiveType,
         D::Native: ToPyObject + FromPyObject<'a>,
     {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -1718,7 +1736,7 @@ impl<'a> ApplyLambda<'a> for ObjectChunked<ObjectValue> {
         init_null_count: usize,
         first_value: Option<bool>,
     ) -> PyResult<BooleanChunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -1757,7 +1775,7 @@ impl<'a> ApplyLambda<'a> for ObjectChunked<ObjectValue> {
         init_null_count: usize,
         first_value: Option<&str>,
     ) -> PyResult<Utf8Chunked> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -1868,6 +1886,7 @@ impl<'a> ApplyLambda<'a> for ObjectChunked<ObjectValue> {
         Ok(Series::new(self.name(), &avs))
     }
 
+    #[cfg(feature = "object")]
     fn apply_lambda_with_object_out_type(
         &'a self,
         py: Python,
@@ -1875,7 +1894,7 @@ impl<'a> ApplyLambda<'a> for ObjectChunked<ObjectValue> {
         init_null_count: usize,
         first_value: Option<ObjectValue>,
     ) -> PyResult<ObjectChunked<ObjectValue>> {
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         if init_null_count == self.len() {
             Ok(ChunkedArray::full_null(self.name(), self.len()))
         } else if !self.has_validity() {
@@ -1970,7 +1989,7 @@ impl<'a> ApplyLambda<'a> for StructChunked {
     {
         let names = self.fields().iter().map(|s| s.name()).collect::<Vec<_>>();
 
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         let it = self.into_iter().skip(init_null_count + skip).map(|val| {
             let arg = make_dict_arg(py, &names, val);
             call_lambda_and_extract(py, lambda, arg).ok()
@@ -1994,7 +2013,7 @@ impl<'a> ApplyLambda<'a> for StructChunked {
     ) -> PyResult<BooleanChunked> {
         let names = self.fields().iter().map(|s| s.name()).collect::<Vec<_>>();
 
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         let it = self.into_iter().skip(init_null_count + skip).map(|val| {
             let arg = make_dict_arg(py, &names, val);
             call_lambda_and_extract(py, lambda, arg).ok()
@@ -2018,7 +2037,7 @@ impl<'a> ApplyLambda<'a> for StructChunked {
     ) -> PyResult<Utf8Chunked> {
         let names = self.fields().iter().map(|s| s.name()).collect::<Vec<_>>();
 
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         let it = self.into_iter().skip(init_null_count + skip).map(|val| {
             let arg = make_dict_arg(py, &names, val);
             call_lambda_and_extract(py, lambda, arg).ok()
@@ -2082,6 +2101,7 @@ impl<'a> ApplyLambda<'a> for StructChunked {
         Ok(Series::new(self.name(), &avs))
     }
 
+    #[cfg(feature = "object")]
     fn apply_lambda_with_object_out_type(
         &'a self,
         py: Python,
@@ -2091,7 +2111,7 @@ impl<'a> ApplyLambda<'a> for StructChunked {
     ) -> PyResult<ObjectChunked<ObjectValue>> {
         let names = self.fields().iter().map(|s| s.name()).collect::<Vec<_>>();
 
-        let skip = if first_value.is_some() { 1 } else { 0 };
+        let skip = usize::from(first_value.is_some());
         let it = self.into_iter().skip(init_null_count + skip).map(|val| {
             let arg = make_dict_arg(py, &names, val);
             call_lambda_and_extract(py, lambda, arg).ok()

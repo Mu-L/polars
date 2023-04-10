@@ -1,18 +1,20 @@
-use super::private;
-use super::IntoSeries;
-use super::SeriesTrait;
+use std::any::Any;
+use std::borrow::Cow;
+
+use super::{private, IntoSeries, SeriesTrait};
 use crate::chunked_array::comparison::*;
-use crate::chunked_array::{ops::explode::ExplodeByOffsets, AsSinglePtr};
+use crate::chunked_array::ops::explode::ExplodeByOffsets;
+use crate::chunked_array::AsSinglePtr;
 use crate::fmt::FmtList;
 use crate::frame::groupby::*;
 use crate::prelude::*;
 use crate::series::implementations::SeriesWrap;
 use crate::series::IsSorted;
-use polars_arrow::prelude::QuantileInterpolOptions;
-use std::any::Any;
-use std::borrow::Cow;
 
 impl private::PrivateSeries for SeriesWrap<ListChunked> {
+    fn compute_len(&mut self) {
+        self.0.compute_len()
+    }
     fn _field(&self) -> Cow<Field> {
         Cow::Borrowed(self.0.ref_field())
     }
@@ -23,8 +25,8 @@ impl private::PrivateSeries for SeriesWrap<ListChunked> {
         self.0.explode_by_offsets(offsets)
     }
 
-    fn _set_sorted(&mut self, is_sorted: IsSorted) {
-        self.0.set_sorted2(is_sorted)
+    fn _set_sorted_flag(&mut self, is_sorted: IsSorted) {
+        self.0.set_sorted_flag(is_sorted)
     }
 
     unsafe fn equal_element(&self, idx_self: usize, idx_other: usize, other: &Series) -> bool {
@@ -32,7 +34,7 @@ impl private::PrivateSeries for SeriesWrap<ListChunked> {
     }
 
     #[cfg(feature = "zip_with")]
-    fn zip_with_same_type(&self, mask: &BooleanChunked, other: &Series) -> Result<Series> {
+    fn zip_with_same_type(&self, mask: &BooleanChunked, other: &Series) -> PolarsResult<Series> {
         ChunkZip::zip_with(&self.0, mask, other.as_ref().as_ref()).map(|ca| ca.into_series())
     }
 
@@ -40,17 +42,12 @@ impl private::PrivateSeries for SeriesWrap<ListChunked> {
         self.0.agg_list(groups)
     }
 
-    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> GroupsProxy {
+    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
         IntoGroupsProxy::group_tuples(&self.0, multithreaded, sorted)
     }
 }
 
 impl SeriesTrait for SeriesWrap<ListChunked> {
-    #[cfg(feature = "interpolate")]
-    fn interpolate(&self) -> Series {
-        self.0.clone().into_series()
-    }
-
     fn rename(&mut self, name: &str) {
         self.0.rename(name);
     }
@@ -69,36 +66,21 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
         self.0.shrink_to_fit()
     }
 
-    fn append_array(&mut self, other: ArrayRef) -> Result<()> {
-        self.0.append_array(other)
-    }
-
     fn slice(&self, offset: i64, length: usize) -> Series {
         self.0.slice(offset, length).into_series()
     }
 
-    fn append(&mut self, other: &Series) -> Result<()> {
-        if self.0.dtype() == other.dtype() {
-            self.0.append(other.as_ref().as_ref());
-            Ok(())
-        } else {
-            Err(PolarsError::SchemaMisMatch(
-                "cannot append Series; data types don't match".into(),
-            ))
-        }
-    }
-    fn extend(&mut self, other: &Series) -> Result<()> {
-        if self.0.dtype() == other.dtype() {
-            self.0.extend(other.as_ref().as_ref());
-            Ok(())
-        } else {
-            Err(PolarsError::SchemaMisMatch(
-                "cannot extend Series; data types don't match".into(),
-            ))
-        }
+    fn append(&mut self, other: &Series) -> PolarsResult<()> {
+        polars_ensure!(self.0.dtype() == other.dtype(), append);
+        self.0.append(other.as_ref().as_ref())
     }
 
-    fn filter(&self, filter: &BooleanChunked) -> Result<Series> {
+    fn extend(&mut self, other: &Series) -> PolarsResult<()> {
+        polars_ensure!(self.0.dtype() == other.dtype(), extend);
+        self.0.extend(other.as_ref().as_ref())
+    }
+
+    fn filter(&self, filter: &BooleanChunked) -> PolarsResult<Series> {
         ChunkFilter::filter(&self.0, filter).map(|ca| ca.into_series())
     }
 
@@ -112,7 +94,7 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
         self.0.take_opt_chunked_unchecked(by).into_series()
     }
 
-    fn take(&self, indices: &IdxCa) -> Result<Series> {
+    fn take(&self, indices: &IdxCa) -> PolarsResult<Series> {
         let indices = if indices.chunks.len() > 1 {
             Cow::Owned(indices.rechunk())
         } else {
@@ -121,7 +103,7 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
         Ok(ChunkTake::take(&self.0, (&*indices).into())?.into_series())
     }
 
-    fn take_iter(&self, iter: &mut dyn TakeIterator) -> Result<Series> {
+    fn take_iter(&self, iter: &mut dyn TakeIterator) -> PolarsResult<Series> {
         Ok(ChunkTake::take(&self.0, iter.into())?.into_series())
     }
 
@@ -133,7 +115,7 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
         ChunkTake::take_unchecked(&self.0, iter.into()).into_series()
     }
 
-    unsafe fn take_unchecked(&self, idx: &IdxCa) -> Result<Series> {
+    unsafe fn take_unchecked(&self, idx: &IdxCa) -> PolarsResult<Series> {
         let idx = if idx.chunks.len() > 1 {
             Cow::Owned(idx.rechunk())
         } else {
@@ -147,7 +129,7 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
     }
 
     #[cfg(feature = "take_opt_iter")]
-    fn take_opt_iter(&self, iter: &mut dyn TakeIteratorNulls) -> Result<Series> {
+    fn take_opt_iter(&self, iter: &mut dyn TakeIteratorNulls) -> PolarsResult<Series> {
         Ok(ChunkTake::take(&self.0, iter.into())?.into_series())
     }
 
@@ -156,18 +138,18 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
     }
 
     fn rechunk(&self) -> Series {
-        ChunkOps::rechunk(&self.0).into_series()
+        self.0.rechunk().into_series()
     }
 
-    fn expand_at_index(&self, index: usize, length: usize) -> Series {
-        ChunkExpandAtIndex::expand_at_index(&self.0, index, length).into_series()
+    fn new_from_index(&self, index: usize, length: usize) -> Series {
+        ChunkExpandAtIndex::new_from_index(&self.0, index, length).into_series()
     }
 
-    fn cast(&self, data_type: &DataType) -> Result<Series> {
+    fn cast(&self, data_type: &DataType) -> PolarsResult<Series> {
         self.0.cast(data_type)
     }
 
-    fn get(&self, index: usize) -> AnyValue {
+    fn get(&self, index: usize) -> PolarsResult<AnyValue> {
         self.0.get_any_value(index)
     }
 
@@ -197,16 +179,12 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
         ChunkReverse::reverse(&self.0).into_series()
     }
 
-    fn as_single_ptr(&mut self) -> Result<usize> {
+    fn as_single_ptr(&mut self) -> PolarsResult<usize> {
         self.0.as_single_ptr()
     }
 
     fn shift(&self, periods: i64) -> Series {
         ChunkShift::shift(&self.0, periods).into_series()
-    }
-
-    fn fill_null(&self, strategy: FillNullStrategy) -> Result<Series> {
-        ChunkFillNull::fill_null(&self.0, strategy).map(|ca| ca.into_series())
     }
 
     fn _sum_as_series(&self) -> Series {
@@ -218,23 +196,6 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
     fn min_as_series(&self) -> Series {
         ChunkAggSeries::min_as_series(&self.0)
     }
-    fn median_as_series(&self) -> Series {
-        QuantileAggSeries::median_as_series(&self.0)
-    }
-    fn var_as_series(&self) -> Series {
-        VarAggSeries::var_as_series(&self.0)
-    }
-    fn std_as_series(&self) -> Series {
-        VarAggSeries::std_as_series(&self.0)
-    }
-    fn quantile_as_series(
-        &self,
-        quantile: f64,
-        interpol: QuantileInterpolOptions,
-    ) -> Result<Series> {
-        QuantileAggSeries::quantile_as_series(&self.0, quantile, interpol)
-    }
-
     fn fmt_list(&self) -> String {
         FmtList::fmt_list(&self.0)
     }

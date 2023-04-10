@@ -1,15 +1,23 @@
-use crate::prelude::*;
+use std::cmp::Ordering;
+
+#[cfg(feature = "timezones")]
+use arrow::temporal_conversions::parse_offset;
+#[cfg(feature = "timezones")]
+use chrono_tz::Tz;
+use polars_arrow::time_zone::PolarsTimeZone;
 use polars_arrow::trusted_len::TrustedLen;
 use polars_arrow::utils::CustomIterTools;
+use polars_core::export::rayon::prelude::*;
 use polars_core::prelude::*;
+use polars_core::utils::_split_offsets;
 use polars_core::POOL;
-use polars_core::{export::rayon::prelude::*, utils::split_offsets};
 use polars_utils::flatten;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 
-#[derive(Clone, Copy, Debug)]
+use crate::prelude::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ClosedWindow {
     Left,
@@ -18,59 +26,34 @@ pub enum ClosedWindow {
     None,
 }
 
-/// Based on the given `Window`, which has an
-/// - every
-/// - period
-/// - offset
-/// window boundaries are created. And every window boundary we search for the values
-/// that fit that window by the given `ClosedWindow`. The groups are return as `GroupTuples`
-/// together with the lower bound and upper bound timestamps. These timestamps indicate the start (lower)
-/// and end (upper) of the window of that group.
-///
-/// If `include_boundaries` is `false` those `lower` and `upper` vectors will be empty.
-pub fn groupby_windows(
-    window: Window,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum StartBy {
+    WindowBound,
+    DataPoint,
+    /// only useful if periods are weekly
+    Monday,
+}
+
+impl Default for StartBy {
+    fn default() -> Self {
+        Self::WindowBound
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_groups_and_bounds<T: PolarsTimeZone>(
+    bounds_iter: BoundsIter<'_, T>,
+    mut start_offset: usize,
     time: &[i64],
-    include_boundaries: bool,
     closed_window: ClosedWindow,
-    tu: TimeUnit,
-) -> (GroupsSlice, Vec<i64>, Vec<i64>) {
-    let start = time[0];
-    let boundary = if time.len() > 1 {
-        // +1 because left or closed boundary could match the next window if it is on the boundary
-        let stop = time[time.len() - 1] + 1;
-        Bounds::new_checked(start, stop)
-    } else {
-        let stop = start + 1;
-        Bounds::new_checked(start, stop)
-    };
-
-    let size = if include_boundaries {
-        match tu {
-            TimeUnit::Nanoseconds => window.estimate_overlapping_bounds_ns(boundary),
-            TimeUnit::Microseconds => window.estimate_overlapping_bounds_us(boundary),
-            TimeUnit::Milliseconds => window.estimate_overlapping_bounds_ms(boundary),
-        }
-    } else {
-        0
-    };
-    let mut lower_bound = Vec::with_capacity(size);
-    let mut upper_bound = Vec::with_capacity(size);
-
-    let mut groups = match tu {
-        TimeUnit::Nanoseconds => {
-            Vec::with_capacity(window.estimate_overlapping_bounds_ns(boundary))
-        }
-        TimeUnit::Microseconds => {
-            Vec::with_capacity(window.estimate_overlapping_bounds_us(boundary))
-        }
-        TimeUnit::Milliseconds => {
-            Vec::with_capacity(window.estimate_overlapping_bounds_ms(boundary))
-        }
-    };
-    let mut start_offset = 0;
-
-    for bi in window.get_overlapping_bounds_iter(boundary, tu) {
+    include_lower_bound: bool,
+    include_upper_bound: bool,
+    lower_bound: &mut Vec<i64>,
+    upper_bound: &mut Vec<i64>,
+    groups: &mut Vec<[IdxSize; 2]>,
+) {
+    for bi in bounds_iter {
         let mut skip_window = false;
         // find starting point of window
         while start_offset < time.len() {
@@ -103,8 +86,10 @@ pub fn groupby_windows(
         if i == time.len() - 1 {
             let t = time[i];
             if bi.is_member(t, closed_window) {
-                if include_boundaries {
+                if include_lower_bound {
                     lower_bound.push(bi.start);
+                }
+                if include_upper_bound {
                     upper_bound.push(bi.stop);
                 }
                 groups.push([i as IdxSize, 1])
@@ -123,31 +108,141 @@ pub fn groupby_windows(
         }
         let len = (i as IdxSize) - first;
 
-        if include_boundaries {
+        if include_lower_bound {
             lower_bound.push(bi.start);
+        }
+        if include_upper_bound {
             upper_bound.push(bi.stop);
         }
         groups.push([first, len])
     }
-    (groups, lower_bound, upper_bound)
 }
 
-pub(crate) fn groupby_values_iter_full_lookbehind(
-    period: Duration,
-    offset: Duration,
+/// Based on the given `Window`, which has an
+/// - every
+/// - period
+/// - offset
+/// window boundaries are created. And every window boundary we search for the values
+/// that fit that window by the given `ClosedWindow`. The groups are return as `GroupTuples`
+/// together with the lower bound and upper bound timestamps. These timestamps indicate the start (lower)
+/// and end (upper) of the window of that group.
+///
+/// If `include_boundaries` is `false` those `lower` and `upper` vectors will be empty.
+#[allow(clippy::too_many_arguments)]
+pub fn groupby_windows(
+    window: Window,
     time: &[i64],
     closed_window: ClosedWindow,
     tu: TimeUnit,
-    start_offset: usize,
-) -> impl Iterator<Item = (IdxSize, IdxSize)> + TrustedLen + '_ {
-    debug_assert!(offset.nanoseconds() >= period.nanoseconds());
-    debug_assert!(offset.negative);
-
-    let add = match tu {
-        TimeUnit::Nanoseconds => Duration::add_ns,
-        TimeUnit::Microseconds => Duration::add_us,
-        TimeUnit::Milliseconds => Duration::add_ms,
+    tz: &Option<TimeZone>,
+    include_lower_bound: bool,
+    include_upper_bound: bool,
+    start_by: StartBy,
+) -> (GroupsSlice, Vec<i64>, Vec<i64>) {
+    let start = time[0];
+    // the boundary we define here is not yet correct. It doesn't take 'period' into account
+    // and it doesn't have the proper starting point. This boundary is used as a proxy to find
+    // the proper 'boundary' in  'window.get_overlapping_bounds_iter'.
+    let boundary = if time.len() > 1 {
+        // +1 because left or closed boundary could match the next window if it is on the boundary
+        let stop = time[time.len() - 1] + 1;
+        Bounds::new_checked(start, stop)
+    } else {
+        let stop = start + 1;
+        Bounds::new_checked(start, stop)
     };
+
+    let size = {
+        match tu {
+            TimeUnit::Nanoseconds => window.estimate_overlapping_bounds_ns(boundary),
+            TimeUnit::Microseconds => window.estimate_overlapping_bounds_us(boundary),
+            TimeUnit::Milliseconds => window.estimate_overlapping_bounds_ms(boundary),
+        }
+    };
+    let size_lower = if include_lower_bound { size } else { 0 };
+    let size_upper = if include_upper_bound { size } else { 0 };
+    let mut lower_bound = Vec::with_capacity(size_lower);
+    let mut upper_bound = Vec::with_capacity(size_upper);
+
+    let mut groups = Vec::with_capacity(size);
+    let start_offset = 0;
+
+    match tz {
+        #[cfg(feature = "timezones")]
+        Some(tz) => match tz.parse::<Tz>() {
+            Ok(tz) => {
+                update_groups_and_bounds(
+                    window
+                        .get_overlapping_bounds_iter(boundary, tu, Some(&tz), start_by)
+                        .unwrap(),
+                    start_offset,
+                    time,
+                    closed_window,
+                    include_lower_bound,
+                    include_upper_bound,
+                    &mut lower_bound,
+                    &mut upper_bound,
+                    &mut groups,
+                );
+            }
+            Err(_) => match parse_offset(tz) {
+                Ok(tz) => {
+                    update_groups_and_bounds(
+                        window
+                            .get_overlapping_bounds_iter(boundary, tu, Some(&tz), start_by)
+                            .unwrap(),
+                        start_offset,
+                        time,
+                        closed_window,
+                        include_lower_bound,
+                        include_upper_bound,
+                        &mut lower_bound,
+                        &mut upper_bound,
+                        &mut groups,
+                    );
+                }
+                _ => unreachable!(),
+            },
+        },
+        _ => {
+            update_groups_and_bounds(
+                window
+                    .get_overlapping_bounds_iter(boundary, tu, NO_TIMEZONE, start_by)
+                    .unwrap(),
+                start_offset,
+                time,
+                closed_window,
+                include_lower_bound,
+                include_upper_bound,
+                &mut lower_bound,
+                &mut upper_bound,
+                &mut groups,
+            );
+        }
+    };
+
+    (groups, lower_bound, upper_bound)
+}
+
+// this assumes that the starting point is alwa
+pub(crate) fn groupby_values_iter_full_lookbehind<'a>(
+    period: Duration,
+    offset: Duration,
+    time: &'a [i64],
+    closed_window: ClosedWindow,
+    tu: TimeUnit,
+    tz: Option<impl PolarsTimeZone + 'a>,
+    start_offset: usize,
+) -> impl Iterator<Item = (IdxSize, IdxSize)> + TrustedLen + 'a {
+    debug_assert!(offset.duration_ns() >= period.duration_ns());
+    debug_assert!(offset.negative);
+    fn add<T: PolarsTimeZone>(tu: TimeUnit) -> fn(&Duration, i64, Option<&T>) -> PolarsResult<i64> {
+        match tu {
+            TimeUnit::Nanoseconds => Duration::add_ns,
+            TimeUnit::Microseconds => Duration::add_us,
+            TimeUnit::Milliseconds => Duration::add_ms,
+        }
+    }
 
     let mut last_lookbehind_i = 0;
     let mut last = i64::MIN;
@@ -156,12 +251,12 @@ pub(crate) fn groupby_values_iter_full_lookbehind(
         .enumerate()
         .map(move |(mut i, lower)| {
             if *lower < last {
-                panic!("index column of 'groupby_rolling' must be sorted!")
+                panic!("index column of 'groupby_rolling' must be sorted in ascending order!")
             }
             last = *lower;
             i += start_offset;
-            let lower = add(&offset, *lower);
-            let upper = add(&period, lower);
+            let lower = add(tu)(&offset, *lower, tz.as_ref()).unwrap();
+            let upper = add(tu)(&period, lower, tz.as_ref()).unwrap();
 
             let b = Bounds::new(lower, upper);
 
@@ -194,18 +289,21 @@ pub(crate) fn groupby_values_iter_full_lookbehind(
 }
 
 // this one is correct for all lookbehind/lookaheads, but is slower
-pub(crate) fn groupby_values_iter_partial_lookbehind(
+pub(crate) fn groupby_values_iter_window_behind_t<'a>(
     period: Duration,
     offset: Duration,
-    time: &[i64],
+    time: &'a [i64],
     closed_window: ClosedWindow,
     tu: TimeUnit,
-) -> impl Iterator<Item = (IdxSize, IdxSize)> + TrustedLen + '_ {
-    let add = match tu {
-        TimeUnit::Nanoseconds => Duration::add_ns,
-        TimeUnit::Microseconds => Duration::add_us,
-        TimeUnit::Milliseconds => Duration::add_ms,
-    };
+    tz: Option<impl PolarsTimeZone + 'a>,
+) -> impl Iterator<Item = (IdxSize, IdxSize)> + TrustedLen + 'a {
+    fn add<T: PolarsTimeZone>(tu: TimeUnit) -> fn(&Duration, i64, Option<&T>) -> PolarsResult<i64> {
+        match tu {
+            TimeUnit::Nanoseconds => Duration::add_ns,
+            TimeUnit::Microseconds => Duration::add_us,
+            TimeUnit::Milliseconds => Duration::add_ms,
+        }
+    }
 
     let mut lagging_offset = 0;
     let mut last = i64::MIN;
@@ -214,8 +312,65 @@ pub(crate) fn groupby_values_iter_partial_lookbehind(
             panic!("index column of 'groupby_rolling' must be sorted!")
         }
         last = *lower;
-        let lower = add(&offset, *lower);
-        let upper = add(&period, lower);
+        let lower = add(tu)(&offset, *lower, tz.as_ref()).unwrap();
+        let upper = add(tu)(&period, lower, tz.as_ref()).unwrap();
+
+        let b = Bounds::new(lower, upper);
+        if b.is_future(time[0], closed_window) {
+            (0, 0)
+        } else {
+            // find starting point of window
+            // we can start searching from lagging offset as that is the minimum boundary because data is sorted
+            // and every iteration this boundary shifts right
+            // we cannot use binary search as a window is not binary,
+            // it is false left from the window, true inside, and false right of the window
+            let mut count = 0;
+            for &t in &time[lagging_offset..] {
+                if b.is_member(t, closed_window) || lagging_offset + count == i {
+                    break;
+                }
+                count += 1
+            }
+            if lagging_offset + count != i {
+                lagging_offset += count;
+            }
+
+            // Safety
+            // we just iterated over value i.
+            let slice = unsafe { time.get_unchecked(lagging_offset..) };
+            let len = slice.partition_point(|v| b.is_member(*v, closed_window));
+
+            (lagging_offset as IdxSize, len as IdxSize)
+        }
+    })
+}
+
+// this one is correct for all lookbehind/lookaheads, but is slower
+pub(crate) fn groupby_values_iter_partial_lookbehind<'a>(
+    period: Duration,
+    offset: Duration,
+    time: &'a [i64],
+    closed_window: ClosedWindow,
+    tu: TimeUnit,
+    tz: Option<impl PolarsTimeZone + 'a>,
+) -> impl Iterator<Item = (IdxSize, IdxSize)> + TrustedLen + 'a {
+    fn add<T: PolarsTimeZone>(tu: TimeUnit) -> fn(&Duration, i64, Option<&T>) -> PolarsResult<i64> {
+        match tu {
+            TimeUnit::Nanoseconds => Duration::add_ns,
+            TimeUnit::Microseconds => Duration::add_us,
+            TimeUnit::Milliseconds => Duration::add_ms,
+        }
+    }
+
+    let mut lagging_offset = 0;
+    let mut last = i64::MIN;
+    time.iter().enumerate().map(move |(i, lower)| {
+        if *lower < last {
+            panic!("index column of 'groupby_rolling' must be sorted!")
+        }
+        last = *lower;
+        let lower = add(tu)(&offset, *lower, tz.as_ref()).unwrap();
+        let upper = add(tu)(&period, lower, tz.as_ref()).unwrap();
 
         let b = Bounds::new(lower, upper);
 
@@ -235,23 +390,27 @@ pub(crate) fn groupby_values_iter_partial_lookbehind(
     })
 }
 
-pub(crate) fn groupby_values_iter_full_lookahead(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn groupby_values_iter_full_lookahead<'a>(
     period: Duration,
     offset: Duration,
-    time: &[i64],
+    time: &'a [i64],
     closed_window: ClosedWindow,
     tu: TimeUnit,
+    tz: Option<impl PolarsTimeZone + 'a>,
     start_offset: usize,
     upper_bound: Option<usize>,
-) -> impl Iterator<Item = (IdxSize, IdxSize)> + TrustedLen + '_ {
+) -> impl Iterator<Item = (IdxSize, IdxSize)> + TrustedLen + 'a {
     let upper_bound = upper_bound.unwrap_or(time.len());
     debug_assert!(!offset.negative);
 
-    let add = match tu {
-        TimeUnit::Nanoseconds => Duration::add_ns,
-        TimeUnit::Microseconds => Duration::add_us,
-        TimeUnit::Milliseconds => Duration::add_ms,
-    };
+    fn add<T: PolarsTimeZone>(tu: TimeUnit) -> fn(&Duration, i64, Option<&T>) -> PolarsResult<i64> {
+        match tu {
+            TimeUnit::Nanoseconds => Duration::add_ns,
+            TimeUnit::Microseconds => Duration::add_us,
+            TimeUnit::Milliseconds => Duration::add_ms,
+        }
+    }
 
     let mut last = i64::MIN;
     time[start_offset..upper_bound]
@@ -263,8 +422,8 @@ pub(crate) fn groupby_values_iter_full_lookahead(
             }
             last = *lower;
             i += start_offset;
-            let lower = add(&offset, *lower);
-            let upper = add(&period, lower);
+            let lower = add(tu)(&offset, *lower, tz.as_ref()).unwrap();
+            let upper = add(tu)(&period, lower, tz.as_ref()).unwrap();
 
             let b = Bounds::new(lower, upper);
 
@@ -276,13 +435,13 @@ pub(crate) fn groupby_values_iter_full_lookahead(
         })
 }
 
-fn partially_check_sorted(time: &[i64]) {
+pub(crate) fn partially_check_sorted(time: &[i64]) {
     // check sortedness of a small subslice.
     if time.len() > 1 {
         assert!(time[..std::cmp::min(time.len(), 10)].windows(2).filter_map(|w| match w[0].cmp(&w[1]) {
             Ordering::Equal => None,
             t => Some(t)
-        }).all_equal(), "subslice check showed that the values in `groupby_rolling` were not sorted. Pleasure ensure the index column is sorted.");
+        }).all_equal(), "Subslice check showed that the values in `groupby_rolling/groupby_dynamic` were not sorted. Pleasure ensure the index column is sorted.");
     }
 }
 
@@ -293,6 +452,7 @@ pub(crate) fn groupby_values_iter<'a>(
     time: &'a [i64],
     closed_window: ClosedWindow,
     tu: TimeUnit,
+    tz: Option<impl PolarsTimeZone + 'a>,
 ) -> Box<dyn TrustedLen<Item = (IdxSize, IdxSize)> + 'a> {
     partially_check_sorted(time);
     // we have a (partial) lookbehind window
@@ -300,18 +460,26 @@ pub(crate) fn groupby_values_iter<'a>(
         // only lookbehind
         if offset.nanoseconds() == period.nanoseconds() {
             let iter =
-                groupby_values_iter_full_lookbehind(period, offset, time, closed_window, tu, 0);
+                groupby_values_iter_full_lookbehind(period, offset, time, closed_window, tu, tz, 0);
             Box::new(iter)
         }
         // partial lookbehind
         else {
             let iter =
-                groupby_values_iter_partial_lookbehind(period, offset, time, closed_window, tu);
+                groupby_values_iter_partial_lookbehind(period, offset, time, closed_window, tu, tz);
             Box::new(iter)
         }
     } else {
-        let iter =
-            groupby_values_iter_full_lookahead(period, offset, time, closed_window, tu, 0, None);
+        let iter = groupby_values_iter_full_lookahead(
+            period,
+            offset,
+            time,
+            closed_window,
+            tu,
+            tz,
+            0,
+            None,
+        );
         Box::new(iter)
     }
 }
@@ -321,67 +489,96 @@ pub(crate) fn groupby_values_iter<'a>(
 ///     - timestamp (lower bound)
 ///     - timestamp + period (upper bound)
 /// where timestamps are the individual values in the array `time`
-pub fn groupby_values(
+pub fn groupby_values<'a>(
     period: Duration,
     offset: Duration,
-    time: &[i64],
+    time: &'a [i64],
     closed_window: ClosedWindow,
     tu: TimeUnit,
+    tz: Option<impl PolarsTimeZone + 'a>,
 ) -> GroupsSlice {
     partially_check_sorted(time);
-    let thread_offsets = split_offsets(time.len(), POOL.current_num_threads());
+    let thread_offsets = _split_offsets(time.len(), POOL.current_num_threads());
 
     // we have a (partial) lookbehind window
     if offset.negative {
-        // only lookbehind
-        if offset.nanoseconds() >= period.nanoseconds() {
-            let vals = thread_offsets
-                .par_iter()
-                .copied()
-                .map(|(base_offset, len)| {
-                    let upper_bound = base_offset + len;
-                    let iter = groupby_values_iter_full_lookbehind(
-                        period,
-                        offset,
-                        &time[..upper_bound],
-                        closed_window,
-                        tu,
-                        base_offset,
-                    );
-                    iter.map(|(offset, len)| [offset as IdxSize, len])
-                        .collect_trusted::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            flatten(&vals, Some(time.len()))
-        }
-        // partial lookbehind
-        // this one is still single threaded
-        // can make it parallel later, its a bit more complicated because the boundaries are unknown
-        else {
-            let iter =
-                groupby_values_iter_partial_lookbehind(period, offset, time, closed_window, tu);
-            iter.map(|(offset, len)| [offset, len]).collect_trusted()
-        }
-    } else {
-        let vals = thread_offsets
-            .par_iter()
-            .copied()
-            .map(|(base_offset, len)| {
-                let lower_bound = base_offset;
-                let upper_bound = base_offset + len;
-                let iter = groupby_values_iter_full_lookahead(
+        if offset.duration_ns() >= period.duration_ns() {
+            // lookbehind
+            // window is within 2 periods length of t
+            // ------t---
+            // [------]
+            if offset.duration_ns() < period.duration_ns() * 2 {
+                let vals = POOL.install(|| {
+                    thread_offsets
+                        .par_iter()
+                        .copied()
+                        .map(|(base_offset, len)| {
+                            let upper_bound = base_offset + len;
+                            let iter = groupby_values_iter_full_lookbehind(
+                                period,
+                                offset,
+                                &time[..upper_bound],
+                                closed_window,
+                                tu,
+                                tz.clone(),
+                                base_offset,
+                            );
+                            iter.map(|(offset, len)| [offset as IdxSize, len])
+                                .collect_trusted::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                });
+                flatten(&vals, Some(time.len()))
+            }
+            // window is completely behind t and t itself is not a member
+            // ---------------t---
+            //  [---]
+            else {
+                let iter = groupby_values_iter_window_behind_t(
                     period,
                     offset,
                     time,
                     closed_window,
                     tu,
-                    lower_bound,
-                    Some(upper_bound),
+                    tz,
                 );
-                iter.map(|(offset, len)| [offset as IdxSize, len])
-                    .collect_trusted::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+                iter.map(|(offset, len)| [offset, len]).collect_trusted()
+            }
+        }
+        // partial lookbehind
+        // this one is still single threaded
+        // can make it parallel later, its a bit more complicated because the boundaries are unknown
+        // window is with -1 periods of t
+        // ----t---
+        //  [---]
+        else {
+            let iter =
+                groupby_values_iter_partial_lookbehind(period, offset, time, closed_window, tu, tz);
+            iter.map(|(offset, len)| [offset, len]).collect_trusted()
+        }
+    } else {
+        let vals = POOL.install(|| {
+            thread_offsets
+                .par_iter()
+                .copied()
+                .map(|(base_offset, len)| {
+                    let lower_bound = base_offset;
+                    let upper_bound = base_offset + len;
+                    let iter = groupby_values_iter_full_lookahead(
+                        period,
+                        offset,
+                        time,
+                        closed_window,
+                        tu,
+                        tz.clone(),
+                        lower_bound,
+                        Some(upper_bound),
+                    );
+                    iter.map(|(offset, len)| [offset as IdxSize, len])
+                        .collect_trusted::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
         flatten(&vals, Some(time.len()))
     }
 }

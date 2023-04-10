@@ -19,8 +19,9 @@ where
     /// See also [`extend`](Self::extend) for appends to the underlying memory
     pub fn append(&mut self, other: &Self) {
         let len = self.len();
+        self.length += other.length;
         new_chunks(&mut self.chunks, &other.chunks, len);
-        self.set_sorted2(IsSorted::Not);
+        self.set_sorted_flag(IsSorted::Not);
     }
 }
 
@@ -28,24 +29,45 @@ where
 impl BooleanChunked {
     pub fn append(&mut self, other: &Self) {
         let len = self.len();
+        self.length += other.length;
         new_chunks(&mut self.chunks, &other.chunks, len);
-        self.set_sorted2(IsSorted::Not);
+        self.set_sorted_flag(IsSorted::Not);
     }
 }
 #[doc(hidden)]
 impl Utf8Chunked {
     pub fn append(&mut self, other: &Self) {
         let len = self.len();
+        self.length += other.length;
         new_chunks(&mut self.chunks, &other.chunks, len);
-        self.set_sorted2(IsSorted::Not);
+        self.set_sorted_flag(IsSorted::Not);
+    }
+}
+
+#[doc(hidden)]
+impl BinaryChunked {
+    pub fn append(&mut self, other: &Self) {
+        let len = self.len();
+        self.length += other.length;
+        new_chunks(&mut self.chunks, &other.chunks, len);
+        self.set_sorted_flag(IsSorted::Not);
     }
 }
 
 #[doc(hidden)]
 impl ListChunked {
-    pub fn append(&mut self, other: &Self) {
+    pub fn append(&mut self, other: &Self) -> PolarsResult<()> {
+        let dtype = merge_dtypes(self.dtype(), other.dtype())?;
+        self.field = Arc::new(Field::new(self.name(), dtype));
+
         let len = self.len();
+        self.length += other.length;
         new_chunks(&mut self.chunks, &other.chunks, len);
+        self.set_sorted_flag(IsSorted::Not);
+        if !other._can_fast_explode() {
+            self.unset_fast_explode()
+        }
+        Ok(())
     }
 }
 #[cfg(feature = "object")]
@@ -53,6 +75,8 @@ impl ListChunked {
 impl<T: PolarsObject> ObjectChunked<T> {
     pub fn append(&mut self, other: &Self) {
         let len = self.len();
+        self.length += other.length;
+        self.set_sorted_flag(IsSorted::Not);
         new_chunks(&mut self.chunks, &other.chunks, len);
     }
 }

@@ -1,5 +1,66 @@
-use crate::prelude::*;
 use arrow::buffer::Buffer;
+
+use crate::prelude::*;
+
+#[cfg(feature = "performant")]
+impl Int16Chunked {
+    pub(crate) fn reinterpret_unsigned(&self) -> UInt16Chunked {
+        let chunks = self
+            .downcast_iter()
+            .map(|array| {
+                let buf = array.values().clone();
+                // Safety
+                // same bit length i16 <-> u16
+                // The fields can still be reordered between generic types
+                // so we do some extra assertions
+                let len = buf.len();
+                let offset = buf.offset();
+                let ptr = buf.as_slice().as_ptr() as usize;
+                #[allow(clippy::transmute_undefined_repr)]
+                let reinterpreted_buf = unsafe { std::mem::transmute::<_, Buffer<u16>>(buf) };
+                debug_assert_eq!(reinterpreted_buf.len(), len);
+                debug_assert_eq!(reinterpreted_buf.offset(), offset);
+                debug_assert_eq!(reinterpreted_buf.as_slice().as_ptr() as usize, ptr);
+                Box::new(PrimitiveArray::new(
+                    ArrowDataType::UInt16,
+                    reinterpreted_buf,
+                    array.validity().cloned(),
+                )) as ArrayRef
+            })
+            .collect::<Vec<_>>();
+        unsafe { UInt16Chunked::from_chunks(self.name(), chunks) }
+    }
+}
+
+#[cfg(feature = "performant")]
+impl Int8Chunked {
+    pub(crate) fn reinterpret_unsigned(&self) -> UInt8Chunked {
+        let chunks = self
+            .downcast_iter()
+            .map(|array| {
+                let buf = array.values().clone();
+                // Safety
+                // same bit length i8 <-> u8
+                // The fields can still be reordered between generic types
+                // so we do some extra assertions
+                let len = buf.len();
+                let offset = buf.offset();
+                let ptr = buf.as_slice().as_ptr() as usize;
+                #[allow(clippy::transmute_undefined_repr)]
+                let reinterpreted_buf = unsafe { std::mem::transmute::<_, Buffer<u8>>(buf) };
+                debug_assert_eq!(reinterpreted_buf.len(), len);
+                debug_assert_eq!(reinterpreted_buf.offset(), offset);
+                debug_assert_eq!(reinterpreted_buf.as_slice().as_ptr() as usize, ptr);
+                Box::new(PrimitiveArray::new(
+                    ArrowDataType::UInt8,
+                    reinterpreted_buf,
+                    array.validity().cloned(),
+                )) as ArrayRef
+            })
+            .collect::<Vec<_>>();
+        unsafe { UInt8Chunked::from_chunks(self.name(), chunks) }
+    }
+}
 
 impl<T> ToBitRepr for ChunkedArray<T>
 where
@@ -11,6 +72,11 @@ where
 
     fn bit_repr_large(&self) -> UInt64Chunked {
         if std::mem::size_of::<T::Native>() == 8 {
+            if matches!(self.dtype(), DataType::UInt64) {
+                let ca = self.clone();
+                // convince the compiler we are this type. This keeps flags
+                return unsafe { std::mem::transmute(ca) };
+            }
             let chunks = self
                 .downcast_iter()
                 .map(|array| {
@@ -27,14 +93,14 @@ where
                     assert_eq!(reinterpreted_buf.len(), len);
                     assert_eq!(reinterpreted_buf.offset(), offset);
                     assert_eq!(reinterpreted_buf.as_slice().as_ptr() as usize, ptr);
-                    Box::new(PrimitiveArray::from_data(
+                    Box::new(PrimitiveArray::new(
                         ArrowDataType::UInt64,
                         reinterpreted_buf,
                         array.validity().cloned(),
                     )) as ArrayRef
                 })
                 .collect::<Vec<_>>();
-            UInt64Chunked::from_chunks(self.name(), chunks)
+            unsafe { UInt64Chunked::from_chunks(self.name(), chunks) }
         } else {
             unreachable!()
         }
@@ -42,6 +108,11 @@ where
 
     fn bit_repr_small(&self) -> UInt32Chunked {
         if std::mem::size_of::<T::Native>() == 4 {
+            if matches!(self.dtype(), DataType::UInt32) {
+                let ca = self.clone();
+                // convince the compiler we are this type. This keeps flags
+                return unsafe { std::mem::transmute(ca) };
+            }
             let chunks = self
                 .downcast_iter()
                 .map(|array| {
@@ -58,20 +129,22 @@ where
                     assert_eq!(reinterpreted_buf.len(), len);
                     assert_eq!(reinterpreted_buf.offset(), offset);
                     assert_eq!(reinterpreted_buf.as_slice().as_ptr() as usize, ptr);
-                    Box::new(PrimitiveArray::from_data(
+                    Box::new(PrimitiveArray::new(
                         ArrowDataType::UInt32,
                         reinterpreted_buf,
                         array.validity().cloned(),
                     )) as ArrayRef
                 })
                 .collect::<Vec<_>>();
-            UInt32Chunked::from_chunks(self.name(), chunks)
+            unsafe { UInt32Chunked::from_chunks(self.name(), chunks) }
         } else {
-            self.cast_unchecked(&DataType::UInt32)
-                .unwrap()
-                .u32()
-                .unwrap()
-                .clone()
+            unsafe {
+                self.cast_unchecked(&DataType::UInt32)
+                    .unwrap()
+                    .u32()
+                    .unwrap()
+                    .clone()
+            }
         }
     }
 }
@@ -102,7 +175,7 @@ impl Reinterpret for UInt64Chunked {
                 )) as ArrayRef
             })
             .collect::<Vec<_>>();
-        Int64Chunked::from_chunks(self.name(), chunks).into_series()
+        unsafe { Int64Chunked::from_chunks(self.name(), chunks).into_series() }
     }
 
     fn reinterpret_unsigned(&self) -> Series {
@@ -120,8 +193,54 @@ impl Reinterpret for Int64Chunked {
     }
 }
 
+#[cfg(feature = "reinterpret")]
+impl Reinterpret for UInt32Chunked {
+    fn reinterpret_signed(&self) -> Series {
+        let chunks = self
+            .downcast_iter()
+            .map(|array| {
+                let buf = array.values().clone();
+                // Safety
+                // same bit length u32 <-> i32
+                // The fields can still be reordered between generic types
+                // so we do some extra assertions
+                let len = buf.len();
+                let offset = buf.offset();
+                let ptr = buf.as_slice().as_ptr() as usize;
+                #[allow(clippy::transmute_undefined_repr)]
+                let reinterpreted_buf = unsafe { std::mem::transmute::<_, Buffer<i32>>(buf) };
+                assert_eq!(reinterpreted_buf.len(), len);
+                assert_eq!(reinterpreted_buf.offset(), offset);
+                assert_eq!(reinterpreted_buf.as_slice().as_ptr() as usize, ptr);
+                Box::new(PrimitiveArray::new(
+                    ArrowDataType::Int32,
+                    reinterpreted_buf,
+                    array.validity().cloned(),
+                )) as ArrayRef
+            })
+            .collect::<Vec<_>>();
+        unsafe { Int32Chunked::from_chunks(self.name(), chunks).into_series() }
+    }
+
+    fn reinterpret_unsigned(&self) -> Series {
+        self.clone().into_series()
+    }
+}
+
+#[cfg(feature = "reinterpret")]
+impl Reinterpret for Int32Chunked {
+    fn reinterpret_signed(&self) -> Series {
+        self.clone().into_series()
+    }
+
+    fn reinterpret_unsigned(&self) -> Series {
+        self.bit_repr_large().into_series()
+    }
+}
+
 impl UInt64Chunked {
-    pub(crate) fn reinterpret_float(&self) -> Series {
+    #[doc(hidden)]
+    pub fn _reinterpret_float(&self) -> Float64Chunked {
         let chunks = self
             .downcast_iter()
             .map(|array| {
@@ -138,18 +257,19 @@ impl UInt64Chunked {
                 assert_eq!(reinterpreted_buf.len(), len);
                 assert_eq!(reinterpreted_buf.offset(), offset);
                 assert_eq!(reinterpreted_buf.as_slice().as_ptr() as usize, ptr);
-                Box::new(PrimitiveArray::from_data(
+                Box::new(PrimitiveArray::new(
                     ArrowDataType::Float64,
                     reinterpreted_buf,
                     array.validity().cloned(),
                 )) as ArrayRef
             })
             .collect::<Vec<_>>();
-        Float64Chunked::from_chunks(self.name(), chunks).into()
+        unsafe { Float64Chunked::from_chunks(self.name(), chunks) }
     }
 }
 impl UInt32Chunked {
-    pub(crate) fn reinterpret_float(&self) -> Series {
+    #[doc(hidden)]
+    pub fn _reinterpret_float(&self) -> Float32Chunked {
         let chunks = self
             .downcast_iter()
             .map(|array| {
@@ -166,14 +286,14 @@ impl UInt32Chunked {
                 assert_eq!(reinterpreted_buf.len(), len);
                 assert_eq!(reinterpreted_buf.offset(), offset);
                 assert_eq!(reinterpreted_buf.as_slice().as_ptr() as usize, ptr);
-                Box::new(PrimitiveArray::from_data(
+                Box::new(PrimitiveArray::new(
                     ArrowDataType::Float32,
                     reinterpreted_buf,
                     array.validity().cloned(),
                 )) as ArrayRef
             })
             .collect::<Vec<_>>();
-        Float32Chunked::from_chunks(self.name(), chunks).into()
+        unsafe { Float32Chunked::from_chunks(self.name(), chunks) }
     }
 }
 
@@ -187,7 +307,7 @@ impl Float32Chunked {
         let s = self.bit_repr_small().into_series();
         let out = f(&s);
         let out = out.u32().unwrap();
-        out.reinterpret_float()
+        out._reinterpret_float().into()
     }
 }
 impl Float64Chunked {
@@ -198,6 +318,6 @@ impl Float64Chunked {
         let s = self.bit_repr_large().into_series();
         let out = f(&s);
         let out = out.u64().unwrap();
-        out.reinterpret_float()
+        out._reinterpret_float().into()
     }
 }

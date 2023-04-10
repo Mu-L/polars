@@ -4,21 +4,22 @@ mod quantile;
 mod sum;
 mod variance;
 
-use super::*;
-use crate::utils::CustomIterTools;
+use std::fmt::Debug;
+
 use arrow::array::PrimitiveArray;
 use arrow::datatypes::DataType;
 use arrow::types::NativeType;
-use num::{Float, NumCast};
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
-
 pub use mean::*;
 pub use min_max::*;
+use num_traits::{Float, NumCast};
 pub use quantile::*;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 pub use sum::*;
 pub use variance::*;
+
+use super::*;
+use crate::utils::CustomIterTools;
 
 pub trait RollingAggWindowNoNulls<'a, T: NativeType> {
     fn new(slice: &'a [T], start: usize, end: usize) -> Self;
@@ -54,28 +55,23 @@ where
         })
         .collect_trusted::<Vec<_>>();
 
-    let validity = create_validity(min_periods, len as usize, window_size, det_offsets_fn);
-    Box::new(PrimitiveArray::from_data(
+    let validity = create_validity(min_periods, len, window_size, det_offsets_fn);
+    Box::new(PrimitiveArray::new(
         T::PRIMITIVE.into(),
         out.into(),
         validity.map(|b| b.into()),
     ))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum QuantileInterpolOptions {
+    #[default]
     Nearest,
     Lower,
     Higher,
     Midpoint,
     Linear,
-}
-
-impl Default for QuantileInterpolOptions {
-    fn default() -> Self {
-        QuantileInterpolOptions::Nearest
-    }
 }
 
 pub(super) fn rolling_apply_weights<T, Fo, Fa>(
@@ -102,8 +98,8 @@ where
         })
         .collect_trusted::<Vec<T>>();
 
-    let validity = create_validity(min_periods, len as usize, window_size, det_offsets_fn);
-    Box::new(PrimitiveArray::from_data(
+    let validity = create_validity(min_periods, len, window_size, det_offsets_fn);
+    Box::new(PrimitiveArray::new(
         DataType::from(T::PRIMITIVE),
         out.into(),
         validity.map(|b| b.into()),

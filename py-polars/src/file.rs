@@ -1,14 +1,13 @@
-// Credits to https://github.com/omerbenamram/pyo3-file
-use crate::prelude::resolve_homedir;
-use polars::io::mmap::MmapBytesReader;
-use pyo3::exceptions::PyFileNotFoundError;
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
-use std::borrow::Borrow;
 use std::fs::File;
 use std::io;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
+
+use polars::io::mmap::MmapBytesReader;
+use pyo3::exceptions::{PyFileNotFoundError, PyTypeError};
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyString};
+
+use crate::prelude::resolve_homedir;
 
 #[derive(Clone)]
 pub struct PyFileLikeObject {
@@ -30,19 +29,18 @@ impl PyFileLikeObject {
     }
 
     pub fn as_file_buffer(&self) -> Cursor<Vec<u8>> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        let buf = Python::with_gil(|py| {
+            let bytes = self
+                .inner
+                .call_method(py, "read", (), None)
+                .expect("no read method found");
 
-        let bytes = self
-            .inner
-            .call_method(py, "read", (), None)
-            .expect("no read method found");
+            let bytes: &PyBytes = bytes
+                .downcast(py)
+                .expect("Expecting to be able to downcast into bytes from read result.");
 
-        let bytes: &PyBytes = bytes
-            .cast_as(py)
-            .expect("Expecting to be able to downcast into bytes from read result.");
-
-        let buf = bytes.as_bytes().to_vec();
+            bytes.as_bytes().to_vec()
+        });
 
         Cursor::new(buf)
     }
@@ -53,21 +51,20 @@ impl PyFileLikeObject {
     /// It also returns the bytes PyObject. As long as that object is held, the lifetime is valid
     /// as the destructor is not called.
     pub unsafe fn as_file_buffer_ref(&self) -> (Cursor<&'static [u8]>, PyObject) {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        Python::with_gil(|py| {
+            let bytes = self
+                .inner
+                .call_method(py, "read", (), None)
+                .expect("no read method found");
 
-        let bytes = self
-            .inner
-            .call_method(py, "read", (), None)
-            .expect("no read method found");
+            let ref_bytes: &PyBytes = bytes
+                .downcast(py)
+                .expect("Expecting to be able to downcast into bytes from read result.");
+            let buf = ref_bytes.as_bytes();
 
-        let ref_bytes: &PyBytes = bytes
-            .cast_as(py)
-            .expect("Expecting to be able to downcast into bytes from read result.");
-        let buf = ref_bytes.as_bytes();
-
-        let static_buf = std::mem::transmute::<&[u8], &'static [u8]>(buf);
-        (Cursor::new(static_buf), bytes)
+            let static_buf = std::mem::transmute::<&[u8], &'static [u8]>(buf);
+            (Cursor::new(static_buf), bytes)
+        })
     }
 
     /// Same as `PyFileLikeObject::new`, but validates that the underlying
@@ -79,110 +76,105 @@ impl PyFileLikeObject {
         write: bool,
         seek: bool,
     ) -> PyResult<Self> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        Python::with_gil(|py| {
+            if read && object.getattr(py, "read").is_err() {
+                return Err(PyErr::new::<PyTypeError, _>(
+                    "Object does not have a .read() method.",
+                ));
+            }
 
-        if read && object.getattr(py, "read").is_err() {
-            return Err(PyErr::new::<PyTypeError, _>(
-                "Object does not have a .read() method.",
-            ));
-        }
+            if seek && object.getattr(py, "seek").is_err() {
+                return Err(PyErr::new::<PyTypeError, _>(
+                    "Object does not have a .seek() method.",
+                ));
+            }
 
-        if seek && object.getattr(py, "seek").is_err() {
-            return Err(PyErr::new::<PyTypeError, _>(
-                "Object does not have a .seek() method.",
-            ));
-        }
+            if write && object.getattr(py, "write").is_err() {
+                return Err(PyErr::new::<PyTypeError, _>(
+                    "Object does not have a .write() method.",
+                ));
+            }
 
-        if write && object.getattr(py, "write").is_err() {
-            return Err(PyErr::new::<PyTypeError, _>(
-                "Object does not have a .write() method.",
-            ));
-        }
-
-        Ok(PyFileLikeObject::new(object))
+            Ok(PyFileLikeObject::new(object))
+        })
     }
 }
 
 /// Extracts a string repr from, and returns an IO error to send back to rust.
 fn pyerr_to_io_err(e: PyErr) -> io::Error {
-    let gil = Python::acquire_gil();
-    let py = gil.python();
-    let e_as_object: PyObject = e.into_py(py);
+    Python::with_gil(|py| {
+        let e_as_object: PyObject = e.into_py(py);
 
-    match e_as_object.call_method(py, "__str__", (), None) {
-        Ok(repr) => match repr.extract::<String>(py) {
-            Ok(s) => io::Error::new(io::ErrorKind::Other, s),
-            Err(_e) => io::Error::new(io::ErrorKind::Other, "An unknown error has occurred"),
-        },
-        Err(_) => io::Error::new(io::ErrorKind::Other, "Err doesn't have __str__"),
-    }
+        match e_as_object.call_method(py, "__str__", (), None) {
+            Ok(repr) => match repr.extract::<String>(py) {
+                Ok(s) => io::Error::new(io::ErrorKind::Other, s),
+                Err(_e) => io::Error::new(io::ErrorKind::Other, "An unknown error has occurred"),
+            },
+            Err(_) => io::Error::new(io::ErrorKind::Other, "Err doesn't have __str__"),
+        }
+    })
 }
 
 impl Read for PyFileLikeObject {
     fn read(&mut self, mut buf: &mut [u8]) -> Result<usize, io::Error> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        Python::with_gil(|py| {
+            let bytes = self
+                .inner
+                .call_method(py, "read", (buf.len(),), None)
+                .map_err(pyerr_to_io_err)?;
 
-        let bytes = self
-            .inner
-            .call_method(py, "read", (buf.len(),), None)
-            .map_err(pyerr_to_io_err)?;
+            let bytes: &PyBytes = bytes
+                .downcast(py)
+                .expect("Expecting to be able to downcast into bytes from read result.");
 
-        let bytes: &PyBytes = bytes
-            .cast_as(py)
-            .expect("Expecting to be able to downcast into bytes from read result.");
+            buf.write_all(bytes.as_bytes())?;
 
-        buf.write_all(bytes.as_bytes())?;
-
-        bytes.len().map_err(pyerr_to_io_err)
+            bytes.len().map_err(pyerr_to_io_err)
+        })
     }
 }
 
 impl Write for PyFileLikeObject {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        Python::with_gil(|py| {
+            let pybytes = PyBytes::new(py, buf);
 
-        let pybytes = PyBytes::new(py, buf);
+            let number_bytes_written = self
+                .inner
+                .call_method(py, "write", (pybytes,), None)
+                .map_err(pyerr_to_io_err)?;
 
-        let number_bytes_written = self
-            .inner
-            .call_method(py, "write", (pybytes,), None)
-            .map_err(pyerr_to_io_err)?;
-
-        number_bytes_written.extract(py).map_err(pyerr_to_io_err)
+            number_bytes_written.extract(py).map_err(pyerr_to_io_err)
+        })
     }
 
     fn flush(&mut self) -> Result<(), io::Error> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        Python::with_gil(|py| {
+            self.inner
+                .call_method(py, "flush", (), None)
+                .map_err(pyerr_to_io_err)?;
 
-        self.inner
-            .call_method(py, "flush", (), None)
-            .map_err(pyerr_to_io_err)?;
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 
 impl Seek for PyFileLikeObject {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
+        Python::with_gil(|py| {
+            let (whence, offset) = match pos {
+                SeekFrom::Start(i) => (0, i as i64),
+                SeekFrom::Current(i) => (1, i),
+                SeekFrom::End(i) => (2, i),
+            };
 
-        let (whence, offset) = match pos {
-            SeekFrom::Start(i) => (0, i as i64),
-            SeekFrom::Current(i) => (1, i as i64),
-            SeekFrom::End(i) => (2, i as i64),
-        };
+            let new_position = self
+                .inner
+                .call_method(py, "seek", (offset, whence), None)
+                .map_err(pyerr_to_io_err)?;
 
-        let new_position = self
-            .inner
-            .call_method(py, "seek", (offset, whence), None)
-            .map_err(pyerr_to_io_err)?;
-
-        new_position.extract(py).map_err(pyerr_to_io_err)
+            new_position.extract(py).map_err(pyerr_to_io_err)
+        })
     }
 }
 
@@ -197,34 +189,43 @@ pub enum EitherRustPythonFile {
     Rust(BufReader<File>),
 }
 
+fn no_such_file_err(file_path: &str) -> PyResult<()> {
+    let msg = if file_path.len() > 88 {
+        let file_path: String = file_path.chars().skip(file_path.len() - 88).collect();
+        format!("No such file or directory: ...{file_path}",)
+    } else {
+        format!("No such file or directory: {file_path}",)
+    };
+
+    Err(PyErr::new::<PyFileNotFoundError, _>(msg))
+}
+
 ///
 /// # Arguments
 /// * `truncate` - open or create a new file.
 pub fn get_either_file(py_f: PyObject, truncate: bool) -> PyResult<EitherRustPythonFile> {
-    let gil = Python::acquire_gil();
-    let py = gil.python();
-
-    if let Ok(pstring) = py_f.cast_as::<PyString>(py) {
-        let rstring = pstring.to_string();
-        let str_slice: &str = rstring.borrow();
-        let f = if truncate {
-            BufReader::new(File::create(str_slice)?)
-        } else {
-            match File::open(str_slice) {
-                Ok(file) => BufReader::new(file),
-                Err(_e) => {
-                    return Err(PyErr::new::<PyFileNotFoundError, _>(format!(
-                        "No such file or directory: {}",
-                        str_slice
-                    )))
+    Python::with_gil(|py| {
+        if let Ok(pstring) = py_f.downcast::<PyString>(py) {
+            let s = pstring.to_str()?;
+            let file_path = std::path::Path::new(&s);
+            let file_path = resolve_homedir(file_path);
+            let f = if truncate {
+                BufReader::new(File::create(file_path)?)
+            } else {
+                match File::open(&file_path) {
+                    Ok(file) => BufReader::new(file),
+                    Err(_e) => {
+                        no_such_file_err(s)?;
+                        unreachable!();
+                    }
                 }
-            }
-        };
-        Ok(EitherRustPythonFile::Rust(f))
-    } else {
-        let f = PyFileLikeObject::with_requirements(py_f, true, true, true)?;
-        Ok(EitherRustPythonFile::Py(f))
-    }
+            };
+            Ok(EitherRustPythonFile::Rust(f))
+        } else {
+            let f = PyFileLikeObject::with_requirements(py_f, true, true, true)?;
+            Ok(EitherRustPythonFile::Py(f))
+        }
+    })
 }
 
 pub fn get_file_like(f: PyObject, truncate: bool) -> PyResult<Box<dyn FileLike>> {
@@ -236,51 +237,50 @@ pub fn get_file_like(f: PyObject, truncate: bool) -> PyResult<Box<dyn FileLike>>
 }
 
 pub fn get_mmap_bytes_reader<'a>(py_f: &'a PyAny) -> PyResult<Box<dyn MmapBytesReader + 'a>> {
-    let gil = Python::acquire_gil();
-    let py = gil.python();
-
     // bytes object
     if let Ok(bytes) = py_f.downcast::<PyBytes>() {
         Ok(Box::new(Cursor::new(bytes.as_bytes())))
     }
     // string so read file
     else if let Ok(pstring) = py_f.downcast::<PyString>() {
-        let s = pstring.to_string();
+        let s = pstring.to_str()?;
         let p = std::path::Path::new(&s);
         let p = resolve_homedir(p);
-        let f = match File::open(&p) {
+        let f = match File::open(p) {
             Ok(file) => file,
             Err(_e) => {
-                return Err(PyErr::new::<PyFileNotFoundError, _>(format!(
-                    "No such file or directory: {}",
-                    s
-                )))
+                no_such_file_err(s)?;
+                unreachable!();
             }
         };
         Ok(Box::new(f))
     }
     // a normal python file: with open(...) as f:.
     else if py_f.getattr("read").is_ok() {
-        // we van still get a file name so open the file instead of go through read
-        if let Ok(filename) = py_f.getattr("name") {
-            let filename = filename.downcast::<PyString>()?;
-            let f = File::open(filename.to_str()?)?;
-            Ok(Box::new(f))
+        // we can still get a file name, inform the user of possibly wrong API usage.
+        if py_f.getattr("name").is_ok() {
+            eprintln!("Polars found a filename. \
+            Ensure you pass a path to the file instead of a python file object when possible for best \
+            performance.")
         }
         // a bytesIO
-        else if let Ok(bytes) = py_f.call_method0("getvalue") {
+        if let Ok(bytes) = py_f.call_method0("getvalue") {
             let bytes = bytes.downcast::<PyBytes>()?;
             Ok(Box::new(Cursor::new(bytes.as_bytes())))
         }
         // don't really know what we got here, just read.
         else {
-            let f = PyFileLikeObject::with_requirements(py_f.to_object(py), true, false, true)?;
+            let f = Python::with_gil(|py| {
+                PyFileLikeObject::with_requirements(py_f.to_object(py), true, false, true)
+            })?;
             Ok(Box::new(f))
         }
     }
     // don't really know what we got here, just read.
     else {
-        let f = PyFileLikeObject::with_requirements(py_f.to_object(py), true, false, true)?;
+        let f = Python::with_gil(|py| {
+            PyFileLikeObject::with_requirements(py_f.to_object(py), true, false, true)
+        })?;
         Ok(Box::new(f))
     }
 }

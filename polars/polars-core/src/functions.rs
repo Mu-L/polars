@@ -2,19 +2,21 @@
 //!
 //! Functions that might be useful.
 //!
-#[cfg(feature = "sort_multiple")]
-use crate::chunked_array::ops::sort::prepare_argsort;
-use crate::prelude::*;
-#[cfg(feature = "diagonal_concat")]
-use crate::utils::concat_df;
+use std::ops::Add;
+
 #[cfg(feature = "diagonal_concat")]
 use ahash::AHashSet;
 use arrow::compute;
 use arrow::types::simd::Simd;
-use num::{Float, NumCast, ToPrimitive};
+use num_traits::{Float, NumCast, ToPrimitive};
 #[cfg(feature = "concat_str")]
 use polars_arrow::prelude::ValueSize;
-use std::ops::Add;
+
+use crate::chunked_array::ops::sort::prepare_arg_sort;
+use crate::prelude::*;
+use crate::utils::coalesce_nulls;
+#[cfg(feature = "diagonal_concat")]
+use crate::utils::concat_df;
 
 /// Compute the covariance between two columns.
 pub fn cov_f<T>(a: &ChunkedArray<T>, b: &ChunkedArray<T>) -> Option<T::Native>
@@ -58,7 +60,7 @@ where
 }
 
 /// Compute the pearson correlation between two columns.
-pub fn pearson_corr_i<T>(a: &ChunkedArray<T>, b: &ChunkedArray<T>) -> Option<f64>
+pub fn pearson_corr_i<T>(a: &ChunkedArray<T>, b: &ChunkedArray<T>, ddof: u8) -> Option<f64>
 where
     T: PolarsIntegerType,
     T::Native: ToPrimitive,
@@ -67,11 +69,15 @@ where
         + compute::aggregate::SimdOrd<T::Native>,
     ChunkedArray<T>: ChunkVar<f64>,
 {
-    Some(cov_i(a, b)? / (a.std()? * b.std()?))
+    let (a, b) = coalesce_nulls(a, b);
+    let a = a.as_ref();
+    let b = b.as_ref();
+
+    Some(cov_i(a, b)? / (a.std(ddof)? * b.std(ddof)?))
 }
 
 /// Compute the pearson correlation between two columns.
-pub fn pearson_corr_f<T>(a: &ChunkedArray<T>, b: &ChunkedArray<T>) -> Option<T::Native>
+pub fn pearson_corr_f<T>(a: &ChunkedArray<T>, b: &ChunkedArray<T>, ddof: u8) -> Option<T::Native>
 where
     T: PolarsFloatType,
     T::Native: Float,
@@ -80,30 +86,28 @@ where
         + compute::aggregate::SimdOrd<T::Native>,
     ChunkedArray<T>: ChunkVar<T::Native>,
 {
-    Some(cov_f(a, b)? / (a.std()? * b.std()?))
+    let (a, b) = coalesce_nulls(a, b);
+    let a = a.as_ref();
+    let b = b.as_ref();
+
+    Some(cov_f(a, b)? / (a.std(ddof)? * b.std(ddof)?))
 }
 
-#[cfg(feature = "sort_multiple")]
 /// Find the indexes that would sort these series in order of appearance.
 /// That means that the first `Series` will be used to determine the ordering
 /// until duplicates are found. Once duplicates are found, the next `Series` will
 /// be used and so on.
-pub fn argsort_by(by: &[Series], reverse: &[bool]) -> Result<IdxCa> {
-    if by.len() != reverse.len() {
-        return Err(PolarsError::ComputeError(
-            format!(
-                "The amount of ordering booleans: {} does not match amount of Series: {}",
-                reverse.len(),
-                by.len()
-            )
-            .into(),
-        ));
-    }
-    let (first, by, reverse) = prepare_argsort(by.to_vec(), reverse.to_vec()).unwrap();
-    first.argsort_multiple(&by, &reverse)
+pub fn arg_sort_by(by: &[Series], descending: &[bool]) -> PolarsResult<IdxCa> {
+    polars_ensure!(
+        by.len() == descending.len(),
+        ComputeError: "the number of ordering booleans: {} does not match the number of series: {}",
+        descending.len(), by.len()
+    );
+    let (first, by, descending) = prepare_arg_sort(by.to_vec(), descending.to_vec()).unwrap();
+    first.arg_sort_multiple(&by, &descending)
 }
 
-// utility to be able to also add literals ot concat_str function
+// utility to be able to also add literals to concat_str function
 #[cfg(feature = "concat_str")]
 enum IterBroadCast<'a> {
     Column(Box<dyn PolarsIterator<Item = Option<&'a str>> + 'a>),
@@ -125,14 +129,9 @@ impl<'a> IterBroadCast<'a> {
 /// The concatenated strings are separated by a `delimiter`.
 /// If no `delimiter` is needed, an empty &str should be passed as argument.
 #[cfg(feature = "concat_str")]
-#[cfg_attr(docsrs, doc(cfg(feature = "concat_str")))]
-pub fn concat_str(s: &[Series], delimiter: &str) -> Result<Utf8Chunked> {
-    if s.is_empty() {
-        return Err(PolarsError::NoData(
-            "expected multiple series in concat_str function".into(),
-        ));
-    }
-    if s[0].is_empty() {
+pub fn concat_str(s: &[Series], delimiter: &str) -> PolarsResult<Utf8Chunked> {
+    polars_ensure!(!s.is_empty(), NoData: "expected multiple series in `concat_str`");
+    if s.iter().any(|s| s.is_empty()) {
         return Ok(Utf8Chunked::full_null(s[0].name(), 0));
     }
 
@@ -145,18 +144,17 @@ pub fn concat_str(s: &[Series], delimiter: &str) -> Result<Utf8Chunked> {
             let mut ca = s.utf8()?.clone();
             // broadcast
             if ca.len() == 1 && len > 1 {
-                ca = ca.expand_at_index(0, len)
+                ca = ca.new_from_index(0, len)
             }
 
             Ok(ca)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<PolarsResult<Vec<_>>>()?;
 
-    if !s.iter().all(|s| s.len() == 1 || s.len() == len) {
-        return Err(PolarsError::ComputeError(
-            "all series in concat_str function should have equal length or unit length".into(),
-        ));
-    }
+    polars_ensure!(
+        s.iter().all(|s| s.len() == 1 || s.len() == len),
+        ComputeError: "all series in `concat_str` should have equal or unit length"
+    );
     let mut iters = cas
         .iter()
         .map(|ca| match ca.len() {
@@ -201,14 +199,13 @@ pub fn concat_str(s: &[Series], delimiter: &str) -> Result<Utf8Chunked> {
 
 /// Concat `[DataFrame]`s horizontally.
 #[cfg(feature = "horizontal_concat")]
-#[cfg_attr(docsrs, doc(cfg(feature = "horizontal_concat")))]
 /// Concat horizontally and extend with null values if lengths don't match
-pub fn hor_concat_df(dfs: &[DataFrame]) -> Result<DataFrame> {
+pub fn hor_concat_df(dfs: &[DataFrame]) -> PolarsResult<DataFrame> {
     let max_len = dfs
         .iter()
         .map(|df| df.height())
         .max()
-        .ok_or_else(|| PolarsError::ComputeError("cannot concat empty dataframes".into()))?;
+        .ok_or_else(|| polars_err!(ComputeError: "cannot concat empty dataframes"))?;
 
     let owned_df;
 
@@ -242,9 +239,9 @@ pub fn hor_concat_df(dfs: &[DataFrame]) -> Result<DataFrame> {
 
 /// Concat `[DataFrame]`s diagonally.
 #[cfg(feature = "diagonal_concat")]
-#[cfg_attr(docsrs, doc(cfg(feature = "diagonal_concat")))]
 /// Concat diagonally thereby combining different schemas.
-pub fn diag_concat_df(dfs: &[DataFrame]) -> Result<DataFrame> {
+pub fn diag_concat_df(dfs: &[DataFrame]) -> PolarsResult<DataFrame> {
+    // TODO! replace with lazy only?
     let upper_bound_width = dfs.iter().map(|df| df.width()).sum();
     let mut column_names = AHashSet::with_capacity(upper_bound_width);
     let mut schema = Vec::with_capacity(upper_bound_width);
@@ -298,7 +295,9 @@ mod test {
         let a = Series::new("a", &[1.0f32, 2.0]);
         let b = Series::new("b", &[1.0f32, 2.0]);
         assert!((cov_f(a.f32().unwrap(), b.f32().unwrap()).unwrap() - 0.5).abs() < 0.001);
-        assert!((pearson_corr_f(a.f32().unwrap(), b.f32().unwrap()).unwrap() - 1.0).abs() < 0.001);
+        assert!(
+            (pearson_corr_f(a.f32().unwrap(), b.f32().unwrap(), 1).unwrap() - 1.0).abs() < 0.001
+        );
     }
 
     #[test]
@@ -320,7 +319,7 @@ mod test {
 
     #[test]
     #[cfg(feature = "diagonal_concat")]
-    fn test_diag_concat() -> Result<()> {
+    fn test_diag_concat() -> PolarsResult<()> {
         let a = df![
             "a" => [1, 2],
             "b" => ["a", "b"]

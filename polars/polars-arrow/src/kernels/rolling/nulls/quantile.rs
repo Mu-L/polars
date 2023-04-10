@@ -16,8 +16,8 @@ where
     T: std::iter::Sum<T>
         + NativeType
         + Copy
-        + std::cmp::PartialOrd
-        + num::ToPrimitive
+        + PartialOrd
+        + ToPrimitive
         + NumCast
         + Add<Output = T>
         + Sub<Output = T>
@@ -29,11 +29,7 @@ where
 {
     if values.is_empty() {
         let out: Vec<T> = vec![];
-        return Box::new(PrimitiveArray::from_data(
-            T::PRIMITIVE.into(),
-            out.into(),
-            None,
-        ));
+        return Box::new(PrimitiveArray::new(T::PRIMITIVE.into(), out.into(), None));
     }
 
     let len = values.len();
@@ -70,7 +66,7 @@ where
         })
         .collect_trusted::<Vec<T>>();
 
-    Box::new(PrimitiveArray::from_data(
+    Box::new(PrimitiveArray::new(
         T::PRIMITIVE.into(),
         out.into(),
         Some(validity.into()),
@@ -104,8 +100,7 @@ where
     // we are in bounds
     let mut sorted_window = unsafe { SortedBufNulls::new(values, bitmap, start, end) };
 
-    let mut validity = match create_validity(min_periods, len as usize, window_size, det_offsets_fn)
-    {
+    let mut validity = match create_validity(min_periods, len, window_size, det_offsets_fn) {
         Some(v) => v,
         None => {
             let mut validity = MutableBitmap::with_capacity(len);
@@ -134,7 +129,7 @@ where
         })
         .collect_trusted::<Vec<T>>();
 
-    Box::new(PrimitiveArray::from_data(
+    Box::new(PrimitiveArray::new(
         T::PRIMITIVE.into(),
         out.into(),
         Some(validity.into()),
@@ -153,8 +148,8 @@ where
         + std::iter::Sum<T>
         + Zero
         + AddAssign
-        + std::cmp::PartialOrd
-        + num::ToPrimitive
+        + PartialOrd
+        + ToPrimitive
         + NumCast
         + Default
         + Add<Output = T>
@@ -218,8 +213,8 @@ where
         + Zero
         + AddAssign
         + Copy
-        + std::cmp::PartialOrd
-        + num::ToPrimitive
+        + PartialOrd
+        + ToPrimitive
         + NumCast
         + Default
         + Add<Output = T>
@@ -254,8 +249,8 @@ where
         + Zero
         + AddAssign
         + Copy
-        + std::cmp::PartialOrd
-        + num::ToPrimitive
+        + PartialOrd
+        + ToPrimitive
         + NumCast
         + Default
         + Add<Output = T>
@@ -294,15 +289,16 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::kernels::rolling::nulls::{rolling_max, rolling_min};
     use arrow::buffer::Buffer;
     use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::kernels::rolling::nulls::{rolling_max, rolling_min};
 
     #[test]
     fn test_rolling_median_nulls() {
         let buf = Buffer::from(vec![1.0, 2.0, 3.0, 4.0]);
-        let arr = &PrimitiveArray::from_data(
+        let arr = &PrimitiveArray::new(
             DataType::Float64,
             buf,
             Some(Bitmap::from(&[true, false, true, true])),
@@ -338,7 +334,7 @@ mod test {
     fn test_rolling_quantile_nulls_limits() {
         // compare quantiles to corresponding min/max/median values
         let buf = Buffer::<f64>::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        let values = &PrimitiveArray::from_data(
+        let values = &PrimitiveArray::new(
             DataType::Float64,
             buf,
             Some(Bitmap::from(&[true, false, false, true, true])),

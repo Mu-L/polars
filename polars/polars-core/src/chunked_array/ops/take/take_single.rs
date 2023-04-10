@@ -1,9 +1,11 @@
+use std::convert::TryFrom;
+
+use arrow::array::*;
+use polars_arrow::is_valid::IsValid;
+
 #[cfg(feature = "object")]
 use crate::chunked_array::object::ObjectArray;
 use crate::prelude::*;
-use arrow::array::*;
-use polars_arrow::is_valid::IsValid;
-use std::convert::TryFrom;
 
 macro_rules! impl_take_random_get {
     ($self:ident, $index:ident, $array_type:ty) => {{
@@ -30,6 +32,7 @@ macro_rules! impl_take_random_get {
 macro_rules! impl_take_random_get_unchecked {
     ($self:ident, $index:ident, $array_type:ty) => {{
         let (chunk_idx, idx) = $self.index_to_chunked_index($index);
+        debug_assert!(chunk_idx < $self.chunks.len());
         // Safety:
         // bounds are checked above
         let arr = $self.chunks.get_unchecked(chunk_idx);
@@ -40,6 +43,7 @@ macro_rules! impl_take_random_get_unchecked {
 
         // Safety:
         // index should be in bounds
+        debug_assert!(idx < arr.len());
         if arr.is_valid_unchecked(idx) {
             Some(arr.value_unchecked(idx))
         } else {
@@ -101,6 +105,17 @@ impl<'a> TakeRandom for &'a Utf8Chunked {
         // Safety:
         // Out of bounds is checked and downcast is of correct type
         unsafe { impl_take_random_get!(self, index, LargeStringArray) }
+    }
+}
+
+impl<'a> TakeRandom for &'a BinaryChunked {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<Self::Item> {
+        // Safety:
+        // Out of bounds is checked and downcast is of correct type
+        unsafe { impl_take_random_get!(self, index, LargeBinaryArray) }
     }
 }
 

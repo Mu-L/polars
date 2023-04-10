@@ -1,8 +1,4 @@
-use crate::physical_plan::executors::execute_projection_cached_window_fns;
-use crate::physical_plan::state::ExecutionState;
-use crate::prelude::*;
-use polars_core::{prelude::*, POOL};
-use rayon::prelude::*;
+use super::*;
 
 pub struct StackExec {
     pub(crate) input: Box<dyn Executor>,
@@ -11,11 +7,12 @@ pub struct StackExec {
     pub(crate) input_schema: SchemaRef,
 }
 
-impl Executor for StackExec {
-    fn execute(&mut self, state: &ExecutionState) -> Result<DataFrame> {
-        let mut df = self.input.execute(state)?;
-
-        state.set_schema(self.input_schema.clone());
+impl StackExec {
+    fn execute_impl(
+        &mut self,
+        state: &mut ExecutionState,
+        mut df: DataFrame,
+    ) -> PolarsResult<DataFrame> {
         let res = if self.has_windows {
             // we have a different run here
             // to ensure the window functions run sequential and share caches
@@ -25,17 +22,45 @@ impl Executor for StackExec {
                 self.expr
                     .par_iter()
                     .map(|expr| expr.evaluate(&df, state))
-                    .collect::<Result<Vec<_>>>()
+                    .collect::<PolarsResult<Vec<_>>>()
             })?
         };
-        state.clear_schema_cache();
         state.clear_expr_cache();
 
         let schema = &*self.input_schema;
-        for s in res {
-            df.with_column_and_schema(s, schema)?;
-        }
+        df._add_columns(res, schema)?;
 
         Ok(df)
+    }
+}
+
+impl Executor for StackExec {
+    fn execute(&mut self, state: &mut ExecutionState) -> PolarsResult<DataFrame> {
+        #[cfg(debug_assertions)]
+        {
+            if state.verbose() {
+                println!("run StackExec")
+            }
+        }
+        let df = self.input.execute(state)?;
+
+        let profile_name = if state.has_node_timer() {
+            let by = self
+                .expr
+                .iter()
+                .map(|s| Ok(s.to_field(&self.input_schema)?.name))
+                .collect::<PolarsResult<Vec<_>>>()?;
+            let name = comma_delimited("with_column".to_string(), &by);
+            Cow::Owned(name)
+        } else {
+            Cow::Borrowed("")
+        };
+
+        if state.has_node_timer() {
+            let new_state = state.clone();
+            new_state.record(|| self.execute_impl(state, df), profile_name)
+        } else {
+            self.execute_impl(state, df)
+        }
     }
 }

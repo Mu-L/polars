@@ -16,11 +16,18 @@ impl LogicalType for DurationChunked {
         self.2.as_ref().unwrap()
     }
 
-    fn get_any_value(&self, i: usize) -> AnyValue<'_> {
-        self.0.get_any_value(i).into_duration(self.time_unit())
+    fn get_any_value(&self, i: usize) -> PolarsResult<AnyValue<'_>> {
+        self.0
+            .get_any_value(i)
+            .map(|av| av.into_duration(self.time_unit()))
+    }
+    unsafe fn get_any_value_unchecked(&self, i: usize) -> AnyValue<'_> {
+        self.0
+            .get_any_value_unchecked(i)
+            .into_duration(self.time_unit())
     }
 
-    fn cast(&self, dtype: &DataType) -> Result<Series> {
+    fn cast(&self, dtype: &DataType) -> PolarsResult<Series> {
         use DataType::*;
         match (self.dtype(), dtype) {
             (Duration(TimeUnit::Milliseconds), Duration(TimeUnit::Nanoseconds)) => {
@@ -31,6 +38,16 @@ impl LogicalType for DurationChunked {
             (Duration(TimeUnit::Milliseconds), Duration(TimeUnit::Microseconds)) => {
                 Ok((self.0.as_ref() * 1_000i64)
                     .into_duration(TimeUnit::Microseconds)
+                    .into_series())
+            }
+            (Duration(TimeUnit::Microseconds), Duration(TimeUnit::Milliseconds)) => {
+                Ok((self.0.as_ref() / 1_000i64)
+                    .into_duration(TimeUnit::Milliseconds)
+                    .into_series())
+            }
+            (Duration(TimeUnit::Microseconds), Duration(TimeUnit::Nanoseconds)) => {
+                Ok((self.0.as_ref() * 1_000i64)
+                    .into_duration(TimeUnit::Nanoseconds)
                     .into_series())
             }
             (Duration(TimeUnit::Nanoseconds), Duration(TimeUnit::Milliseconds)) => {

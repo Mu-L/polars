@@ -57,27 +57,87 @@ impl FromIterator<String> for Series {
     }
 }
 
+pub type SeriesPhysIter<'a> = Box<dyn ExactSizeIterator<Item = AnyValue<'a>> + 'a>;
+
 #[cfg(any(feature = "rows", feature = "dtype-struct"))]
 impl Series {
+    /// iterate over [`Series`] as [`AnyValue`].
+    ///
+    /// # Panics
+    /// This will panic if the array is not rechunked first.
     pub fn iter(&self) -> SeriesIter<'_> {
         let dtype = self.dtype();
-        let arr = match dtype {
-            #[cfg(feature = "dtype-struct")]
-            DataType::Struct(_) => {
-                let ca = self.struct_().unwrap();
-                &**ca.arrow_array()
-            }
-            _ => {
-                assert_eq!(self.chunks().len(), 1, "impl error");
-                &*self.chunks()[0]
-            }
-        };
+        assert_eq!(self.chunks().len(), 1, "impl error");
+        let arr = &*self.chunks()[0];
         let len = arr.len();
         SeriesIter {
             arr,
             dtype,
             idx: 0,
             len,
+        }
+    }
+
+    pub fn phys_iter(&self) -> SeriesPhysIter<'_> {
+        let dtype = self.dtype();
+        let phys_dtype = dtype.to_physical();
+
+        assert_eq!(dtype, &phys_dtype, "impl error");
+        assert_eq!(self.chunks().len(), 1, "impl error");
+        let arr = &*self.chunks()[0];
+
+        if phys_dtype.is_numeric() {
+            if arr.null_count() == 0 {
+                with_match_physical_numeric_type!(phys_dtype, |$T| {
+                        let arr = arr.as_any().downcast_ref::<PrimitiveArray<$T>>().unwrap();
+                        let values = arr.values().as_slice();
+                        Box::new(values.iter().map(|&value| AnyValue::from(value))) as Box<dyn ExactSizeIterator<Item=AnyValue<'_>> + '_>
+                })
+            } else {
+                with_match_physical_numeric_type!(phys_dtype, |$T| {
+                        let arr = arr.as_any().downcast_ref::<PrimitiveArray<$T>>().unwrap();
+                        Box::new(arr.iter().map(|value| {
+
+                        match value {
+                            Some(value) => AnyValue::from(*value),
+                            None => AnyValue::Null
+                        }
+
+                    })) as Box<dyn ExactSizeIterator<Item=AnyValue<'_>> + '_>
+                })
+            }
+        } else {
+            match dtype {
+                DataType::Utf8 => {
+                    let arr = arr.as_any().downcast_ref::<Utf8Array<i64>>().unwrap();
+                    if arr.null_count() == 0 {
+                        Box::new(arr.values_iter().map(AnyValue::Utf8))
+                            as Box<dyn ExactSizeIterator<Item = AnyValue<'_>> + '_>
+                    } else {
+                        let zipvalid = arr.iter();
+                        Box::new(zipvalid.unwrap_optional().map(|v| match v {
+                            Some(value) => AnyValue::Utf8(value),
+                            None => AnyValue::Null,
+                        }))
+                            as Box<dyn ExactSizeIterator<Item = AnyValue<'_>> + '_>
+                    }
+                }
+                DataType::Boolean => {
+                    let arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    if arr.null_count() == 0 {
+                        Box::new(arr.values_iter().map(AnyValue::Boolean))
+                            as Box<dyn ExactSizeIterator<Item = AnyValue<'_>> + '_>
+                    } else {
+                        let zipvalid = arr.iter();
+                        Box::new(zipvalid.unwrap_optional().map(|v| match v {
+                            Some(value) => AnyValue::Boolean(value),
+                            None => AnyValue::Null,
+                        }))
+                            as Box<dyn ExactSizeIterator<Item = AnyValue<'_>> + '_>
+                    }
+                }
+                _ => Box::new(self.iter()),
+            }
         }
     }
 }
@@ -92,6 +152,7 @@ pub struct SeriesIter<'a> {
 impl<'a> Iterator for SeriesIter<'a> {
     type Item = AnyValue<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let idx = self.idx;
 

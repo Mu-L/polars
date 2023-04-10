@@ -1,15 +1,17 @@
-use crate::index::IdxSize;
-use arrow::types::NativeType;
 use std::fmt::Debug;
 
+use arrow::types::NativeType;
+
+use crate::index::IdxSize;
+
 /// Find partition indexes such that every partition contains unique groups.
-fn find_partition_points<T>(values: &[T], n: usize, reverse: bool) -> Vec<usize>
+fn find_partition_points<T>(values: &[T], n: usize, descending: bool) -> Vec<usize>
 where
     T: Debug + NativeType + PartialOrd,
 {
     let len = values.len();
     if n > len {
-        return find_partition_points(values, len / 2, reverse);
+        return find_partition_points(values, len / 2, descending);
     }
     if n < 2 {
         return vec![];
@@ -29,7 +31,7 @@ where
         let part = &values[start_idx..end_idx];
 
         let latest_val = values[end_idx];
-        let idx = if reverse {
+        let idx = if descending {
             part.partition_point(|v| *v > latest_val)
         } else {
             part.partition_point(|v| *v < latest_val)
@@ -44,11 +46,11 @@ where
     partition_points
 }
 
-pub fn create_clean_partitions<T>(values: &[T], n: usize, reverse: bool) -> Vec<&[T]>
+pub fn create_clean_partitions<T>(values: &[T], n: usize, descending: bool) -> Vec<&[T]>
 where
     T: Debug + NativeType + PartialOrd,
 {
-    let part_idx = find_partition_points(values, n, reverse);
+    let part_idx = find_partition_points(values, n, descending);
     let mut out = Vec::with_capacity(n + 1);
 
     let mut start_idx = 0_usize;
@@ -64,6 +66,53 @@ where
     }
 
     out
+}
+
+pub fn partition_to_groups_amortized<T>(
+    values: &[T],
+    first_group_offset: IdxSize,
+    nulls_first: bool,
+    offset: IdxSize,
+    out: &mut Vec<[IdxSize; 2]>,
+) where
+    T: Debug + NativeType + PartialOrd,
+{
+    if let Some(mut first) = values.get(0) {
+        out.clear();
+        if nulls_first && first_group_offset > 0 {
+            out.push([0, first_group_offset])
+        }
+
+        let mut first_idx = if nulls_first { first_group_offset } else { 0 } + offset;
+
+        for val in values {
+            // new group reached
+            if val != first {
+                let val_ptr = val as *const T;
+                let first_ptr = first as *const T;
+
+                // Safety
+                // all pointers suffice the invariants
+                let len = unsafe { val_ptr.offset_from(first_ptr) } as IdxSize;
+                out.push([first_idx, len]);
+                first_idx += len;
+                first = val;
+            }
+        }
+        // add last group
+        if nulls_first {
+            out.push([
+                first_idx,
+                values.len() as IdxSize + first_group_offset - first_idx,
+            ]);
+        } else {
+            out.push([first_idx, values.len() as IdxSize - (first_idx - offset)]);
+        }
+
+        if !nulls_first && first_group_offset > 0 {
+            out.push([values.len() as IdxSize + offset, first_group_offset])
+        }
+    }
 }
 
 /// Take a clean-partitioned slice and return the groups slices
@@ -82,43 +131,8 @@ where
     if values.is_empty() {
         return vec![];
     }
-    let mut first = values.get(0).unwrap();
     let mut out = Vec::with_capacity(values.len() / 10);
-
-    if nulls_first && first_group_offset > 0 {
-        out.push([0, first_group_offset])
-    }
-
-    let mut first_idx = if nulls_first { first_group_offset } else { 0 } + offset;
-
-    for val in values {
-        // new group reached
-        if val != first {
-            let val_ptr = val as *const T;
-            let first_ptr = first as *const T;
-
-            // Safety
-            // all pointers suffice the invariants
-            let len = unsafe { val_ptr.offset_from(first_ptr) } as IdxSize;
-            out.push([first_idx, len]);
-            first_idx += len;
-            first = val;
-        }
-    }
-    // add last group
-    if nulls_first {
-        out.push([
-            first_idx,
-            values.len() as IdxSize + first_group_offset - first_idx,
-        ]);
-    } else {
-        out.push([first_idx, values.len() as IdxSize - (first_idx - offset)]);
-    }
-
-    if !nulls_first && first_group_offset > 0 {
-        out.push([values.len() as IdxSize + offset, first_group_offset])
-    }
-
+    partition_to_groups_amortized(values, first_group_offset, nulls_first, offset, &mut out);
     out
 }
 

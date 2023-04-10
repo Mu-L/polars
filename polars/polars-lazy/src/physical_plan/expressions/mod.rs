@@ -7,11 +7,7 @@ mod column;
 mod count;
 mod filter;
 mod group_iter;
-mod is_not_null;
-mod is_null;
 mod literal;
-mod not;
-mod shift;
 mod slice;
 mod sort;
 mod sortby;
@@ -19,21 +15,31 @@ mod take;
 mod ternary;
 mod window;
 
-pub(crate) use {
-    aggregation::*, alias::*, apply::*, binary::*, cast::*, column::*, count::*, filter::*,
-    is_not_null::*, is_null::*, literal::*, not::*, shift::*, slice::*, sort::*, sortby::*,
-    take::*, ternary::*, window::*,
-};
+use std::borrow::Cow;
+use std::fmt::{Display, Formatter};
 
-use crate::physical_plan::state::ExecutionState;
-use crate::prelude::*;
-use polars_arrow::export::arrow::array::ListArray;
-use polars_arrow::trusted_len::PushUnchecked;
+pub(crate) use aggregation::*;
+pub(crate) use alias::*;
+pub(crate) use apply::*;
+pub(crate) use binary::*;
+pub(crate) use cast::*;
+pub(crate) use column::*;
+pub(crate) use count::*;
+pub(crate) use filter::*;
+pub(crate) use literal::*;
 use polars_arrow::utils::CustomIterTools;
 use polars_core::frame::groupby::GroupsProxy;
 use polars_core::prelude::*;
 use polars_io::predicates::PhysicalIoExpr;
-use std::borrow::Cow;
+pub(crate) use slice::*;
+pub(crate) use sort::*;
+pub(crate) use sortby::*;
+pub(crate) use take::*;
+pub(crate) use ternary::*;
+pub(crate) use window::*;
+
+use crate::physical_plan::state::ExecutionState;
+use crate::prelude::*;
 
 #[derive(Clone, Debug)]
 pub(crate) enum AggState {
@@ -79,8 +85,6 @@ pub(crate) enum UpdateGroups {
     /// this one should be used when the length has changed. Note that
     /// the series should be aggregated state or else it will panic.
     WithSeriesLen,
-    // Same as WithSeriesLen, but now take a series given by the caller
-    WithSeriesLenOwned(Series),
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -102,6 +106,11 @@ pub struct AggregationContext<'a> {
     /// This is true when the Series and GroupsProxy still have all
     /// their original values. Not the case when filtered
     original_len: bool,
+    // special state that just should propagate nulls on aggregations.
+    // this is needed as (expr - expr.mean()) could leave nulls but is
+    // not really a final aggregation as left is still a list, but right only
+    // contains null and thus propagates that.
+    null_propagated: bool,
 }
 
 impl<'a> AggregationContext<'a> {
@@ -141,35 +150,8 @@ impl<'a> AggregationContext<'a> {
                 let s = self.series().clone();
                 self.det_groups_from_list(&s);
             }
-            UpdateGroups::WithSeriesLenOwned(ref s) => {
-                let s = s.clone();
-                self.det_groups_from_list(&s);
-            }
         }
         &self.groups
-    }
-
-    /// Check if this contexts group tuples can be combined with that of other.
-    pub(crate) fn can_combine(&self, other: &AggregationContext) -> bool {
-        match (
-            &self.groups,
-            self.sorted,
-            self.is_original_len(),
-            &other.groups,
-            other.sorted,
-            other.original_len,
-        ) {
-            (Cow::Borrowed(_), _, _, Cow::Borrowed(_), _, _) => true,
-            (Cow::Owned(_), _, _, Cow::Borrowed(_), _, _) => true,
-            (Cow::Borrowed(_), _, _, Cow::Owned(_), _, _) => true,
-            (Cow::Owned(_), true, true, Cow::Owned(_), true, true) => true,
-            (Cow::Owned(_), true, false, Cow::Owned(_), true, true) => false,
-            (Cow::Owned(_), true, true, Cow::Owned(_), true, false) => false,
-            (Cow::Owned(_), true, _, Cow::Owned(_), true, _) => {
-                self.groups.len() == other.groups.len()
-            }
-            _ => false,
-        }
     }
 
     pub(crate) fn series(&self) -> &Series {
@@ -195,15 +177,9 @@ impl<'a> AggregationContext<'a> {
     pub(crate) fn is_aggregated(&self) -> bool {
         !self.is_not_aggregated()
     }
+
     pub(crate) fn is_literal(&self) -> bool {
         matches!(self.state, AggState::Literal(_))
-    }
-
-    pub(crate) fn combine_groups(&mut self, other: AggregationContext) -> &mut Self {
-        if let (Cow::Borrowed(_), Cow::Owned(a)) = (&self.groups, other.groups) {
-            self.groups = Cow::Owned(a);
-        };
-        self
     }
 
     /// # Arguments
@@ -232,6 +208,7 @@ impl<'a> AggregationContext<'a> {
             sorted: false,
             update_groups: UpdateGroups::No,
             original_len: true,
+            null_propagated: false,
         }
     }
 
@@ -242,11 +219,8 @@ impl<'a> AggregationContext<'a> {
             sorted: false,
             update_groups: UpdateGroups::No,
             original_len: true,
+            null_propagated: false,
         }
-    }
-
-    pub(crate) fn is_original_len(&self) -> bool {
-        self.original_len
     }
 
     pub(crate) fn set_original_len(&mut self, original_len: bool) -> &mut Self {
@@ -344,10 +318,27 @@ impl<'a> AggregationContext<'a> {
     /// # Arguments
     /// - `aggregated` sets if the Series is a list due to aggregation (could also be a list because its
     /// the columns dtype)
-    pub(crate) fn with_series(&mut self, series: Series, aggregated: bool) -> &mut Self {
+    pub(crate) fn with_series(
+        &mut self,
+        series: Series,
+        aggregated: bool,
+        expr: Option<&Expr>,
+    ) -> PolarsResult<&mut Self> {
         self.state = match (aggregated, series.dtype()) {
             (true, &DataType::List(_)) => {
-                assert_eq!(series.len(), self.groups.len());
+                if series.len() != self.groups.len() {
+                    let fmt_expr = if let Some(e) = expr {
+                        format!("'{e}' ")
+                    } else {
+                        String::new()
+                    };
+                    polars_bail!(
+                        ComputeError:
+                        "aggregation expression '{}' produced a different number of elements: {} \
+                        than the number of groups: {} (this is likely invalid)",
+                        fmt_expr, series.len(), self.groups.len(),
+                    );
+                }
                 AggState::AggregatedList(series)
             }
             (true, _) => AggState::AggregatedFlat(series),
@@ -361,7 +352,7 @@ impl<'a> AggregationContext<'a> {
                 }
             }
         };
-        self
+        Ok(self)
     }
 
     pub(crate) fn with_literal(&mut self, series: Series) -> &mut Self {
@@ -372,7 +363,8 @@ impl<'a> AggregationContext<'a> {
     /// Update the group tuples
     pub(crate) fn with_groups(&mut self, groups: GroupsProxy) -> &mut Self {
         // In case of new groups, a series always needs to be flattened
-        self.with_series(self.flat_naive().into_owned(), false);
+        self.with_series(self.flat_naive().into_owned(), false, None)
+            .unwrap();
         self.groups = Cow::Owned(groups);
         // make sure that previous setting is not used
         self.update_groups = UpdateGroups::No;
@@ -402,17 +394,15 @@ impl<'a> AggregationContext<'a> {
                 let out = unsafe { s.agg_list(&self.groups) };
                 self.state = AggState::AggregatedList(out.clone());
 
-                if !self.sorted {
-                    self.sorted = true;
-                    self.update_groups = UpdateGroups::WithGroupsLen;
-                };
+                self.sorted = true;
+                self.update_groups = UpdateGroups::WithGroupsLen;
                 out
             }
             AggState::AggregatedList(s) | AggState::AggregatedFlat(s) => s,
             AggState::Literal(s) => {
                 self.groups();
                 let rows = self.groups.len();
-                let s = s.expand_at_index(0, rows);
+                let s = s.new_from_index(0, rows);
                 s.reshape(&[rows as i64, -1]).unwrap()
             }
         }
@@ -427,53 +417,9 @@ impl<'a> AggregationContext<'a> {
                 let s = s.clone();
                 self.groups();
                 let rows = self.groups.len();
-                s.expand_at_index(0, rows)
+                s.new_from_index(0, rows)
             }
             _ => self.aggregated(),
-        }
-    }
-
-    /// Different from aggregated, in arity operations we expect literals to expand to the size of the
-    /// group
-    /// eg:
-    ///
-    /// lit(9) in groups [[1, 1], [2, 2, 2]]
-    /// becomes: [[9, 9], [9, 9, 9]]
-    ///
-    /// where in [`Self::aggregated`] this becomes [9, 9]
-    ///
-    /// this is because comparisons need to create mask that have a correct length.
-    fn aggregated_arity_operation(&mut self) -> Series {
-        if let AggState::Literal(s) = self.agg_state() {
-            // stop borrow;
-            let s = s.clone();
-            let groups = self.groups();
-
-            let mut offsets = Vec::with_capacity(groups.len() + 1);
-
-            let mut last_offset = 0i64;
-            offsets.push(last_offset);
-            for g in groups.iter() {
-                last_offset += g.len() as i64;
-                // safety:
-                // we allocated enough
-                unsafe { offsets.push_unchecked(last_offset) };
-            }
-            let values = s.expand_at_index(0, last_offset as usize);
-            let values = values.array_ref(0).clone();
-            // Safety:
-            // offsets are monotonically increasing
-            let arr = unsafe {
-                ListArray::<i64>::new_unchecked(
-                    DataType::List(Box::new(s.dtype().clone())).to_arrow(),
-                    offsets.into(),
-                    values,
-                    None,
-                )
-            };
-            Series::try_from((s.name(), Box::new(arr) as ArrayRef)).unwrap()
-        } else {
-            self.aggregated()
         }
     }
 
@@ -495,7 +441,18 @@ impl<'a> AggregationContext<'a> {
     pub(crate) fn flat_naive(&self) -> Cow<'_, Series> {
         match &self.state {
             AggState::NotAggregated(s) => Cow::Borrowed(s),
-            AggState::AggregatedList(s) => Cow::Owned(s.explode().unwrap()),
+            AggState::AggregatedList(s) => {
+                #[cfg(debug_assertions)]
+                {
+                    // panic so we find cases where we accidentally explode overlapping groups
+                    // we don't want this as this can create a lot of data
+                    if let GroupsProxy::Slice { rolling: true, .. } = self.groups.as_ref() {
+                        panic!("implementation error, polars should not hit this branch for overlapping groups")
+                    }
+                }
+
+                Cow::Owned(s.explode().unwrap())
+            }
             AggState::AggregatedFlat(s) => Cow::Borrowed(s),
             AggState::Literal(s) => Cow::Borrowed(s),
         }
@@ -516,10 +473,12 @@ impl<'a> AggregationContext<'a> {
 /// Take a DataFrame and evaluate the expressions.
 /// Implement this for Column, lt, eq, etc
 pub trait PhysicalExpr: Send + Sync {
-    fn as_expression(&self) -> &Expr;
+    fn as_expression(&self) -> Option<&Expr> {
+        None
+    }
 
     /// Take a DataFrame and evaluate the expression.
-    fn evaluate(&self, df: &DataFrame, _state: &ExecutionState) -> Result<Series>;
+    fn evaluate(&self, df: &DataFrame, _state: &ExecutionState) -> PolarsResult<Series>;
 
     /// Some expression that are not aggregations can be done per group
     /// Think of sort, slice, filter, shift, etc.
@@ -549,10 +508,10 @@ pub trait PhysicalExpr: Send + Sync {
         df: &DataFrame,
         groups: &'a GroupsProxy,
         state: &ExecutionState,
-    ) -> Result<AggregationContext<'a>>;
+    ) -> PolarsResult<AggregationContext<'a>>;
 
     /// Get the output field of this expr
-    fn to_field(&self, input_schema: &Schema) -> Result<Field>;
+    fn to_field(&self, input_schema: &Schema) -> PolarsResult<Field>;
 
     /// Convert to a partitioned aggregator.
     fn as_partitioned_aggregator(&self) -> Option<&dyn PartitionedAggregation> {
@@ -566,6 +525,22 @@ pub trait PhysicalExpr: Send + Sync {
     fn as_stats_evaluator(&self) -> Option<&dyn polars_io::predicates::StatsEvaluator> {
         None
     }
+
+    //
+    fn is_valid_aggregation(&self) -> bool;
+
+    fn is_literal(&self) -> bool {
+        false
+    }
+}
+
+impl Display for &dyn PhysicalExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.as_expression() {
+            None => Ok(()),
+            Some(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// Wrapper struct that allow us to use a PhysicalExpr in polars-io.
@@ -576,7 +551,7 @@ pub struct PhysicalIoHelper {
 }
 
 impl PhysicalIoExpr for PhysicalIoHelper {
-    fn evaluate(&self, df: &DataFrame) -> Result<Series> {
+    fn evaluate(&self, df: &DataFrame) -> PolarsResult<Series> {
         self.expr.evaluate(df, &Default::default())
     }
 
@@ -600,7 +575,7 @@ pub trait PartitionedAggregation: Send + Sync + PhysicalExpr {
         df: &DataFrame,
         groups: &GroupsProxy,
         state: &ExecutionState,
-    ) -> Result<Series>;
+    ) -> PolarsResult<Series>;
 
     /// Called to merge all the partitioned results in a final aggregate.
     #[allow(clippy::ptr_arg)]
@@ -609,5 +584,5 @@ pub trait PartitionedAggregation: Send + Sync + PhysicalExpr {
         partitioned: Series,
         groups: &GroupsProxy,
         state: &ExecutionState,
-    ) -> Result<Series>;
+    ) -> PolarsResult<Series>;
 }

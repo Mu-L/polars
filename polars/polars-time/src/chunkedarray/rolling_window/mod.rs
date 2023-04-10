@@ -3,8 +3,10 @@ mod ints;
 #[cfg(feature = "rolling_window")]
 mod rolling_kernels;
 
-use crate::prelude::*;
-use crate::series::WrapFloat;
+#[cfg(feature = "rolling_window")]
+use std::convert::TryFrom;
+use std::ops::SubAssign;
+
 #[cfg(feature = "rolling_window")]
 use arrow::array::{Array, PrimitiveArray};
 use polars_arrow::data_types::IsFloat;
@@ -15,11 +17,13 @@ use polars_arrow::kernels::rolling;
 #[cfg(feature = "rolling_window")]
 use polars_arrow::prelude::QuantileInterpolOptions;
 use polars_core::prelude::*;
+
 #[cfg(feature = "rolling_window")]
-use std::convert::TryFrom;
-use std::ops::SubAssign;
+use crate::prelude::*;
+use crate::series::WrapFloat;
 
 #[derive(Clone)]
+#[cfg(feature = "rolling_window")]
 pub struct RollingOptions {
     /// The length of the window.
     pub window_size: Duration,
@@ -36,6 +40,7 @@ pub struct RollingOptions {
     pub closed_window: Option<ClosedWindow>,
 }
 
+#[cfg(feature = "rolling_window")]
 impl Default for RollingOptions {
     fn default() -> Self {
         RollingOptions {
@@ -50,6 +55,7 @@ impl Default for RollingOptions {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "rolling_window")]
 pub struct RollingOptionsImpl<'a> {
     /// The length of the window.
     pub window_size: Duration,
@@ -62,9 +68,11 @@ pub struct RollingOptionsImpl<'a> {
     pub center: bool,
     pub by: Option<&'a [i64]>,
     pub tu: Option<TimeUnit>,
+    pub tz: Option<&'a TimeZone>,
     pub closed_window: Option<ClosedWindow>,
 }
 
+#[cfg(feature = "rolling_window")]
 impl From<RollingOptions> for RollingOptionsImpl<'static> {
     fn from(options: RollingOptions) -> Self {
         let window_size = options.window_size;
@@ -80,6 +88,7 @@ impl From<RollingOptions> for RollingOptionsImpl<'static> {
             center: options.center,
             by: None,
             tu: None,
+            tz: None,
             closed_window: None,
         }
     }
@@ -103,6 +112,7 @@ impl From<RollingOptions> for RollingOptionsFixedWindow {
     }
 }
 
+#[cfg(feature = "rolling_window")]
 impl Default for RollingOptionsImpl<'static> {
     fn default() -> Self {
         RollingOptionsImpl {
@@ -112,6 +122,7 @@ impl Default for RollingOptionsImpl<'static> {
             center: false,
             by: None,
             tu: None,
+            tz: None,
             closed_window: None,
         }
     }
@@ -144,30 +155,30 @@ pub trait RollingAgg {
     /// A window of length `window_size` will traverse the array. The values that fill this window
     /// will (optionally) be multiplied with the weights given by the `weights` vector. The resulting
     /// values will be aggregated to their mean.
-    fn rolling_mean(&self, options: RollingOptionsImpl) -> Result<Series>;
+    fn rolling_mean(&self, options: RollingOptionsImpl) -> PolarsResult<Series>;
 
     /// Apply a rolling sum (moving sum) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
     /// will (optionally) be multiplied with the weights given by the `weights` vector. The resulting
     /// values will be aggregated to their sum.
-    fn rolling_sum(&self, options: RollingOptionsImpl) -> Result<Series>;
+    fn rolling_sum(&self, options: RollingOptionsImpl) -> PolarsResult<Series>;
 
     /// Apply a rolling min (moving min) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
     /// will (optionally) be multiplied with the weights given by the `weights` vector. The resulting
     /// values will be aggregated to their min.
-    fn rolling_min(&self, options: RollingOptionsImpl) -> Result<Series>;
+    fn rolling_min(&self, options: RollingOptionsImpl) -> PolarsResult<Series>;
 
     /// Apply a rolling max (moving max) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
     /// will (optionally) be multiplied with the weights given by the `weights` vector. The resulting
     /// values will be aggregated to their max.
-    fn rolling_max(&self, options: RollingOptionsImpl) -> Result<Series>;
+    fn rolling_max(&self, options: RollingOptionsImpl) -> PolarsResult<Series>;
 
     /// Apply a rolling median (moving median) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
     /// will (optionally) be weighted according to the `weights` vector.
-    fn rolling_median(&self, options: RollingOptionsImpl) -> Result<Series>;
+    fn rolling_median(&self, options: RollingOptionsImpl) -> PolarsResult<Series>;
 
     /// Apply a rolling quantile (moving quantile) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
@@ -177,31 +188,30 @@ pub trait RollingAgg {
         quantile: f64,
         interpolation: QuantileInterpolOptions,
         options: RollingOptionsImpl,
-    ) -> Result<Series>;
+    ) -> PolarsResult<Series>;
 
     /// Apply a rolling var (moving var) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
     /// will (optionally) be multiplied with the weights given by the `weights` vector. The resulting
     /// values will be aggregated to their var.
-    fn rolling_var(&self, options: RollingOptionsImpl) -> Result<Series>;
+    #[cfg(feature = "rolling_window")]
+    fn rolling_var(&self, options: RollingOptionsImpl) -> PolarsResult<Series>;
 
     /// Apply a rolling std (moving std) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
     /// will (optionally) be multiplied with the weights given by the `weights` vector. The resulting
     /// values will be aggregated to their std.
-    fn rolling_std(&self, options: RollingOptionsImpl) -> Result<Series>;
+    fn rolling_std(&self, options: RollingOptionsImpl) -> PolarsResult<Series>;
 }
 
 /// utility
 #[cfg(feature = "rolling_window")]
-fn check_input(window_size: usize, min_periods: usize) -> Result<()> {
-    if min_periods > window_size {
-        Err(PolarsError::ComputeError(
-            "`windows_size` should be >= `min_periods`".into(),
-        ))
-    } else {
-        Ok(())
-    }
+fn check_input(window_size: usize, min_periods: usize) -> PolarsResult<()> {
+    polars_ensure!(
+        min_periods <= window_size,
+        ComputeError: "`min_periods` should be <= `window_size`",
+    );
+    Ok(())
 }
 
 #[cfg(feature = "rolling_window")]
@@ -218,9 +228,17 @@ fn rolling_agg<T>(
         Option<&[f64]>,
     ) -> ArrayRef,
     rolling_agg_fn_dynamic: Option<
-        &dyn Fn(&[T::Native], Duration, Duration, &[i64], ClosedWindow, TimeUnit) -> ArrayRef,
+        &dyn Fn(
+            &[T::Native],
+            Duration,
+            Duration,
+            &[i64],
+            ClosedWindow,
+            TimeUnit,
+            Option<&TimeZone>,
+        ) -> ArrayRef,
     >,
-) -> Result<Series>
+) -> PolarsResult<Series>
 where
     T: PolarsNumericType,
 {
@@ -234,10 +252,9 @@ where
     let arr = if options.window_size.parsed_int {
         let options: RollingOptionsFixedWindow = options.into();
         check_input(options.window_size, options.min_periods)?;
-        let ca = ca.rechunk();
 
-        match ca.has_validity() {
-            false => rolling_agg_fn(
+        match ca.null_count() {
+            0 => rolling_agg_fn(
                 arr.values().as_slice(),
                 options.window_size,
                 options.min_periods,
@@ -267,7 +284,7 @@ where
             "'rolling by' not yet supported for this expression, consider using 'groupby_rolling'",
         );
 
-        func(values, duration, offset, by, closed_window, tu)
+        func(values, duration, offset, by, closed_window, tu, options.tz)
     };
     Series::try_from((ca.name(), arr))
 }

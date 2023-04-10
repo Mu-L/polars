@@ -1,20 +1,22 @@
+use numpy::PyArray1;
+use polars_algo::{cut, hist, qcut};
+use polars_core::prelude::QuantileInterpolOptions;
+use polars_core::series::IsSorted;
+use polars_core::utils::{flatten_series, CustomIterTools};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyList};
+use pyo3::Python;
+
 use crate::apply::series::{call_lambda_and_extract, ApplyLambda};
 use crate::arrow_interop::to_rust::array_to_rust;
 use crate::dataframe::PyDataFrame;
 use crate::error::PyPolarsErr;
 use crate::list_construction::py_seq_to_list;
-use crate::utils::reinterpret;
-use crate::{
-    arrow_interop,
-    npy::{aligned_array, get_refcnt},
-    prelude::*,
-};
-use numpy::PyArray1;
-use polars_core::prelude::QuantileInterpolOptions;
-use polars_core::series::IsSorted;
-use polars_core::utils::CustomIterTools;
-use pyo3::types::{PyBytes, PyList, PyTuple};
-use pyo3::{exceptions::PyRuntimeError, prelude::*, Python};
+use crate::prelude::*;
+use crate::py_modules::POLARS;
+use crate::set::set_at_idx;
+use crate::{apply_method_all_arrow_series2, arrow_interop, raise_err};
 
 #[pyclass]
 #[repr(transparent)]
@@ -99,7 +101,7 @@ impl PySeries {
         })
     }
 
-    pub fn struct_to_frame(&self) -> PyResult<PyDataFrame> {
+    pub fn struct_unnest(&self) -> PyResult<PyDataFrame> {
         let ca = self.series.struct_().map_err(PyPolarsErr::from)?;
         let df: DataFrame = ca.clone().into();
         Ok(df.into())
@@ -113,12 +115,25 @@ impl PySeries {
 
 #[pymethods]
 impl PySeries {
+    pub fn is_sorted_ascending_flag(&self) -> bool {
+        matches!(self.series.is_sorted_flag(), IsSorted::Ascending)
+    }
+    pub fn is_sorted_descending_flag(&self) -> bool {
+        matches!(self.series.is_sorted_flag(), IsSorted::Descending)
+    }
+    pub fn can_fast_explode_flag(&self) -> bool {
+        match self.series.list() {
+            Err(_) => false,
+            Ok(list) => list._can_fast_explode(),
+        }
+    }
+
     #[staticmethod]
     pub fn new_opt_bool(name: &str, obj: &PyAny, strict: bool) -> PyResult<PySeries> {
-        let (seq, len) = get_pyseq(obj)?;
+        let len = obj.len()?;
         let mut builder = BooleanChunkedBuilder::new(name, len);
 
-        for res in seq.iter()? {
+        for res in obj.iter()? {
             let item = res?;
             if item.is_none() {
                 builder.append_null()
@@ -141,6 +156,38 @@ impl PySeries {
     }
 }
 
+fn new_primitive<'a, T>(name: &str, obj: &'a PyAny, strict: bool) -> PyResult<PySeries>
+where
+    T: PolarsNumericType,
+    ChunkedArray<T>: IntoSeries,
+    T::Native: FromPyObject<'a>,
+{
+    let len = obj.len()?;
+    let mut builder = PrimitiveChunkedBuilder::<T>::new(name, len);
+
+    for res in obj.iter()? {
+        let item = res?;
+
+        if item.is_none() {
+            builder.append_null()
+        } else {
+            match item.extract::<T::Native>() {
+                Ok(val) => builder.append_value(val),
+                Err(e) => {
+                    if strict {
+                        return Err(e);
+                    }
+                    builder.append_null()
+                }
+            }
+        }
+    }
+    let ca = builder.finish();
+
+    let s = ca.into_series();
+    Ok(PySeries { series: s })
+}
+
 // Init with lists that can contain Nones
 macro_rules! init_method_opt {
     ($name:ident, $type:ty, $native: ty) => {
@@ -148,30 +195,7 @@ macro_rules! init_method_opt {
         impl PySeries {
             #[staticmethod]
             pub fn $name(name: &str, obj: &PyAny, strict: bool) -> PyResult<PySeries> {
-                let (seq, len) = get_pyseq(obj)?;
-                let mut builder = PrimitiveChunkedBuilder::<$type>::new(name, len);
-
-                for res in seq.iter()? {
-                    let item = res?;
-
-                    if item.is_none() {
-                        builder.append_null()
-                    } else {
-                        match item.extract::<$native>() {
-                            Ok(val) => builder.append_value(val),
-                            Err(e) => {
-                                if strict {
-                                    return Err(e);
-                                }
-                                builder.append_null()
-                            }
-                        }
-                    }
-                }
-                let ca = builder.finish();
-
-                let s = ca.into_series();
-                Ok(PySeries { series: s })
+                new_primitive::<$type>(name, obj, strict)
             }
         }
     };
@@ -202,10 +226,14 @@ impl From<Series> for PySeries {
 )]
 impl PySeries {
     #[staticmethod]
-    pub fn new_from_anyvalues(name: &str, val: Vec<Wrap<AnyValue<'_>>>) -> PyResult<PySeries> {
+    pub fn new_from_anyvalues(
+        name: &str,
+        val: Vec<Wrap<AnyValue<'_>>>,
+        strict: bool,
+    ) -> PyResult<PySeries> {
         let avs = slice_extract_wrapped(&val);
         // from anyvalues is fallible
-        let s = Series::from_any_values(name, avs).map_err(PyPolarsErr::from)?;
+        let s = Series::from_any_values(name, avs, strict).map_err(PyPolarsErr::from)?;
         Ok(s.into())
     }
 
@@ -217,15 +245,52 @@ impl PySeries {
     }
 
     #[staticmethod]
+    pub fn new_binary(name: &str, val: Wrap<BinaryChunked>, _strict: bool) -> Self {
+        let mut s = val.0.into_series();
+        s.rename(name);
+        PySeries::new(s)
+    }
+
+    #[staticmethod]
+    pub fn new_null(name: &str, val: &PyAny, _strict: bool) -> PyResult<Self> {
+        let s = Series::new_null(name, val.len()?);
+        Ok(PySeries::new(s))
+    }
+
+    #[staticmethod]
     pub fn new_object(name: &str, val: Vec<ObjectValue>, _strict: bool) -> Self {
-        let s = ObjectChunked::<ObjectValue>::new_from_vec(name, val).into_series();
-        s.into()
+        #[cfg(feature = "object")]
+        {
+            // object builder must be registered.
+            crate::object::register_object_builder();
+            let s = ObjectChunked::<ObjectValue>::new_from_vec(name, val).into_series();
+            s.into()
+        }
+        #[cfg(not(feature = "object"))]
+        {
+            todo!()
+        }
     }
 
     #[staticmethod]
     pub fn new_series_list(name: &str, val: Vec<Self>, _strict: bool) -> Self {
         let series_vec = to_series_collection(val);
         Series::new(name, &series_vec).into()
+    }
+
+    #[staticmethod]
+    pub fn new_decimal(
+        name: &str,
+        val: Vec<Wrap<AnyValue<'_>>>,
+        strict: bool,
+    ) -> PyResult<PySeries> {
+        // TODO: do we have to respect 'strict' here? it's possible if we want to
+        let avs = slice_extract_wrapped(&val);
+        // create a fake dtype with a placeholder "none" scale, to be inferred later
+        let dtype = DataType::Decimal(None, None);
+        let s = Series::from_any_values_and_dtype(name, avs, &dtype, strict)
+            .map_err(PyPolarsErr::from)?;
+        Ok(s.into())
     }
 
     #[staticmethod]
@@ -243,6 +308,12 @@ impl PySeries {
                 ca.rename(name);
                 ca.into_inner().into_series().into()
             }
+            DataType::Int32 => {
+                let val = val.extract::<i32>().unwrap();
+                let mut ca: NoNull<Int32Chunked> = (0..n).map(|_| val).collect_trusted();
+                ca.rename(name);
+                ca.into_inner().into_series().into()
+            }
             DataType::Float64 => {
                 let val = val.extract::<f64>().unwrap();
                 let mut ca: NoNull<Float64Chunked> = (0..n).map(|_| val).collect_trusted();
@@ -255,8 +326,12 @@ impl PySeries {
                 ca.rename(name);
                 ca.into_series().into()
             }
+            DataType::Null => {
+                let s = Series::new_null(name, n);
+                PySeries::new(s)
+            }
             dt => {
-                panic!("cannot create repeat with dtype: {:?}", dt);
+                panic!("cannot create repeat with dtype: {dt:?}");
             }
         }
     }
@@ -278,11 +353,11 @@ impl PySeries {
                     }
                     previous = o;
                 }
-                let mut out = ListChunked::from_chunks(name, vec![arr]);
+                let mut out = unsafe { ListChunked::from_chunks(name, vec![arr]) };
                 if fast_explode {
                     out.set_fast_explode()
                 }
-                return Ok(out.into_series().into());
+                Ok(out.into_series().into())
             }
             _ => {
                 let series: Series =
@@ -297,52 +372,24 @@ impl PySeries {
         py_seq_to_list(name, seq, &dtype.0).map(|s| s.into())
     }
 
-    /// Should only be called for Series with null types.
-    /// This will cast to floats so that `None = np.nan`
-    pub fn to_numpy(&self, py: Python) -> PyObject {
-        let s = &self.series;
-        if s.bit_repr_is_large() {
-            let s = s.cast(&DataType::Float64).unwrap();
-            let ca = s.f64().unwrap();
-            let np_arr = PyArray1::from_iter(
-                py,
-                ca.into_iter().map(|opt_v| match opt_v {
-                    Some(v) => v,
-                    None => f64::NAN,
-                }),
-            );
-            np_arr.into_py(py)
-        } else {
-            let s = s.cast(&DataType::Float32).unwrap();
-            let ca = s.f32().unwrap();
-            let np_arr = PyArray1::from_iter(
-                py,
-                ca.into_iter().map(|opt_v| match opt_v {
-                    Some(v) => v,
-                    None => f32::NAN,
-                }),
-            );
-            np_arr.into_py(py)
-        }
-    }
-
     pub fn estimated_size(&self) -> usize {
         self.series.estimated_size()
     }
 
+    #[cfg(feature = "object")]
     pub fn get_object(&self, index: usize) -> PyObject {
-        let gil = Python::acquire_gil();
-        let python = gil.python();
-        if matches!(self.series.dtype(), DataType::Object(_)) {
-            let obj: Option<&ObjectValue> = self.series.get_object(index).map(|any| any.into());
-            obj.to_object(python)
-        } else {
-            python.None()
-        }
+        Python::with_gil(|py| {
+            if matches!(self.series.dtype(), DataType::Object(_)) {
+                let obj: Option<&ObjectValue> = self.series.get_object(index).map(|any| any.into());
+                obj.to_object(py)
+            } else {
+                py.None()
+            }
+        })
     }
 
     pub fn get_fmt(&self, index: usize, str_lengths: usize) -> String {
-        let val = format!("{}", self.series.get(index));
+        let val = format!("{}", self.series.get(index).unwrap());
         if let DataType::Utf8 | DataType::Categorical(_) = self.series.dtype() {
             let v_trunc = &val[..val
                 .char_indices()
@@ -353,7 +400,7 @@ impl PySeries {
             if val == v_trunc {
                 val
             } else {
-                format!("{}...", v_trunc)
+                format!("{v_trunc}…")
             }
         } else {
             val
@@ -370,8 +417,20 @@ impl PySeries {
         }
     }
 
-    pub fn get_idx(&self, py: Python, idx: usize) -> PyObject {
-        Wrap(self.series.get(idx)).into_py(py)
+    pub fn get_idx(&self, py: Python, idx: usize) -> PyResult<PyObject> {
+        let av = self.series.get(idx).map_err(PyPolarsErr::from)?;
+        if let AnyValue::List(s) = av {
+            let pyseries = PySeries::new(s);
+            let out = POLARS
+                .getattr(py, "wrap_s")
+                .unwrap()
+                .call1(py, (pyseries,))
+                .unwrap();
+
+            Ok(out.into_py(py))
+        } else {
+            Ok(Wrap(self.series.get(idx).map_err(PyPolarsErr::from)?).into_py(py))
+        }
     }
 
     pub fn bitand(&self, other: &PySeries) -> PyResult<Self> {
@@ -397,26 +456,6 @@ impl PySeries {
         Ok(out.into())
     }
 
-    pub fn cumsum(&self, reverse: bool) -> Self {
-        self.series.cumsum(reverse).into()
-    }
-
-    pub fn cummax(&self, reverse: bool) -> Self {
-        self.series.cummax(reverse).into()
-    }
-
-    pub fn cummin(&self, reverse: bool) -> Self {
-        self.series.cummin(reverse).into()
-    }
-
-    pub fn cumprod(&self, reverse: bool) -> Self {
-        self.series.cumprod(reverse).into()
-    }
-
-    pub fn reverse(&self) -> Self {
-        self.series.reverse().into()
-    }
-
     pub fn chunk_lengths(&self) -> Vec<usize> {
         self.series.chunk_lengths().collect()
     }
@@ -440,12 +479,12 @@ impl PySeries {
             .map(|dt| Wrap(dt.clone()).to_object(py))
     }
 
-    fn set_sorted(&self, reverse: bool) -> Self {
+    fn set_sorted_flag(&self, descending: bool) -> Self {
         let mut out = self.series.clone();
-        if reverse {
-            out.set_sorted(IsSorted::Descending);
+        if descending {
+            out.set_sorted_flag(IsSorted::Descending);
         } else {
-            out.set_sorted(IsSorted::Ascending)
+            out.set_sorted_flag(IsSorted::Ascending)
         }
         out.into()
     }
@@ -460,32 +499,38 @@ impl PySeries {
         }
     }
 
-    pub fn max(&self, py: Python) -> PyObject {
-        Wrap(self.series.max_as_series().get(0)).into_py(py)
+    pub fn max(&self, py: Python) -> PyResult<PyObject> {
+        Ok(Wrap(
+            self.series
+                .max_as_series()
+                .get(0)
+                .map_err(PyPolarsErr::from)?,
+        )
+        .into_py(py))
     }
 
-    pub fn min(&self, py: Python) -> PyObject {
-        Wrap(self.series.min_as_series().get(0)).into_py(py)
+    pub fn min(&self, py: Python) -> PyResult<PyObject> {
+        Ok(Wrap(
+            self.series
+                .min_as_series()
+                .get(0)
+                .map_err(PyPolarsErr::from)?,
+        )
+        .into_py(py))
     }
 
-    pub fn sum(&self, py: Python) -> PyObject {
-        Wrap(self.series.sum_as_series().get(0)).into_py(py)
+    pub fn sum(&self, py: Python) -> PyResult<PyObject> {
+        Ok(Wrap(
+            self.series
+                .sum_as_series()
+                .get(0)
+                .map_err(PyPolarsErr::from)?,
+        )
+        .into_py(py))
     }
 
     pub fn n_chunks(&self) -> usize {
         self.series.n_chunks()
-    }
-
-    pub fn limit(&self, num_elements: usize) -> Self {
-        let series = self.series.limit(num_elements);
-        series.into()
-    }
-
-    pub fn slice(&self, offset: i64, length: Option<usize>) -> Self {
-        let series = self
-            .series
-            .slice(offset, length.unwrap_or(self.series.len()));
-        series.into()
     }
 
     pub fn append(&mut self, other: &PySeries) -> PyResult<()> {
@@ -502,6 +547,14 @@ impl PySeries {
         Ok(())
     }
 
+    pub fn new_from_index(&self, index: usize, length: usize) -> PyResult<Self> {
+        if index >= self.series.len() {
+            Err(PyValueError::new_err("index is out of bounds"))
+        } else {
+            Ok(self.series.new_from_index(index, length).into())
+        }
+    }
+
     pub fn filter(&self, filter: &PySeries) -> PyResult<Self> {
         let filter_series = &filter.series;
         if let Ok(ca) = filter_series.bool() {
@@ -512,8 +565,12 @@ impl PySeries {
         }
     }
 
-    pub fn add(&self, other: &PySeries) -> Self {
-        (&self.series + &other.series).into()
+    pub fn add(&self, other: &PySeries) -> PyResult<Self> {
+        let out = self
+            .series
+            .try_add(&other.series)
+            .map_err(PyPolarsErr::from)?;
+        Ok(out.into())
     }
 
     pub fn sub(&self, other: &PySeries) -> Self {
@@ -532,41 +589,16 @@ impl PySeries {
         (&self.series % &other.series).into()
     }
 
-    pub fn head(&self, length: Option<usize>) -> Self {
-        (self.series.head(length)).into()
+    pub fn sort(&mut self, descending: bool) -> Self {
+        PySeries::new(self.series.sort(descending))
     }
 
-    pub fn tail(&self, length: Option<usize>) -> Self {
-        (self.series.tail(length)).into()
-    }
-
-    pub fn sort(&mut self, reverse: bool) -> Self {
-        PySeries::new(self.series.sort(reverse))
-    }
-
-    pub fn argsort(&self, reverse: bool, nulls_last: bool) -> Self {
-        self.series
-            .argsort(SortOptions {
-                descending: reverse,
-                nulls_last,
-            })
-            .into_series()
-            .into()
-    }
-
-    pub fn unique(&self) -> PyResult<Self> {
-        let unique = self.series.unique().map_err(PyPolarsErr::from)?;
-        Ok(unique.into())
-    }
-
-    pub fn value_counts(&self) -> PyResult<PyDataFrame> {
-        let df = self.series.value_counts(true).map_err(PyPolarsErr::from)?;
+    pub fn value_counts(&self, sorted: bool) -> PyResult<PyDataFrame> {
+        let df = self
+            .series
+            .value_counts(true, sorted)
+            .map_err(PyPolarsErr::from)?;
         Ok(df.into())
-    }
-
-    pub fn arg_unique(&self) -> PyResult<Self> {
-        let arg_unique = self.series.arg_unique().map_err(PyPolarsErr::from)?;
-        Ok(arg_unique.into_series().into())
     }
 
     pub fn arg_min(&self) -> Option<usize> {
@@ -575,14 +607,6 @@ impl PySeries {
 
     pub fn arg_max(&self) -> Option<usize> {
         self.series.arg_max()
-    }
-
-    pub fn take(&self, indices: Wrap<Vec<IdxSize>>) -> PyResult<Self> {
-        let indices = indices.0;
-        let indices = IdxCa::from_vec("", indices);
-
-        let take = self.series.take(&indices).map_err(PyPolarsErr::from)?;
-        Ok(PySeries::new(take))
     }
 
     pub fn take_with_series(&self, indices: &PySeries) -> PyResult<Self> {
@@ -597,82 +621,6 @@ impl PySeries {
 
     pub fn has_validity(&self) -> bool {
         self.series.has_validity()
-    }
-
-    pub fn is_null(&self) -> PySeries {
-        Self::new(self.series.is_null().into_series())
-    }
-
-    pub fn is_not_null(&self) -> PySeries {
-        Self::new(self.series.is_not_null().into_series())
-    }
-
-    pub fn is_not_nan(&self) -> PyResult<Self> {
-        let ca = self.series.is_not_nan().map_err(PyPolarsErr::from)?;
-        Ok(ca.into_series().into())
-    }
-
-    pub fn is_nan(&self) -> PyResult<Self> {
-        let ca = self.series.is_nan().map_err(PyPolarsErr::from)?;
-        Ok(ca.into_series().into())
-    }
-
-    pub fn is_finite(&self) -> PyResult<Self> {
-        let ca = self.series.is_finite().map_err(PyPolarsErr::from)?;
-        Ok(ca.into_series().into())
-    }
-
-    pub fn is_infinite(&self) -> PyResult<Self> {
-        let ca = self.series.is_infinite().map_err(PyPolarsErr::from)?;
-        Ok(ca.into_series().into())
-    }
-
-    pub fn is_unique(&self) -> PyResult<Self> {
-        let ca = self.series.is_unique().map_err(PyPolarsErr::from)?;
-        Ok(ca.into_series().into())
-    }
-
-    pub fn sample_n(
-        &self,
-        n: usize,
-        with_replacement: bool,
-        shuffle: bool,
-        seed: Option<u64>,
-    ) -> PyResult<Self> {
-        let s = self
-            .series
-            .sample_n(n, with_replacement, shuffle, seed)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn sample_frac(
-        &self,
-        frac: f64,
-        with_replacement: bool,
-        shuffle: bool,
-        seed: Option<u64>,
-    ) -> PyResult<Self> {
-        let s = self
-            .series
-            .sample_frac(frac, with_replacement, shuffle, seed)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn is_duplicated(&self) -> PyResult<Self> {
-        let ca = self.series.is_duplicated().map_err(PyPolarsErr::from)?;
-        Ok(ca.into_series().into())
-    }
-
-    pub fn explode(&self) -> PyResult<Self> {
-        let s = self.series.explode().map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn take_every(&self, n: usize) -> Self {
-        let s = self.series.take_every(n);
-        s.into()
     }
 
     pub fn series_equal(&self, other: &PySeries, null_equal: bool, strict: bool) -> bool {
@@ -730,90 +678,119 @@ impl PySeries {
         self.series.len()
     }
 
-    pub fn to_physical(&self) -> Self {
-        let s = self.series.to_physical_repr().into_owned();
-        s.into()
-    }
-
     pub fn to_list(&self) -> PyObject {
-        let gil = Python::acquire_gil();
-        let python = gil.python();
+        Python::with_gil(|py| {
+            let series = &self.series;
 
-        let series = &self.series;
-
-        fn to_list_recursive(python: Python, series: &Series) -> PyObject {
-            let pylist = match series.dtype() {
-                DataType::Boolean => PyList::new(python, series.bool().unwrap()),
-                DataType::UInt8 => PyList::new(python, series.u8().unwrap()),
-                DataType::UInt16 => PyList::new(python, series.u16().unwrap()),
-                DataType::UInt32 => PyList::new(python, series.u32().unwrap()),
-                DataType::UInt64 => PyList::new(python, series.u64().unwrap()),
-                DataType::Int8 => PyList::new(python, series.i8().unwrap()),
-                DataType::Int16 => PyList::new(python, series.i16().unwrap()),
-                DataType::Int32 => PyList::new(python, series.i32().unwrap()),
-                DataType::Int64 => PyList::new(python, series.i64().unwrap()),
-                DataType::Float32 => PyList::new(python, series.f32().unwrap()),
-                DataType::Float64 => PyList::new(python, series.f64().unwrap()),
-                DataType::Categorical(_) => {
-                    PyList::new(python, series.categorical().unwrap().iter_str())
-                }
-                DataType::Object(_) => {
-                    let v = PyList::empty(python);
-                    for i in 0..series.len() {
-                        let obj: Option<&ObjectValue> = series.get_object(i).map(|any| any.into());
-                        let val = obj.to_object(python);
-
-                        v.append(val).unwrap();
+            fn to_list_recursive(py: Python, series: &Series) -> PyObject {
+                let pylist = match series.dtype() {
+                    DataType::Boolean => PyList::new(py, series.bool().unwrap()),
+                    DataType::UInt8 => PyList::new(py, series.u8().unwrap()),
+                    DataType::UInt16 => PyList::new(py, series.u16().unwrap()),
+                    DataType::UInt32 => PyList::new(py, series.u32().unwrap()),
+                    DataType::UInt64 => PyList::new(py, series.u64().unwrap()),
+                    DataType::Int8 => PyList::new(py, series.i8().unwrap()),
+                    DataType::Int16 => PyList::new(py, series.i16().unwrap()),
+                    DataType::Int32 => PyList::new(py, series.i32().unwrap()),
+                    DataType::Int64 => PyList::new(py, series.i64().unwrap()),
+                    DataType::Float32 => PyList::new(py, series.f32().unwrap()),
+                    DataType::Float64 => PyList::new(py, series.f64().unwrap()),
+                    DataType::Categorical(_) => {
+                        PyList::new(py, series.categorical().unwrap().iter_str())
                     }
-                    v
-                }
-                DataType::List(_) => {
-                    let v = PyList::empty(python);
-                    let ca = series.list().unwrap();
-                    for opt_s in ca.amortized_iter() {
-                        match opt_s {
-                            None => {
-                                v.append(python.None()).unwrap();
-                            }
-                            Some(s) => {
-                                let pylst = to_list_recursive(python, s.as_ref());
-                                v.append(pylst).unwrap();
+                    #[cfg(feature = "object")]
+                    DataType::Object(_) => {
+                        let v = PyList::empty(py);
+                        for i in 0..series.len() {
+                            let obj: Option<&ObjectValue> =
+                                series.get_object(i).map(|any| any.into());
+                            let val = obj.to_object(py);
+
+                            v.append(val).unwrap();
+                        }
+                        v
+                    }
+                    DataType::List(_) => {
+                        let v = PyList::empty(py);
+                        let ca = series.list().unwrap();
+                        for opt_s in ca.amortized_iter() {
+                            match opt_s {
+                                None => {
+                                    v.append(py.None()).unwrap();
+                                }
+                                Some(s) => {
+                                    let pylst = to_list_recursive(py, s.as_ref());
+                                    v.append(pylst).unwrap();
+                                }
                             }
                         }
+                        v
                     }
-                    v
-                }
-                DataType::Date => {
-                    let ca = series.date().unwrap();
-                    return Wrap(ca).to_object(python);
-                }
-                DataType::Time => {
-                    let ca = series.time().unwrap();
-                    return Wrap(ca).to_object(python);
-                }
-                DataType::Datetime(_, _) => {
-                    let ca = series.datetime().unwrap();
-                    return Wrap(ca).to_object(python);
-                }
-                DataType::Utf8 => {
-                    let ca = series.utf8().unwrap();
-                    return Wrap(ca).to_object(python);
-                }
-                DataType::Struct(_) => {
-                    let ca = series.struct_().unwrap();
-                    return Wrap(ca).to_object(python);
-                }
-                DataType::Duration(_) => {
-                    let ca = series.duration().unwrap();
-                    return Wrap(ca).to_object(python);
-                }
-                dt => panic!("to_list() not implemented for {:?}", dt),
-            };
-            pylist.to_object(python)
-        }
+                    DataType::Date => {
+                        let ca = series.date().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Time => {
+                        let ca = series.time().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Datetime(_, _) => {
+                        let ca = series.datetime().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Decimal(_, _) => {
+                        let ca = series.decimal().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Utf8 => {
+                        let ca = series.utf8().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Struct(_) => {
+                        let ca = series.struct_().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Duration(_) => {
+                        let ca = series.duration().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Binary => {
+                        let ca = series.binary().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Null => {
+                        let null: Option<u8> = None;
+                        let n = series.len();
+                        let iter = std::iter::repeat(null).take(n);
+                        use std::iter::{Repeat, Take};
+                        struct NullIter {
+                            iter: Take<Repeat<Option<u8>>>,
+                            n: usize,
+                        }
+                        impl Iterator for NullIter {
+                            type Item = Option<u8>;
 
-        let pylist = to_list_recursive(python, series);
-        pylist.to_object(python)
+                            fn next(&mut self) -> Option<Self::Item> {
+                                self.iter.next()
+                            }
+                            fn size_hint(&self) -> (usize, Option<usize>) {
+                                (self.n, Some(self.n))
+                            }
+                        }
+                        impl ExactSizeIterator for NullIter {}
+
+                        PyList::new(py, NullIter { iter, n })
+                    }
+                    DataType::Unknown => {
+                        panic!("to_list not implemented for unknown")
+                    }
+                };
+                pylist.to_object(py)
+            }
+
+            let pylist = to_list_recursive(py, series);
+            pylist.to_object(py)
+        })
     }
 
     pub fn median(&self) -> Option<f64> {
@@ -826,26 +803,21 @@ impl PySeries {
         }
     }
 
-    pub fn quantile(&self, quantile: f64, interpolation: &str) -> PyObject {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-
-        let interpol = match interpolation {
-            "nearest" => QuantileInterpolOptions::Nearest,
-            "lower" => QuantileInterpolOptions::Lower,
-            "higher" => QuantileInterpolOptions::Higher,
-            "midpoint" => QuantileInterpolOptions::Midpoint,
-            "linear" => QuantileInterpolOptions::Linear,
-            _ => panic!("not supported"),
-        };
-
-        Wrap(
-            self.series
-                .quantile_as_series(quantile, interpol)
-                .expect("invalid quantile")
-                .get(0),
-        )
-        .into_py(py)
+    pub fn quantile(
+        &self,
+        quantile: f64,
+        interpolation: Wrap<QuantileInterpolOptions>,
+    ) -> PyObject {
+        Python::with_gil(|py| {
+            Wrap(
+                self.series
+                    .quantile_as_series(quantile, interpolation.0)
+                    .expect("invalid quantile")
+                    .get(0)
+                    .unwrap_or(AnyValue::Null),
+            )
+            .into_py(py)
+        })
     }
 
     /// Rechunk and return a pointer to the start of the Series.
@@ -855,33 +827,12 @@ impl PySeries {
         Ok(ptr)
     }
 
-    pub fn drop_nulls(&self) -> Self {
-        self.series.drop_nulls().into()
-    }
-
-    pub fn fill_null(&self, strategy: &str, limit: Option<IdxSize>) -> PyResult<Self> {
-        let strat = parse_strategy(strategy, limit)?;
-        let series = self.series.fill_null(strat).map_err(PyPolarsErr::from)?;
-        Ok(PySeries::new(series))
-    }
-
     pub fn to_arrow(&mut self) -> PyResult<PyObject> {
         self.rechunk(true);
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-        let pyarrow = py.import("pyarrow")?;
+        Python::with_gil(|py| {
+            let pyarrow = py.import("pyarrow")?;
 
-        arrow_interop::to_py::to_py_array(self.series.to_arrow(0), py, pyarrow)
-    }
-
-    #[cfg(feature = "is_in")]
-    pub fn is_in(&self, py: Python, other: &PySeries) -> PyResult<Self> {
-        py.allow_threads(|| {
-            let out = self
-                .series
-                .is_in(&other.series)
-                .map_err(PyPolarsErr::from)?;
-            Ok(out.into_series().into())
+            arrow_interop::to_py::to_py_array(self.series.to_arrow(0), py, pyarrow)
         })
     }
 
@@ -889,215 +840,248 @@ impl PySeries {
         PySeries::new(self.series.clone())
     }
 
+    #[pyo3(signature = (lambda, output_type, skip_nulls))]
     pub fn apply_lambda(
         &self,
         lambda: &PyAny,
         output_type: Option<Wrap<DataType>>,
+        skip_nulls: bool,
     ) -> PyResult<PySeries> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
         let series = &self.series;
+
+        if skip_nulls && (series.null_count() == series.len()) {
+            if let Some(output_type) = output_type {
+                return Ok(Series::full_null(series.name(), series.len(), &output_type.0).into());
+            }
+            let msg = "The output type of 'apply' function cannot determined.\n\
+            The function was never called because 'skip_nulls=True' and all values are null.\n\
+            Consider setting 'skip_nulls=False' or setting the 'return_dtype'.";
+            raise_err!(msg, ComputeError)
+        }
 
         let output_type = output_type.map(|dt| dt.0);
 
-        if matches!(
-            self.series.dtype(),
-            DataType::Datetime(_, _)
-                | DataType::Date
-                | DataType::Duration(_)
-                | DataType::Categorical(_)
-                | DataType::Time
-        ) {
-            let mut avs = Vec::with_capacity(self.series.len());
-            let iter = self.series.iter().map(|av| {
-                let input = Wrap(av);
-                call_lambda_and_extract::<_, Wrap<AnyValue>>(py, lambda, input)
-                    .unwrap()
-                    .0
-            });
-            avs.extend(iter);
-            return Ok(Series::new(self.name(), &avs).into());
+        macro_rules! dispatch_apply {
+            ($self:expr, $method:ident, $($args:expr),*) => {
+                match $self.dtype() {
+                    #[cfg(feature = "object")]
+                    DataType::Object(_) => {
+                        let ca = $self.0.unpack::<ObjectType<ObjectValue>>().unwrap();
+                        ca.$method($($args),*)
+                    },
+                    _ => {
+                        apply_method_all_arrow_series2!(
+                            $self,
+                            $method,
+                            $($args),*
+                        )
+                    }
+
+                }
+            }
+
         }
 
-        let out = match output_type {
-            Some(DataType::Int8) => {
-                let ca: Int8Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::Int16) => {
-                let ca: Int16Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::Int32) => {
-                let ca: Int32Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::Int64) => {
-                let ca: Int64Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::UInt8) => {
-                let ca: UInt8Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::UInt16) => {
-                let ca: UInt16Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::UInt32) => {
-                let ca: UInt32Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::UInt64) => {
-                let ca: UInt64Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::Float32) => {
-                let ca: Float32Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::Float64) => {
-                let ca: Float64Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::Boolean) => {
-                let ca: BooleanChunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_bool_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::Date) => {
-                let ca: Int32Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_date().into_series()
-            }
-            Some(DataType::Datetime(tu, tz)) => {
-                let ca: Int64Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_primitive_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_datetime(tu, tz).into_series()
-            }
-            Some(DataType::Utf8) => {
-                let ca: Utf8Chunked = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_utf8_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            Some(DataType::Object(_)) => {
-                let ca: ObjectChunked<ObjectValue> = apply_method_all_arrow_series!(
-                    series,
-                    apply_lambda_with_object_out_type,
-                    py,
-                    lambda,
-                    0,
-                    None
-                )?;
-                ca.into_series()
-            }
-            None => {
-                return apply_method_all_arrow_series!(series, apply_lambda_unknown, py, lambda);
+        Python::with_gil(|py| {
+            if matches!(
+                self.series.dtype(),
+                DataType::Datetime(_, _)
+                    | DataType::Date
+                    | DataType::Duration(_)
+                    | DataType::Categorical(_)
+                    | DataType::Binary
+                    | DataType::Time
+            ) || !skip_nulls
+            {
+                let mut avs = Vec::with_capacity(self.series.len());
+                let iter = self.series.iter().map(|av| match (skip_nulls, av) {
+                    (true, AnyValue::Null) => AnyValue::Null,
+                    (_, av) => {
+                        let input = Wrap(av);
+                        call_lambda_and_extract::<_, Wrap<AnyValue>>(py, lambda, input)
+                            .unwrap()
+                            .0
+                    }
+                });
+                avs.extend(iter);
+                return Ok(Series::new(self.name(), &avs).into());
             }
 
-            _ => return apply_method_all_arrow_series!(series, apply_lambda, py, lambda),
-        };
+            let out = match output_type {
+                Some(DataType::Int8) => {
+                    let ca: Int8Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::Int16) => {
+                    let ca: Int16Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::Int32) => {
+                    let ca: Int32Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::Int64) => {
+                    let ca: Int64Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::UInt8) => {
+                    let ca: UInt8Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::UInt16) => {
+                    let ca: UInt16Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::UInt32) => {
+                    let ca: UInt32Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::UInt64) => {
+                    let ca: UInt64Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::Float32) => {
+                    let ca: Float32Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::Float64) => {
+                    let ca: Float64Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::Boolean) => {
+                    let ca: BooleanChunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_bool_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                Some(DataType::Date) => {
+                    let ca: Int32Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_date().into_series()
+                }
+                Some(DataType::Datetime(tu, tz)) => {
+                    let ca: Int64Chunked = dispatch_apply!(
+                        series,
+                        apply_lambda_with_primitive_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_datetime(tu, tz).into_series()
+                }
+                Some(DataType::Utf8) => {
+                    let ca = dispatch_apply!(
+                        series,
+                        apply_lambda_with_utf8_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
 
-        Ok(PySeries::new(out))
-    }
+                    ca.into_series()
+                }
+                #[cfg(feature = "object")]
+                Some(DataType::Object(_)) => {
+                    let ca = dispatch_apply!(
+                        series,
+                        apply_lambda_with_object_out_type,
+                        py,
+                        lambda,
+                        0,
+                        None
+                    )?;
+                    ca.into_series()
+                }
+                None => return dispatch_apply!(series, apply_lambda_unknown, py, lambda),
 
-    pub fn shift(&self, periods: i64) -> Self {
-        let s = self.series.shift(periods);
-        PySeries::new(s)
+                _ => return dispatch_apply!(series, apply_lambda_unknown, py, lambda),
+            };
+
+            Ok(PySeries::new(out))
+        })
     }
 
     pub fn zip_with(&self, mask: &PySeries, other: &PySeries) -> PyResult<Self> {
@@ -1109,128 +1093,11 @@ impl PySeries {
         Ok(PySeries::new(s))
     }
 
-    pub fn str_lengths(&self) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca.str_lengths().into_series();
-        Ok(PySeries::new(s))
-    }
-
-    pub fn str_contains(&self, pat: &str, literal: Option<bool>) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = if literal.unwrap_or(false) {
-            ca.contains_literal(pat)
-        } else {
-            ca.contains(pat)
-        }
-        .map_err(PyPolarsErr::from)?
-        .into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_json_path_match(&self, pat: &str) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca
-            .json_path_match(pat)
-            .map_err(PyPolarsErr::from)?
-            .into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_extract(&self, pat: &str, group_index: usize) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca
-            .extract(pat, group_index)
-            .map_err(PyPolarsErr::from)?
-            .into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_replace(&self, pat: &str, val: &str) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca
-            .replace(pat, val)
-            .map_err(PyPolarsErr::from)?
-            .into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_replace_all(&self, pat: &str, val: &str) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca
-            .replace_all(pat, val)
-            .map_err(PyPolarsErr::from)?
-            .into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_to_uppercase(&self) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca.to_uppercase().into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_to_lowercase(&self) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca.to_lowercase().into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_slice(&self, start: i64, length: Option<u64>) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca
-            .str_slice(start, length)
-            .map_err(PyPolarsErr::from)?
-            .into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_hex_encode(&self) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca.hex_encode().into_series();
-        Ok(s.into())
-    }
-    pub fn str_hex_decode(&self, strict: Option<bool>) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca
-            .hex_decode(strict)
-            .map_err(PyPolarsErr::from)?
-            .into_series();
-
-        Ok(s.into())
-    }
-    pub fn str_base64_encode(&self) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca.base64_encode().into_series();
-        Ok(s.into())
-    }
-
-    pub fn str_base64_decode(&self, strict: Option<bool>) -> PyResult<Self> {
-        let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca
-            .base64_decode(strict)
-            .map_err(PyPolarsErr::from)?
-            .into_series();
-        Ok(s.into())
-    }
-
-    pub fn strftime(&self, fmt: &str) -> PyResult<Self> {
-        let s = self.series.strftime(fmt).map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn arr_lengths(&self) -> PyResult<Self> {
-        let ca = self.series.list().map_err(PyPolarsErr::from)?;
-        let s = ca.lst_lengths().into_series();
-        Ok(PySeries::new(s))
-    }
-
-    pub fn timestamp(&self, tu: Wrap<TimeUnit>) -> PyResult<Self> {
-        let ca = self.series.timestamp(tu.0).map_err(PyPolarsErr::from)?;
-        Ok(ca.into_series().into())
-    }
-
-    pub fn to_dummies(&self) -> PyResult<PyDataFrame> {
-        let df = self.series.to_dummies().map_err(PyPolarsErr::from)?;
+    pub fn to_dummies(&self, separator: Option<&str>) -> PyResult<PyDataFrame> {
+        let df = self
+            .series
+            .to_dummies(separator)
+            .map_err(PyPolarsErr::from)?;
         Ok(df.into())
     }
 
@@ -1241,64 +1108,6 @@ impl PySeries {
         } else {
             None
         }
-    }
-
-    pub fn year(&self) -> PyResult<Self> {
-        let s = self.series.year().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn month(&self) -> PyResult<Self> {
-        let s = self.series.month().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn weekday(&self) -> PyResult<Self> {
-        let s = self.series.weekday().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn week(&self) -> PyResult<Self> {
-        let s = self.series.week().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn day(&self) -> PyResult<Self> {
-        let s = self.series.day().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn ordinal_day(&self) -> PyResult<Self> {
-        let s = self.series.ordinal_day().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn hour(&self) -> PyResult<Self> {
-        let s = self.series.hour().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn minute(&self) -> PyResult<Self> {
-        let s = self.series.minute().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn second(&self) -> PyResult<Self> {
-        let s = self.series.second().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn nanosecond(&self) -> PyResult<Self> {
-        let s = self.series.nanosecond().map_err(PyPolarsErr::from)?;
-        Ok(s.into_series().into())
-    }
-
-    pub fn dt_epoch_seconds(&self) -> PyResult<Self> {
-        let ms = self
-            .series
-            .timestamp(TimeUnit::Milliseconds)
-            .map_err(PyPolarsErr::from)?;
-        Ok((ms / 1000).into_series().into())
     }
 
     pub fn peak_max(&self) -> Self {
@@ -1314,20 +1123,6 @@ impl PySeries {
         Ok(n)
     }
 
-    pub fn is_first(&self) -> PyResult<Self> {
-        let out = self
-            .series
-            .is_first()
-            .map_err(PyPolarsErr::from)?
-            .into_series();
-        Ok(out.into())
-    }
-
-    pub fn round(&self, decimals: u32) -> PyResult<Self> {
-        let s = self.series.round(decimals).map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
     pub fn floor(&self) -> PyResult<Self> {
         let s = self.series.floor().map_err(PyPolarsErr::from)?;
         Ok(s.into())
@@ -1339,26 +1134,6 @@ impl PySeries {
 
     pub fn dot(&self, other: &PySeries) -> Option<f64> {
         self.series.dot(&other.series)
-    }
-
-    pub fn hash(&self, k0: u64, k1: u64, k2: u64, k3: u64) -> Self {
-        let hb = ahash::RandomState::with_seeds(k0, k1, k2, k3);
-        self.series.hash(hb).into_series().into()
-    }
-
-    pub fn reinterpret(&self, signed: bool) -> PyResult<Self> {
-        let s = reinterpret(&self.series, signed).map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn mode(&self) -> PyResult<Self> {
-        let s = self.series.mode().map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn interpolate(&self) -> Self {
-        let s = self.series.interpolate();
-        s.into()
     }
 
     pub fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
@@ -1375,20 +1150,6 @@ impl PySeries {
             }
             Err(e) => Err(e),
         }
-    }
-
-    pub fn rank(&self, method: &str, reverse: bool) -> PyResult<Self> {
-        let method = str_to_rankmethod(method).unwrap();
-        let options = RankOptions {
-            method,
-            descending: reverse,
-        };
-        Ok(self.series.rank(options).into())
-    }
-
-    pub fn diff(&self, n: usize, null_behavior: &str) -> PyResult<Self> {
-        let null_behavior = str_to_null_behavior(null_behavior)?;
-        Ok(self.series.diff(n, null_behavior).into())
     }
 
     pub fn skew(&self, bias: bool) -> PyResult<Option<f64>> {
@@ -1415,32 +1176,11 @@ impl PySeries {
         Ok(out.into())
     }
 
-    pub fn abs(&self) -> PyResult<Self> {
-        let out = self.series.abs().map_err(PyPolarsErr::from)?;
-        Ok(out.into())
-    }
-
-    pub fn reshape(&self, dims: Vec<i64>) -> PyResult<Self> {
-        let out = self.series.reshape(&dims).map_err(PyPolarsErr::from)?;
-        Ok(out.into())
-    }
-
-    pub fn shuffle(&self, seed: u64) -> Self {
-        self.series.shuffle(seed).into()
-    }
-
-    pub fn extend_constant(&self, value: Wrap<AnyValue>, n: usize) -> PyResult<Self> {
-        let value = value.0;
-        let out = self
-            .series
-            .extend_constant(value, n)
-            .map_err(PyPolarsErr::from)?;
-        Ok(out.into())
-    }
-
     pub fn time_unit(&self) -> Option<&str> {
-        if let DataType::Datetime(tu, _) | DataType::Duration(tu) = self.series.dtype() {
-            Some(match tu {
+        if let DataType::Datetime(time_unit, _) | DataType::Duration(time_unit) =
+            self.series.dtype()
+        {
+            Some(match time_unit {
                 TimeUnit::Nanoseconds => "ns",
                 TimeUnit::Microseconds => "us",
                 TimeUnit::Milliseconds => "ms",
@@ -1450,74 +1190,105 @@ impl PySeries {
         }
     }
 
-    pub fn and_time_zone(&self, tz: Option<TimeZone>) -> PyResult<Self> {
-        let mut dt = self.series.datetime().map_err(PyPolarsErr::from)?.clone();
-        dt.set_time_zone(tz);
-        Ok(dt.into_series().into())
+    pub fn set_at_idx(&mut self, idx: PySeries, values: PySeries) -> PyResult<()> {
+        // we take the value because we want a ref count
+        // of 1 so that we can have mutable access
+        let s = std::mem::take(&mut self.series);
+        match set_at_idx(s, &idx.series, &values.series) {
+            Ok(out) => {
+                self.series = out;
+                Ok(())
+            }
+            Err(e) => Err(PyErr::from(PyPolarsErr::from(e))),
+        }
+    }
+    pub fn get_chunks(&self) -> PyResult<Vec<PyObject>> {
+        Python::with_gil(|py| {
+            let wrap_s = py_modules::POLARS.getattr(py, "wrap_s").unwrap();
+            flatten_series(&self.series)
+                .into_iter()
+                .map(|s| wrap_s.call1(py, (Self::new(s),)))
+                .collect()
+        })
+    }
+
+    pub fn is_sorted(&self, descending: bool) -> bool {
+        let options = SortOptions {
+            descending,
+            nulls_last: descending,
+            multithreaded: true,
+        };
+        self.series.is_sorted(options)
+    }
+
+    pub fn clear(&self) -> Self {
+        self.series.clear().into()
+    }
+
+    #[pyo3(signature = (bins, labels, break_point_label, category_label, maintain_order))]
+    pub fn cut(
+        &self,
+        bins: Self,
+        labels: Option<Vec<&str>>,
+        break_point_label: Option<&str>,
+        category_label: Option<&str>,
+        maintain_order: bool,
+    ) -> PyResult<PyDataFrame> {
+        let out = cut(
+            &self.series,
+            bins.series,
+            labels,
+            break_point_label,
+            category_label,
+            maintain_order,
+        )
+        .map_err(PyPolarsErr::from)?;
+        Ok(out.into())
+    }
+
+    #[pyo3(signature = (quantiles, labels, break_point_label, category_label, maintain_order))]
+    pub fn qcut(
+        &self,
+        quantiles: Self,
+        labels: Option<Vec<&str>>,
+        break_point_label: Option<&str>,
+        category_label: Option<&str>,
+        maintain_order: bool,
+    ) -> PyResult<PyDataFrame> {
+        if quantiles.series.null_count() > 0 {
+            return Err(PyValueError::new_err(
+                "did not expect null values in list of quantiles",
+            ));
+        }
+        let quantiles = quantiles.series.cast(&DataType::Float64).unwrap();
+        let quantiles = quantiles.f64().unwrap().rechunk();
+
+        let out = qcut(
+            &self.series,
+            quantiles.cont_slice().unwrap(),
+            labels,
+            break_point_label,
+            category_label,
+            maintain_order,
+        )
+        .map_err(PyPolarsErr::from)?;
+        Ok(out.into())
+    }
+
+    pub fn hist(&self, bins: Option<Self>, bin_count: Option<usize>) -> PyResult<PyDataFrame> {
+        let bins = bins.map(|s| s.series);
+        let out = hist(&self.series, bins.as_ref(), bin_count).map_err(PyPolarsErr::from)?;
+        Ok(out.into())
     }
 }
 
-macro_rules! impl_ufuncs {
-    ($name:ident, $type:ident, $unsafe_from_ptr_method:ident) => {
-        #[pymethods]
-        impl PySeries {
-            // applies a ufunc by accepting a lambda out: ufunc(*args, out=out)
-            // the out array is allocated in this method, send to Python and once the ufunc is applied
-            // ownership is taken by Rust again to prevent memory leak.
-            // if the ufunc fails, we first must take ownership back.
-            pub fn $name(&self, lambda: &PyAny) -> PyResult<PySeries> {
-                // numpy array object, and a *mut ptr
-                let gil = Python::acquire_gil();
-                let py = gil.python();
-                let size = self.len();
-                let (out_array, av) =
-                    unsafe { aligned_array::<<$type as PolarsNumericType>::Native>(py, size) };
-
-                debug_assert_eq!(get_refcnt(out_array), 1);
-                // inserting it in a tuple increase the reference count by 1.
-                let args = PyTuple::new(py, &[out_array]);
-                debug_assert_eq!(get_refcnt(out_array), 2);
-
-                // whatever the result, we must take the leaked memory ownership back
-                let s = match lambda.call1(args) {
-                    Ok(_) => {
-                        // if this assert fails, the lambda has taken a reference to the object, so we must panic
-                        // args and the lambda return have a reference, making a total of 3
-                        assert_eq!(get_refcnt(out_array), 3);
-
-                        let validity = self.series.chunks()[0].validity().cloned();
-                        let ca = ChunkedArray::<$type>::new_from_owned_with_null_bitmap(
-                            self.name(),
-                            av,
-                            validity,
-                        );
-                        PySeries::new(ca.into_series())
-                    }
-                    Err(e) => {
-                        // return error information
-                        return Err(e);
-                    }
-                };
-
-                Ok(s)
-            }
-        }
-    };
-}
-impl_ufuncs!(apply_ufunc_f32, Float32Type, unsafe_from_ptr_f32);
-impl_ufuncs!(apply_ufunc_f64, Float64Type, unsafe_from_ptr_f64);
-impl_ufuncs!(apply_ufunc_u8, UInt8Type, unsafe_from_ptr_u8);
-impl_ufuncs!(apply_ufunc_u16, UInt16Type, unsafe_from_ptr_u16);
-impl_ufuncs!(apply_ufunc_u32, UInt32Type, unsafe_from_ptr_u32);
-impl_ufuncs!(apply_ufunc_u64, UInt64Type, unsafe_from_ptr_u64);
-impl_ufuncs!(apply_ufunc_i8, Int8Type, unsafe_from_ptr_i8);
-impl_ufuncs!(apply_ufunc_i16, Int16Type, unsafe_from_ptr_i16);
-impl_ufuncs!(apply_ufunc_i32, Int32Type, unsafe_from_ptr_i32);
-impl_ufuncs!(apply_ufunc_i64, Int64Type, unsafe_from_ptr_i64);
-
 macro_rules! impl_set_with_mask {
     ($name:ident, $native:ty, $cast:ident, $variant:ident) => {
-        fn $name(series: &Series, filter: &PySeries, value: Option<$native>) -> Result<Series> {
+        fn $name(
+            series: &Series,
+            filter: &PySeries,
+            value: Option<$native>,
+        ) -> PolarsResult<Series> {
             let mask = filter.series.bool()?;
             let ca = series.$cast()?;
             let new = ca.set(mask, value)?;
@@ -1546,38 +1317,6 @@ impl_set_with_mask!(set_with_mask_i16, i16, i16, Int16);
 impl_set_with_mask!(set_with_mask_i32, i32, i32, Int32);
 impl_set_with_mask!(set_with_mask_i64, i64, i64, Int64);
 impl_set_with_mask!(set_with_mask_bool, bool, bool, Boolean);
-
-macro_rules! impl_set_at_idx {
-    ($name:ident, $native:ty, $cast:ident, $variant:ident) => {
-        fn $name(series: &Series, idx: &[u32], value: Option<$native>) -> Result<Series> {
-            let ca = series.$cast()?;
-            let new = ca.set_at_idx(idx.iter().map(|idx| *idx as usize), value)?;
-            Ok(new.into_series())
-        }
-
-        #[pymethods]
-        impl PySeries {
-            pub fn $name(&self, idx: &PyArray1<u32>, value: Option<$native>) -> PyResult<Self> {
-                let idx = unsafe { idx.as_slice().unwrap() };
-                let series = $name(&self.series, &idx, value).map_err(PyPolarsErr::from)?;
-                Ok(Self::new(series))
-            }
-        }
-    };
-}
-
-impl_set_at_idx!(set_at_idx_str, &str, utf8, Utf8);
-impl_set_at_idx!(set_at_idx_f64, f64, f64, Float64);
-impl_set_at_idx!(set_at_idx_f32, f32, f32, Float32);
-impl_set_at_idx!(set_at_idx_u8, u8, u8, UInt8);
-impl_set_at_idx!(set_at_idx_u16, u16, u16, UInt16);
-impl_set_at_idx!(set_at_idx_u32, u32, u32, UInt32);
-impl_set_at_idx!(set_at_idx_u64, u64, u64, UInt64);
-impl_set_at_idx!(set_at_idx_i8, i8, i8, Int8);
-impl_set_at_idx!(set_at_idx_i16, i16, i16, Int16);
-impl_set_at_idx!(set_at_idx_i32, i32, i32, Int32);
-impl_set_at_idx!(set_at_idx_i64, i64, i64, Int64);
-impl_set_at_idx!(set_at_idx_bool, bool, bool, Boolean);
 
 macro_rules! impl_get {
     ($name:ident, $series_variant:ident, $type:ty) => {

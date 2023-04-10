@@ -1,6 +1,5 @@
 use super::*;
 use crate::prelude::*;
-
 pub type DateChunked = Logical<DateType, Int32Type>;
 
 impl From<Int32Chunked> for DateChunked {
@@ -20,11 +19,15 @@ impl LogicalType for DateChunked {
         &DataType::Date
     }
 
-    fn get_any_value(&self, i: usize) -> AnyValue<'_> {
-        self.0.get_any_value(i).into_date()
+    fn get_any_value(&self, i: usize) -> PolarsResult<AnyValue<'_>> {
+        self.0.get_any_value(i).map(|av| av.into_date())
     }
 
-    fn cast(&self, dtype: &DataType) -> Result<Series> {
+    unsafe fn get_any_value_unchecked(&self, i: usize) -> AnyValue<'_> {
+        self.0.get_any_value_unchecked(i).into_date()
+    }
+
+    fn cast(&self, dtype: &DataType) -> PolarsResult<Series> {
         use DataType::*;
         match (self.dtype(), dtype) {
             #[cfg(feature = "dtype-datetime")]
@@ -40,6 +43,9 @@ impl LogicalType for DateChunked {
                     .into_datetime(*tu, tz.clone())
                     .into_series())
             }
+            (Date, Time) => Ok(Int64Chunked::full(self.name(), 0i64, self.len())
+                .into_time()
+                .into_series()),
             _ => self.0.cast(dtype),
         }
     }

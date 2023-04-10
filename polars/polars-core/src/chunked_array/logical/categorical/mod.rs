@@ -4,10 +4,21 @@ mod merge;
 mod ops;
 pub mod stringcache;
 
+use bitflags::bitflags;
+pub use builder::*;
+pub(crate) use merge::*;
+pub(crate) use ops::{CategoricalTakeRandomGlobal, CategoricalTakeRandomLocal};
+use polars_utils::sync::SyncPtr;
+
 use super::*;
 use crate::prelude::*;
-pub use builder::*;
-pub(crate) use ops::{CategoricalTakeRandomGlobal, CategoricalTakeRandomLocal};
+
+bitflags! {
+    #[derive(Default)]
+    struct BitSettings: u8 {
+    const ORIGINAL = 0x01;
+    const LEXICAL_SORT = 0x02;
+}}
 
 #[derive(Clone)]
 pub struct CategoricalChunked {
@@ -15,7 +26,7 @@ pub struct CategoricalChunked {
     /// 1st bit: original local categorical
     ///             meaning that n_unique is the same as the cat map length
     /// 2nd bit: use lexical sorting
-    bit_settings: u8,
+    bit_settings: BitSettings,
 }
 
 impl CategoricalChunked {
@@ -52,10 +63,12 @@ impl CategoricalChunked {
         chunks: Vec<ArrayRef>,
         rev_map: RevMapping,
     ) -> Self {
-        let ca = UInt32Chunked::from_chunks(name, chunks);
+        let ca = unsafe { UInt32Chunked::from_chunks(name, chunks) };
         let mut logical = Logical::<UInt32Type, _>::new_logical::<CategoricalType>(ca);
         logical.2 = Some(DataType::Categorical(Some(Arc::new(rev_map))));
-        let bit_settings = 1u8;
+
+        let mut bit_settings = BitSettings::default();
+        bit_settings.insert(BitSettings::ORIGINAL);
         Self {
             logical,
             bit_settings,
@@ -64,26 +77,35 @@ impl CategoricalChunked {
 
     pub fn set_lexical_sorted(&mut self, toggle: bool) {
         if toggle {
-            self.bit_settings |= 1u8 << 1;
+            self.bit_settings.insert(BitSettings::LEXICAL_SORT);
         } else {
-            self.bit_settings &= !(1u8 << 1);
+            self.bit_settings.remove(BitSettings::LEXICAL_SORT);
         }
     }
 
     pub(crate) fn use_lexical_sort(&self) -> bool {
-        self.bit_settings & 1 << 1 != 0
+        self.bit_settings.contains(BitSettings::LEXICAL_SORT)
     }
 
-    pub(crate) fn from_cats_and_rev_map(idx: UInt32Chunked, rev_map: Arc<RevMapping>) -> Self {
+    /// Create a [`CategoricalChunked`] from an array of `idx` and an existing [`RevMapping`]:  `rev_map`.
+    ///
+    /// # Safety
+    /// Invariant in `v < rev_map.len() for v in idx` must be hold.
+    pub unsafe fn from_cats_and_rev_map_unchecked(
+        idx: UInt32Chunked,
+        rev_map: Arc<RevMapping>,
+    ) -> Self {
         let mut logical = Logical::<UInt32Type, _>::new_logical::<CategoricalType>(idx);
         logical.2 = Some(DataType::Categorical(Some(rev_map)));
         Self {
             logical,
-            bit_settings: 0,
+            bit_settings: Default::default(),
         }
     }
 
-    pub(crate) fn set_rev_map(&mut self, rev_map: Arc<RevMapping>, keep_fast_unique: bool) {
+    /// # Safety
+    /// The existing index values must be in bounds of the new [`RevMapping`].
+    pub(crate) unsafe fn set_rev_map(&mut self, rev_map: Arc<RevMapping>, keep_fast_unique: bool) {
         self.logical.2 = Some(DataType::Categorical(Some(rev_map)));
         if !keep_fast_unique {
             self.set_fast_unique(false)
@@ -91,14 +113,14 @@ impl CategoricalChunked {
     }
 
     pub(crate) fn can_fast_unique(&self) -> bool {
-        self.bit_settings & 1 << 0 != 0 && self.logical.chunks.len() == 1
+        self.bit_settings.contains(BitSettings::ORIGINAL) && self.logical.chunks.len() == 1
     }
 
     pub(crate) fn set_fast_unique(&mut self, can: bool) {
         if can {
-            self.bit_settings |= 1u8 << 0;
+            self.bit_settings.insert(BitSettings::ORIGINAL);
         } else {
-            self.bit_settings &= !(1u8 << 0);
+            self.bit_settings.remove(BitSettings::ORIGINAL);
         }
     }
 
@@ -126,14 +148,19 @@ impl LogicalType for CategoricalChunked {
         self.logical.2.as_ref().unwrap()
     }
 
-    fn get_any_value(&self, i: usize) -> AnyValue<'_> {
-        match self.logical.0.get(i) {
-            Some(i) => AnyValue::Categorical(i, self.get_rev_map()),
+    fn get_any_value(&self, i: usize) -> PolarsResult<AnyValue<'_>> {
+        polars_ensure!(i < self.len(), oob = i, self.len());
+        Ok(unsafe { self.get_any_value_unchecked(i) })
+    }
+
+    unsafe fn get_any_value_unchecked(&self, i: usize) -> AnyValue<'_> {
+        match self.logical.0.get_unchecked(i) {
+            Some(i) => AnyValue::Categorical(i, self.get_rev_map(), SyncPtr::new_null()),
             None => AnyValue::Null,
         }
     }
 
-    fn cast(&self, dtype: &DataType) -> Result<Series> {
+    fn cast(&self, dtype: &DataType) -> PolarsResult<Series> {
         match dtype {
             DataType::Utf8 => {
                 let mapping = &**self.get_rev_map();
@@ -157,8 +184,9 @@ impl LogicalType for CategoricalChunked {
                 Ok(ca.into_series())
             }
             DataType::UInt32 => {
-                let ca =
-                    UInt32Chunked::from_chunks(self.logical.name(), self.logical.chunks.clone());
+                let ca = unsafe {
+                    UInt32Chunked::from_chunks(self.logical.name(), self.logical.chunks.clone())
+                };
                 Ok(ca.into_series())
             }
             #[cfg(feature = "dtype-categorical")]
@@ -197,12 +225,13 @@ impl<'a> ExactSizeIterator for CatIter<'a> {}
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::{reset_string_cache, toggle_string_cache, SINGLE_LOCK};
     use std::convert::TryFrom;
 
+    use super::*;
+    use crate::{enable_string_cache, reset_string_cache, SINGLE_LOCK};
+
     #[test]
-    fn test_categorical_round_trip() -> Result<()> {
+    fn test_categorical_round_trip() -> PolarsResult<()> {
         let _lock = SINGLE_LOCK.lock();
         reset_string_cache();
         let slice = &[
@@ -230,7 +259,7 @@ mod test {
     fn test_append_categorical() {
         let _lock = SINGLE_LOCK.lock();
         reset_string_cache();
-        toggle_string_cache(true);
+        enable_string_cache(true);
 
         let mut s1 = Series::new("1", vec!["a", "b", "c"])
             .cast(&DataType::Categorical(None))
@@ -239,10 +268,10 @@ mod test {
             .cast(&DataType::Categorical(None))
             .unwrap();
         let appended = s1.append(&s2).unwrap();
-        assert_eq!(appended.str_value(0), "a");
-        assert_eq!(appended.str_value(1), "b");
-        assert_eq!(appended.str_value(4), "x");
-        assert_eq!(appended.str_value(5), "y");
+        assert_eq!(appended.str_value(0).unwrap(), "a");
+        assert_eq!(appended.str_value(1).unwrap(), "b");
+        assert_eq!(appended.str_value(4).unwrap(), "x");
+        assert_eq!(appended.str_value(5).unwrap(), "y");
     }
 
     #[test]
@@ -261,10 +290,10 @@ mod test {
     }
 
     #[test]
-    fn test_categorical_flow() -> Result<()> {
+    fn test_categorical_flow() -> PolarsResult<()> {
         let _lock = SINGLE_LOCK.lock();
         reset_string_cache();
-        toggle_string_cache(false);
+        enable_string_cache(false);
 
         // tests several things that may loose the dtype information
         let s = Series::new("a", vec!["a", "b", "c"]).cast(&DataType::Categorical(None))?;
@@ -274,17 +303,17 @@ mod test {
             Field::new("a", DataType::Categorical(None))
         );
         assert!(matches!(
-            s.get(0),
-            AnyValue::Categorical(0, RevMapping::Local(_))
+            s.get(0)?,
+            AnyValue::Categorical(0, RevMapping::Local(_), _)
         ));
 
         let groups = s.group_tuples(false, true);
-        let aggregated = unsafe { s.agg_list(&groups) };
-        match aggregated.get(0) {
+        let aggregated = unsafe { s.agg_list(&groups?) };
+        match aggregated.get(0)? {
             AnyValue::List(s) => {
                 assert!(matches!(s.dtype(), DataType::Categorical(_)));
                 let str_s = s.cast(&DataType::Utf8).unwrap();
-                assert_eq!(str_s.get(0), AnyValue::Utf8("a"));
+                assert_eq!(str_s.get(0)?, AnyValue::Utf8("a"));
                 assert_eq!(s.len(), 1);
             }
             _ => panic!(),

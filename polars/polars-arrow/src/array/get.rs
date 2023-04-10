@@ -1,8 +1,7 @@
+use arrow::array::{Array, BinaryArray, BooleanArray, ListArray, PrimitiveArray, Utf8Array};
+use arrow::types::NativeType;
+
 use crate::is_valid::IsValid;
-use arrow::{
-    array::{Array, BooleanArray, ListArray, PrimitiveArray, Utf8Array},
-    types::NativeType,
-};
 
 pub trait ArrowGetItem {
     type Item;
@@ -28,6 +27,7 @@ impl<T: NativeType> ArrowGetItem for PrimitiveArray<T> {
 
     #[inline]
     unsafe fn get_unchecked(&self, item: usize) -> Option<Self::Item> {
+        debug_assert!(item < self.len());
         if self.is_null_unchecked(item) {
             None
         } else {
@@ -50,6 +50,7 @@ impl ArrowGetItem for BooleanArray {
 
     #[inline]
     unsafe fn get_unchecked(&self, item: usize) -> Option<Self::Item> {
+        debug_assert!(item < self.len());
         if self.is_null_unchecked(item) {
             None
         } else {
@@ -72,6 +73,30 @@ impl<'a> ArrowGetItem for &'a Utf8Array<i64> {
 
     #[inline]
     unsafe fn get_unchecked(&self, item: usize) -> Option<Self::Item> {
+        debug_assert!(item < self.len());
+        if self.is_null_unchecked(item) {
+            None
+        } else {
+            Some(self.value_unchecked(item))
+        }
+    }
+}
+
+impl<'a> ArrowGetItem for &'a BinaryArray<i64> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn get(&self, item: usize) -> Option<Self::Item> {
+        if item >= self.len() {
+            None
+        } else {
+            unsafe { self.get_unchecked(item) }
+        }
+    }
+
+    #[inline]
+    unsafe fn get_unchecked(&self, item: usize) -> Option<Self::Item> {
+        debug_assert!(item < self.len());
         if self.is_null_unchecked(item) {
             None
         } else {
@@ -85,6 +110,7 @@ impl ArrowGetItem for ListArray<i64> {
 
     #[inline]
     fn get(&self, item: usize) -> Option<Self::Item> {
+        debug_assert!(item < self.len());
         if item >= self.len() {
             None
         } else {
@@ -94,6 +120,7 @@ impl ArrowGetItem for ListArray<i64> {
 
     #[inline]
     unsafe fn get_unchecked(&self, item: usize) -> Option<Self::Item> {
+        debug_assert!(item < self.len());
         if self.is_null_unchecked(item) {
             None
         } else {

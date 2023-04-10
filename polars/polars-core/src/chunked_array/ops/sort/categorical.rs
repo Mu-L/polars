@@ -12,12 +12,12 @@ fn sort_with_nulls<T: PartialOrd>(a: &Option<T>, b: &Option<T>) -> Ordering {
 }
 
 /// Default sorting nulls
-pub fn order_default_null<T: PartialOrd>(a: &Option<T>, b: &Option<T>) -> Ordering {
+pub fn order_ascending_null<T: PartialOrd>(a: &Option<T>, b: &Option<T>) -> Ordering {
     sort_with_nulls(a, b)
 }
 
 /// Default sorting nulls
-pub fn order_reverse_null<T: PartialOrd>(a: &Option<T>, b: &Option<T>) -> Ordering {
+pub fn order_descending_null<T: PartialOrd>(a: &Option<T>, b: &Option<T>) -> Ordering {
     sort_with_nulls(b, a)
 }
 
@@ -34,14 +34,18 @@ impl CategoricalChunked {
                 RevMapping::Local(arr) => {
                     // we don't use arrow2 sort here because its not activated
                     // that saves compilation
-                    let ca = Utf8Chunked::from_chunks("", vec![Box::from(arr.clone())]);
+                    let ca = unsafe { Utf8Chunked::from_chunks("", vec![Box::from(arr.clone())]) };
                     let sorted = ca.sort(options.descending);
                     let arr = sorted.downcast_iter().next().unwrap().clone();
                     let rev_map = RevMapping::Local(arr);
-                    CategoricalChunked::from_cats_and_rev_map(
-                        self.logical().clone(),
-                        Arc::new(rev_map),
-                    )
+                    // safety:
+                    // we only reordered the indexes so we are still in bounds
+                    unsafe {
+                        CategoricalChunked::from_cats_and_rev_map_unchecked(
+                            self.logical().clone(),
+                            Arc::new(rev_map),
+                        )
+                    }
                 }
                 RevMapping::Global(_, _, _) => {
                     // a global rev map must always point to the same string values
@@ -53,40 +57,56 @@ impl CategoricalChunked {
                         .zip(self.iter_str())
                         .collect_trusted::<Vec<_>>();
 
-                    argsort_branch(
+                    arg_sort_branch(
                         vals.as_mut_slice(),
                         options.descending,
-                        |(_, a), (_, b)| order_default_null(a, b),
-                        |(_, a), (_, b)| order_reverse_null(a, b),
+                        |(_, a), (_, b)| order_ascending_null(a, b),
+                        |(_, a), (_, b)| order_descending_null(a, b),
+                        options.multithreaded,
                     );
                     let cats: NoNull<UInt32Chunked> =
                         vals.into_iter().map(|(idx, _v)| idx).collect_trusted();
-                    CategoricalChunked::from_cats_and_rev_map(
-                        cats.into_inner(),
-                        self.get_rev_map().clone(),
-                    )
+                    let mut cats = cats.into_inner();
+                    cats.rename(self.name());
+
+                    // safety:
+                    // we only reordered the indexes so we are still in bounds
+                    unsafe {
+                        CategoricalChunked::from_cats_and_rev_map_unchecked(
+                            cats,
+                            self.get_rev_map().clone(),
+                        )
+                    }
                 }
             }
         } else {
             let cats = self.logical().sort_with(options);
-            CategoricalChunked::from_cats_and_rev_map(cats, self.get_rev_map().clone())
+            // safety:
+            // we only reordered the indexes so we are still in bounds
+            unsafe {
+                CategoricalChunked::from_cats_and_rev_map_unchecked(
+                    cats,
+                    self.get_rev_map().clone(),
+                )
+            }
         }
     }
 
     /// Returned a sorted `ChunkedArray`.
     #[must_use]
-    pub fn sort(&self, reverse: bool) -> CategoricalChunked {
+    pub fn sort(&self, descending: bool) -> CategoricalChunked {
         self.sort_with(SortOptions {
             nulls_last: false,
-            descending: reverse,
+            descending,
+            multithreaded: true,
         })
     }
 
     /// Retrieve the indexes needed to sort this array.
-    pub fn argsort(&self, options: SortOptions) -> IdxCa {
+    pub fn arg_sort(&self, options: SortOptions) -> IdxCa {
         if self.use_lexical_sort() {
             let iters = [self.iter_str()];
-            argsort::argsort(
+            arg_sort::arg_sort(
                 self.name(),
                 iters,
                 options,
@@ -94,15 +114,19 @@ impl CategoricalChunked {
                 self.len(),
             )
         } else {
-            self.logical().argsort(options)
+            self.logical().arg_sort(options)
         }
     }
 
     /// Retrieve the indexes need to sort this and the other arrays.
-    #[cfg(feature = "sort_multiple")]
-    pub(crate) fn argsort_multiple(&self, other: &[Series], reverse: &[bool]) -> Result<IdxCa> {
+
+    pub(crate) fn arg_sort_multiple(
+        &self,
+        other: &[Series],
+        descending: &[bool],
+    ) -> PolarsResult<IdxCa> {
         if self.use_lexical_sort() {
-            args_validate(self.logical(), other, reverse)?;
+            args_validate(self.logical(), other, descending)?;
             let mut count: IdxSize = 0;
             let vals: Vec<_> = self
                 .iter_str()
@@ -113,9 +137,9 @@ impl CategoricalChunked {
                 })
                 .collect_trusted();
 
-            argsort_multiple_impl(vals, other, reverse)
+            arg_sort_multiple_impl(vals, other, descending)
         } else {
-            self.logical().argsort_multiple(other, reverse)
+            self.logical().arg_sort_multiple(other, descending)
         }
     }
 }
@@ -123,7 +147,7 @@ impl CategoricalChunked {
 #[cfg(test)]
 mod test {
     use crate::prelude::*;
-    use crate::{toggle_string_cache, SINGLE_LOCK};
+    use crate::{enable_string_cache, reset_string_cache, SINGLE_LOCK};
 
     fn assert_order(ca: &CategoricalChunked, cmp: &[&str]) {
         let s = ca.cast(&DataType::Utf8).unwrap();
@@ -132,12 +156,13 @@ mod test {
     }
 
     #[test]
-    fn test_cat_lexical_sort() -> Result<()> {
+    fn test_cat_lexical_sort() -> PolarsResult<()> {
         let init = &["c", "b", "a", "d"];
 
         let _lock = SINGLE_LOCK.lock();
         for toggle in [true, false] {
-            toggle_string_cache(toggle);
+            reset_string_cache();
+            enable_string_cache(toggle);
             let s = Series::new("", init).cast(&DataType::Categorical(None))?;
             let ca = s.categorical()?;
             let mut ca_lexical = ca.clone();
@@ -148,7 +173,7 @@ mod test {
             let out = ca.sort(false);
             assert_order(&out, init);
 
-            let out = ca_lexical.argsort(SortOptions {
+            let out = ca_lexical.arg_sort(SortOptions {
                 descending: false,
                 ..Default::default()
             });
@@ -159,29 +184,31 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "sort_multiple")]
-    fn test_cat_lexical_sort_multiple() -> Result<()> {
+
+    fn test_cat_lexical_sort_multiple() -> PolarsResult<()> {
         let init = &["c", "b", "a", "a"];
 
         let _lock = SINGLE_LOCK.lock();
-        for toggle in [true, false] {
-            toggle_string_cache(toggle);
+        for enable in [true, false] {
+            enable_string_cache(enable);
             let s = Series::new("", init).cast(&DataType::Categorical(None))?;
             let ca = s.categorical()?;
-            let mut ca_lexical = ca.clone();
+            let mut ca_lexical: CategoricalChunked = ca.clone();
             ca_lexical.set_lexical_sorted(true);
 
+            let series = ca_lexical.into_series();
+
             let df = df![
-                "cat" => &ca_lexical.into_series(),
+                "cat" => &series,
                 "vals" => [1, 1, 2, 2]
             ]?;
 
-            let out = df.sort(&["cat", "vals"], vec![false, false])?;
+            let out = df.sort(["cat", "vals"], vec![false, false])?;
             let out = out.column("cat")?;
             let cat = out.categorical()?;
             assert_order(cat, &["a", "a", "b", "c"]);
 
-            let out = df.sort(&["vals", "cat"], vec![false, false])?;
+            let out = df.sort(["vals", "cat"], vec![false, false])?;
             let out = out.column("cat")?;
             let cat = out.categorical()?;
             assert_order(cat, &["b", "c", "a", "a"]);

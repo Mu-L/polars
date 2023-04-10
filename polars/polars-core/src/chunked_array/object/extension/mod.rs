@@ -2,12 +2,17 @@ pub(crate) mod drop;
 mod list;
 pub(crate) mod polars_extension;
 
-use crate::{prelude::*, PROCESS_ID};
+use std::mem;
+
 use arrow::array::{Array, FixedSizeBinaryArray};
 use arrow::bitmap::MutableBitmap;
 use arrow::buffer::Buffer;
 use polars_extension::PolarsExtension;
-use std::mem;
+
+use crate::prelude::*;
+use crate::PROCESS_ID;
+
+pub const EXTENSION_NAME: &str = "POLARS_EXTENSION_TYPE";
 
 /// Invariants
 /// `ptr` must point to start a `T` allocation
@@ -17,7 +22,7 @@ unsafe fn create_drop<T: Sized>(mut ptr: *const u8, n_t_vals: usize) -> Box<dyn 
         let t_size = std::mem::size_of::<T>() as isize;
         for _ in 0..n_t_vals {
             let _ = std::ptr::read_unaligned(ptr as *const T);
-            ptr = ptr.offset(t_size as isize)
+            ptr = ptr.offset(t_size)
         }
     })
 }
@@ -53,10 +58,7 @@ pub(crate) fn create_extension<
 ) -> PolarsExtension {
     let env = "POLARS_ALLOW_EXTENSION";
     std::env::var(env).unwrap_or_else(|_| {
-        panic!(
-            "env var: {} must be set to allow extension types to be created",
-            env
-        )
+        panic!("env var: {env} must be set to allow extension types to be created",)
     });
     let t_size = std::mem::size_of::<T>();
     let t_alignment = std::mem::align_of::<T>();
@@ -97,7 +99,7 @@ pub(crate) fn create_extension<
     // they can be forgotten
     let buf: Buffer<u8> = buf.into();
     let len = buf.len() - n_padding;
-    let buf = buf.slice(n_padding, len);
+    let buf = buf.sliced(n_padding, len);
 
     // ptr to start of T, not to start of padding
     let ptr = buf.as_slice().as_ptr();
@@ -115,11 +117,8 @@ pub(crate) fn create_extension<
     let metadata = format!("{};{}", *PROCESS_ID, et_ptr as usize);
 
     let physical_type = ArrowDataType::FixedSizeBinary(t_size);
-    let extension_type = ArrowDataType::Extension(
-        "POLARS_EXTENSION_TYPE".into(),
-        physical_type.into(),
-        Some(metadata),
-    );
+    let extension_type =
+        ArrowDataType::Extension(EXTENSION_NAME.into(), physical_type.into(), Some(metadata));
     // first freeze, otherwise we compute null
     let validity = if null_count > 0 {
         Some(validity.into())
@@ -127,7 +126,7 @@ pub(crate) fn create_extension<
         None
     };
 
-    let array = FixedSizeBinaryArray::from_data(extension_type, buf, validity);
+    let array = FixedSizeBinaryArray::new(extension_type, buf, validity);
 
     // Safety:
     // we just heap allocated the ExtensionSentinel, so its alive.
@@ -136,8 +135,9 @@ pub(crate) fn create_extension<
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use std::fmt::{Display, Formatter};
+
+    use super::*;
 
     #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
     struct Foo {

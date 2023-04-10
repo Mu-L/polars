@@ -1,21 +1,22 @@
 //! Patterns are grouped together by order of month, day, year. This is to prevent
 //! parsing different orders of dates in a single column.
 
+use chrono::FixedOffset;
+
 pub(super) static DATE_D_M_Y: &[&str] = &[
     // 8-Jul-2001
-    "%v",       // 31-12-2021
-    "%d-%m-%Y", // 31-12-21
-    "%d-%m-%y", // 31_12_2021
-    "%d_%m_%Y", // 31_12_21
-    "%d_%m_%y",
+    "%v",       // 8-Jul-2001
+    "%d-%m-%Y", // 31-12-2021
+    "%d_%m_%Y", // 31_12_2021
+    "%d/%m/%Y", // 31/12/2021
 ];
 
 pub(super) static DATE_Y_M_D: &[&str] = &[
-    // 2021-12-31
-    "%Y-%m-%d", // 21-12-21
-    "%y-%m-%d", // 2021_12_31
-    "%Y_%m_%d", // 21_12_21
-    "%y_%m_%d",
+    // 31-Dec-2021
+    "%Y/%m/%d", // 2021/12/31
+    "%Y-%m-%d", // 2021-12-31
+    "%Y%m%d",   // 20211231
+    "%Y_%m_%d", // 2021_12_31
 ];
 
 /// NOTE: don't use single letter dates like %F
@@ -24,7 +25,7 @@ pub(super) static DATETIME_D_M_Y: &[&str] = &[
     // --
     // supported by polars' parser
     // ---
-    // 31/12/21 12:54:98
+    // 31/12/21 12:54:48
     "%d/%m/%y %H:%M:%S",
     // 31-12-2021 24:58:01
     "%d-%m-%Y %H:%M:%S",
@@ -44,47 +45,169 @@ pub(super) static DATETIME_D_M_Y: &[&str] = &[
     // no times
     "%d-%m-%Y",
     "%d-%m-%y",
+    // 31/12/2021 11:54:48 PM
+    "%d/%m/%Y %I:%M:%S %p",
+    "%d-%m-%Y %I:%M:%S %p",
+    // 31/12/2021 11:54 PM
+    "%d/%m/%Y %I:%M %p",
+    "%d-%m-%Y %I:%M %p",
 ];
 
 /// NOTE: don't use single letter dates like %F
 /// polars parsers does not support them, so it will be slower
 pub(super) static DATETIME_Y_M_D: &[&str] = &[
-    // 21/12/31 12:54:98
-    "%y/%m/%d %H:%M:%S",
-    // 2021-12-31 24:58:01
-    "%Y-%m-%d %H:%M:%S",
-    // 21/12/31 24:58:01
-    "%y/%m/%d %H:%M:%S",
-    //210319 23:58:50
-    "%y%m%d %H:%M:%S",
-    // 2019-04-18T02:45:55
-    // 2021/12/31 12:54:98
-    "%Y/%m/%d %H:%M:%S",
-    // 2021-12-31 24:58:01
-    "%Y-%m-%d %H:%M:%S",
-    // 2021/12/31 24:58:01
-    "%Y/%m/%d %H:%M:%S",
-    // 20210319 23:58:50
-    "%Y%m%d %H:%M:%S",
-    // 2019-04-18T02:45:55
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%dT%H:%M:%SZ",
-    // 2019-04-18T02:45:55.555000000
-    // microseconds
-    "%Y-%m-%dT%H:%M:%S.%6f",
-    // nanoseconds
-    "%Y-%m-%dT%H:%M:%S.%9f",
-    "%Y-%m-%dT%H:%M:%S.%3f",
-    // no times
-    "%Y-%m-%d",
-    "%Y/%m/%d",
-    // --
-    // not supported by polars' parser
     // ---
-    "%+",
+    // ISO8601-like, generated via the `iso8601_format_datetime` test fixture
+    // ---
+    "%Y/%m/%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y%m%dT%H:%M:%S",
+    "%Y/%m/%dT%H%M%S",
+    "%Y-%m-%dT%H%M%S",
+    "%Y%m%dT%H%M%S",
+    "%Y/%m/%dT%H:%M",
+    "%Y-%m-%dT%H:%M",
+    "%Y%m%dT%H:%M",
+    "%Y/%m/%dT%H%M",
+    "%Y-%m-%dT%H%M",
+    "%Y%m%dT%H%M",
+    "%Y/%m/%dT%H:%M:%S.%9f",
+    "%Y-%m-%dT%H:%M:%S.%9f",
+    "%Y%m%dT%H:%M:%S.%9f",
+    "%Y/%m/%dT%H:%M:%S.%6f",
+    "%Y-%m-%dT%H:%M:%S.%6f",
+    "%Y%m%dT%H:%M:%S.%6f",
+    "%Y/%m/%dT%H:%M:%S.%3f",
+    "%Y-%m-%dT%H:%M:%S.%3f",
+    "%Y%m%dT%H:%M:%S.%3f",
+    "%Y/%m/%dT%H%M%S.%9f",
+    "%Y-%m-%dT%H%M%S.%9f",
+    "%Y%m%dT%H%M%S.%9f",
+    "%Y/%m/%dT%H%M%S.%6f",
+    "%Y-%m-%dT%H%M%S.%6f",
+    "%Y%m%dT%H%M%S.%6f",
+    "%Y/%m/%dT%H%M%S.%3f",
+    "%Y-%m-%dT%H%M%S.%3f",
+    "%Y%m%dT%H%M%S.%3f",
+    "%Y/%m/%d",
+    "%Y-%m-%d",
+    "%Y%m%d",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y%m%d %H:%M:%S",
+    "%Y/%m/%d %H%M%S",
+    "%Y-%m-%d %H%M%S",
+    "%Y%m%d %H%M%S",
+    "%Y/%m/%d %H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y%m%d %H:%M",
+    "%Y/%m/%d %H%M",
+    "%Y-%m-%d %H%M",
+    "%Y%m%d %H%M",
+    "%Y/%m/%d %H:%M:%S.%9f",
+    "%Y-%m-%d %H:%M:%S.%9f",
+    "%Y%m%d %H:%M:%S.%9f",
+    "%Y/%m/%d %H:%M:%S.%6f",
+    "%Y-%m-%d %H:%M:%S.%6f",
+    "%Y%m%d %H:%M:%S.%6f",
+    "%Y/%m/%d %H:%M:%S.%3f",
+    "%Y-%m-%d %H:%M:%S.%3f",
+    "%Y%m%d %H:%M:%S.%3f",
+    "%Y/%m/%d %H%M%S.%9f",
+    "%Y-%m-%d %H%M%S.%9f",
+    "%Y%m%d %H%M%S.%9f",
+    "%Y/%m/%d %H%M%S.%6f",
+    "%Y-%m-%d %H%M%S.%6f",
+    "%Y%m%d %H%M%S.%6f",
+    "%Y/%m/%d %H%M%S.%3f",
+    "%Y-%m-%d %H%M%S.%3f",
+    "%Y%m%d %H%M%S.%3f",
+    // ---
+    // other
+    // ---
+    // 21/12/31 12:54:48
+    "%y/%m/%d %H:%M:%S",
+    // 21/12/31 24:58:01
+    "%y%m%d %H:%M:%S",
+    // 2021/12/31 11:54:48 PM
+    "%Y/%m/%d %I:%M:%S %p",
+    "%Y-%m-%d %I:%M:%S %p",
+    // 2021/12/31 11:54 PM
+    "%Y/%m/%d %I:%M %p",
+    "%Y-%m-%d %I:%M %p",
+    // ---
     // we cannot know this one, because polars needs to know
     // the length of the parsed fmt
+    // ---
     "%FT%H:%M:%S%.f",
+];
+
+pub(super) static DATETIME_Y_M_D_Z: &[&str] = &[
+    // ---
+    // ISO8601-like, generated via the `iso8601_tz_aware_format_datetime` test fixture
+    // ---
+    "%Y/%m/%dT%H:%M:%S%#z",
+    "%Y-%m-%dT%H:%M:%S%#z",
+    "%Y%m%dT%H:%M:%S%#z",
+    "%Y/%m/%dT%H%M%S%#z",
+    "%Y-%m-%dT%H%M%S%#z",
+    "%Y%m%dT%H%M%S%#z",
+    "%Y/%m/%dT%H:%M%#z",
+    "%Y-%m-%dT%H:%M%#z",
+    "%Y%m%dT%H:%M%#z",
+    "%Y/%m/%dT%H%M%#z",
+    "%Y-%m-%dT%H%M%#z",
+    "%Y%m%dT%H%M%#z",
+    "%Y/%m/%dT%H:%M:%S.%9f%#z",
+    "%Y-%m-%dT%H:%M:%S.%9f%#z",
+    "%Y%m%dT%H:%M:%S.%9f%#z",
+    "%Y/%m/%dT%H:%M:%S.%6f%#z",
+    "%Y-%m-%dT%H:%M:%S.%6f%#z",
+    "%Y%m%dT%H:%M:%S.%6f%#z",
+    "%Y/%m/%dT%H:%M:%S.%3f%#z",
+    "%Y-%m-%dT%H:%M:%S.%3f%#z",
+    "%Y%m%dT%H:%M:%S.%3f%#z",
+    "%Y/%m/%dT%H%M%S.%9f%#z",
+    "%Y-%m-%dT%H%M%S.%9f%#z",
+    "%Y%m%dT%H%M%S.%9f%#z",
+    "%Y/%m/%dT%H%M%S.%6f%#z",
+    "%Y-%m-%dT%H%M%S.%6f%#z",
+    "%Y%m%dT%H%M%S.%6f%#z",
+    "%Y/%m/%dT%H%M%S.%3f%#z",
+    "%Y-%m-%dT%H%M%S.%3f%#z",
+    "%Y%m%dT%H%M%S.%3f%#z",
+    "%Y/%m/%d %H:%M:%S%#z",
+    "%Y-%m-%d %H:%M:%S%#z",
+    "%Y%m%d %H:%M:%S%#z",
+    "%Y/%m/%d %H%M%S%#z",
+    "%Y-%m-%d %H%M%S%#z",
+    "%Y%m%d %H%M%S%#z",
+    "%Y/%m/%d %H:%M%#z",
+    "%Y-%m-%d %H:%M%#z",
+    "%Y%m%d %H:%M%#z",
+    "%Y/%m/%d %H%M%#z",
+    "%Y-%m-%d %H%M%#z",
+    "%Y%m%d %H%M%#z",
+    "%Y/%m/%d %H:%M:%S.%9f%#z",
+    "%Y-%m-%d %H:%M:%S.%9f%#z",
+    "%Y%m%d %H:%M:%S.%9f%#z",
+    "%Y/%m/%d %H:%M:%S.%6f%#z",
+    "%Y-%m-%d %H:%M:%S.%6f%#z",
+    "%Y%m%d %H:%M:%S.%6f%#z",
+    "%Y/%m/%d %H:%M:%S.%3f%#z",
+    "%Y-%m-%d %H:%M:%S.%3f%#z",
+    "%Y%m%d %H:%M:%S.%3f%#z",
+    "%Y/%m/%d %H%M%S.%9f%#z",
+    "%Y-%m-%d %H%M%S.%9f%#z",
+    "%Y%m%d %H%M%S.%9f%#z",
+    "%Y/%m/%d %H%M%S.%6f%#z",
+    "%Y-%m-%d %H%M%S.%6f%#z",
+    "%Y%m%d %H%M%S.%6f%#z",
+    "%Y/%m/%d %H%M%S.%3f%#z",
+    "%Y-%m-%d %H%M%S.%3f%#z",
+    "%Y%m%d %H%M%S.%3f%#z",
+    // other
+    "%+",
 ];
 
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
@@ -93,4 +216,10 @@ pub enum Pattern {
     DateYMD,
     DatetimeYMD,
     DatetimeDMY,
+    DatetimeYMDZ,
+}
+
+pub struct PatternWithOffset {
+    pub pattern: Pattern,
+    pub offset: Option<FixedOffset>,
 }

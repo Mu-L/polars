@@ -1,11 +1,5 @@
 use super::*;
 
-fn get_arenas() -> (Arena<AExpr>, Arena<ALogicalPlan>) {
-    let expr_arena = Arena::with_capacity(16);
-    let lp_arena = Arena::with_capacity(8);
-    (expr_arena, lp_arena)
-}
-
 pub(crate) fn row_count_at_scan(q: LazyFrame) -> bool {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
@@ -78,7 +72,7 @@ fn slice_at_scan(q: LazyFrame) -> bool {
 }
 
 #[test]
-fn test_pred_pd_1() -> Result<()> {
+fn test_pred_pd_1() -> PolarsResult<()> {
     let df = fruits_cars();
 
     let q = df
@@ -116,7 +110,7 @@ fn test_pred_pd_1() -> Result<()> {
 }
 
 #[test]
-fn test_no_left_join_pass() -> Result<()> {
+fn test_no_left_join_pass() -> PolarsResult<()> {
     let df1 = df![
         "foo" => ["abc", "def", "ghi"],
         "idx1" => [0, 0, 1],
@@ -143,7 +137,7 @@ fn test_no_left_join_pass() -> Result<()> {
 }
 
 #[test]
-pub fn test_simple_slice() -> Result<()> {
+pub fn test_simple_slice() -> PolarsResult<()> {
     let _guard = SINGLE_LOCK.lock().unwrap();
     let q = scan_foods_parquet(false).limit(3);
 
@@ -162,14 +156,17 @@ pub fn test_simple_slice() -> Result<()> {
 }
 
 #[test]
-pub fn test_slice_pushdown_join() -> Result<()> {
+#[cfg(feature = "cse")]
+pub fn test_slice_pushdown_join() -> PolarsResult<()> {
     let _guard = SINGLE_LOCK.lock().unwrap();
     let q1 = scan_foods_parquet(false).limit(3);
     let q2 = scan_foods_parquet(false);
 
     let q = q1
         .join(q2, [col("category")], [col("category")], JoinType::Left)
-        .slice(1, 3);
+        .slice(1, 3)
+        // this inserts a cache and blocks slice pushdown
+        .with_common_subplan_elimination(false);
     // test if optimization continued beyond the join node
     assert!(slice_at_scan(q.clone()));
 
@@ -190,7 +187,7 @@ pub fn test_slice_pushdown_join() -> Result<()> {
 }
 
 #[test]
-pub fn test_slice_pushdown_groupby() -> Result<()> {
+pub fn test_slice_pushdown_groupby() -> PolarsResult<()> {
     let _guard = SINGLE_LOCK.lock().unwrap();
     let q = scan_foods_parquet(false).limit(100);
 
@@ -219,7 +216,7 @@ pub fn test_slice_pushdown_groupby() -> Result<()> {
 }
 
 #[test]
-pub fn test_slice_pushdown_sort() -> Result<()> {
+pub fn test_slice_pushdown_sort() -> PolarsResult<()> {
     let _guard = SINGLE_LOCK.lock().unwrap();
     let q = scan_foods_parquet(false).limit(100);
 
@@ -246,7 +243,7 @@ pub fn test_slice_pushdown_sort() -> Result<()> {
 
 #[test]
 #[cfg(feature = "dtype-i16")]
-pub fn test_predicate_block_cast() -> Result<()> {
+pub fn test_predicate_block_cast() -> PolarsResult<()> {
     let df = df![
         "value" => [10, 20, 30, 40]
     ]?;
@@ -281,7 +278,7 @@ fn test_lazy_filter_and_rename() {
         .lazy()
         .rename(["a"], ["x"])
         .filter(col("x").map(
-            |s: Series| Ok(s.gt(3)?.into_series()),
+            |s: Series| Ok(Some(s.gt(3)?.into_series())),
             GetOutput::from_type(DataType::Boolean),
         ))
         .select([col("x")]);
@@ -294,7 +291,7 @@ fn test_lazy_filter_and_rename() {
 
     // now we check if the column is rename or added when we don't select
     let lf = df.lazy().rename(["a"], ["x"]).filter(col("x").map(
-        |s: Series| Ok(s.gt(3)?.into_series()),
+        |s: Series| Ok(Some(s.gt(3)?.into_series())),
         GetOutput::from_type(DataType::Boolean),
     ));
     // the rename function should not interfere with the predicate pushdown
@@ -304,7 +301,7 @@ fn test_lazy_filter_and_rename() {
 }
 
 #[test]
-fn test_with_row_count_opts() -> Result<()> {
+fn test_with_row_count_opts() -> PolarsResult<()> {
     let df = df![
         "a" => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     ]?;
@@ -380,7 +377,7 @@ fn test_with_row_count_opts() -> Result<()> {
 }
 
 #[test]
-fn test_groupby_ternary_literal_predicate() -> Result<()> {
+fn test_groupby_ternary_literal_predicate() -> PolarsResult<()> {
     let df = df![
         "a" => [1, 2, 3],
         "b" => [1, 2, 3]
@@ -423,5 +420,134 @@ fn test_groupby_ternary_literal_predicate() -> Result<()> {
         };
     }
 
+    Ok(())
+}
+
+#[cfg(all(feature = "concat_str", feature = "strings"))]
+#[test]
+fn test_string_addition_to_concat_str() -> PolarsResult<()> {
+    let df = df![
+        "a"=> ["a"],
+        "b"=> ["b"],
+    ]?;
+
+    let q = df
+        .lazy()
+        .select([lit("foo") + col("a") + col("b") + lit("bar")]);
+
+    let (mut expr_arena, mut lp_arena) = get_arenas();
+    let root = q.clone().optimize(&mut lp_arena, &mut expr_arena)?;
+    let lp = lp_arena.get(root);
+    let mut exprs = lp.get_exprs();
+    let expr_node = exprs.pop().unwrap();
+    if let AExpr::Function { input, .. } = expr_arena.get(expr_node) {
+        // the concat_str has the 4 expressions as input
+        assert_eq!(input.len(), 4);
+    } else {
+        panic!()
+    }
+
+    let out = q.collect()?;
+    let s = out.column("literal")?;
+    assert_eq!(s.get(0)?, AnyValue::Utf8("fooabbar"));
+
+    Ok(())
+}
+#[test]
+fn test_with_column_prune() -> PolarsResult<()> {
+    // don't
+    let df = df![
+        "c0" => [0],
+        "c1" => [0],
+        "c2" => [0],
+    ]?;
+    let (mut expr_arena, mut lp_arena) = get_arenas();
+
+    // only a single expression pruned and only one column selection
+    let q = df
+        .clone()
+        .lazy()
+        .with_columns([col("c0"), col("c1").alias("c4")])
+        .select([col("c1"), col("c4")]);
+    let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
+    (&lp_arena).iter(lp).for_each(|(_, lp)| {
+        use ALogicalPlan::*;
+        match lp {
+            DataFrameScan { projection, .. } => {
+                let projection = projection.as_ref().unwrap();
+                let projection = projection.as_slice();
+                assert_eq!(projection.len(), 1);
+                let name = &projection[0];
+                assert_eq!(name, "c1");
+            }
+            HStack { exprs, .. } => {
+                assert_eq!(exprs.len(), 1);
+            }
+            _ => {}
+        };
+    });
+
+    // whole `with_columns` pruned
+    let q = df.lazy().with_column(col("c0")).select([col("c1")]);
+
+    let lp = q.clone().optimize(&mut lp_arena, &mut expr_arena).unwrap();
+
+    // check if with_column is pruned
+    assert!((&lp_arena).iter(lp).all(|(_, lp)| {
+        use ALogicalPlan::*;
+        match lp {
+            ALogicalPlan::MapFunction {
+                function: FunctionNode::FastProjection { .. },
+                ..
+            }
+            | DataFrameScan { .. } => true,
+            _ => false,
+        }
+    }));
+    assert_eq!(
+        q.schema().unwrap().as_ref(),
+        &Schema::from([Field::new("c1", DataType::Int32)].into_iter())
+    );
+    Ok(())
+}
+
+#[test]
+fn test_slice_at_scan_groupby() -> PolarsResult<()> {
+    let ldf = scan_foods_csv();
+
+    // this tests if slice pushdown restarts aggregation nodes (it did not)
+    let q = ldf
+        .slice(0, 5)
+        .filter(col("calories").lt(lit(10)))
+        .groupby([col("calories")])
+        .agg([col("fats_g").first()])
+        .select([col("fats_g")]);
+
+    assert!(slice_at_scan(q));
+    Ok(())
+}
+
+#[test]
+fn test_flatten_unions() -> PolarsResult<()> {
+    let (mut expr_arena, mut lp_arena) = get_arenas();
+
+    let lf = df! {
+        "a" => [1,2,3,4,5],
+    }
+    .unwrap()
+    .lazy();
+
+    let lf2 = concat(&[lf.clone(), lf.clone()], false, true).unwrap();
+    let lf3 = concat(&[lf.clone(), lf.clone(), lf.clone()], false, true).unwrap();
+    let lf4 = concat(&[lf2.clone(), lf3], false, true).unwrap();
+    let root = lf4.optimize(&mut lp_arena, &mut expr_arena).unwrap();
+    let lp = lp_arena.get(root);
+    match lp {
+        ALogicalPlan::Union { inputs, .. } => {
+            // we make sure that the nested unions are flattened into a single union
+            assert_eq!(inputs.len(), 5);
+        }
+        _ => panic!(),
+    }
     Ok(())
 }

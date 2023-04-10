@@ -1,8 +1,10 @@
-use super::*;
-use crate::utils::get_iter_capacity;
-use arrow::bitmap::MutableBitmap;
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+use arrow::bitmap::MutableBitmap;
+
+use super::*;
+use crate::utils::get_iter_capacity;
 
 pub struct ObjectChunkedBuilder<T> {
     field: Field,
@@ -37,16 +39,12 @@ where
     }
 
     #[inline]
-    pub fn append_value_from_any(&mut self, v: &dyn Any) -> Result<()> {
-        match v.downcast_ref::<T>() {
-            None => Err(PolarsError::SchemaMisMatch(
-                "cannot downcast any in ObjectBuilder".into(),
-            )),
-            Some(v) => {
-                self.append_value(v.clone());
-                Ok(())
-            }
-        }
+    pub fn append_value_from_any(&mut self, v: &dyn Any) -> PolarsResult<()> {
+        let Some(v) = v.downcast_ref::<T>() else {
+            polars_bail!(SchemaMismatch: "cannot downcast any in ObjectBuilder");
+        };
+        self.append_value(v.clone());
+        Ok(())
     }
 
     #[inline]
@@ -72,8 +70,8 @@ where
             field: Arc::new(self.field),
             chunks: vec![arr],
             phantom: PhantomData,
-            categorical_map: None,
-            ..Default::default()
+            bit_settings: Default::default(),
+            length: len as IdxSize,
         }
     }
 }
@@ -125,7 +123,6 @@ where
     pub fn new_from_vec(name: &str, v: Vec<T>) -> Self {
         let field = Arc::new(Field::new(name, DataType::Object(T::type_name())));
         let len = v.len();
-
         let arr = Box::new(ObjectArray {
             values: Arc::new(v),
             null_bitmap: None,
@@ -137,8 +134,29 @@ where
             field,
             chunks: vec![arr],
             phantom: PhantomData,
-            categorical_map: None,
-            ..Default::default()
+            bit_settings: Default::default(),
+            length: len as IdxSize,
         }
     }
+
+    pub fn new_empty(name: &str) -> Self {
+        Self::new_from_vec(name, vec![])
+    }
+}
+
+/// Convert a Series of dtype object to an Arrow Array of FixedSizeBinary
+pub(crate) fn object_series_to_arrow_array(s: &Series) -> ArrayRef {
+    // The list builder knows how to create an arrow array
+    // we simply piggy back on that code.
+
+    // safety: 0..len is in bounds
+    let list_s = unsafe {
+        s.agg_list(&GroupsProxy::Slice {
+            groups: vec![[0, s.len() as IdxSize]],
+            rolling: false,
+        })
+    };
+    let arr = &list_s.chunks()[0];
+    let arr = arr.as_any().downcast_ref::<ListArray<i64>>().unwrap();
+    arr.values().to_boxed()
 }

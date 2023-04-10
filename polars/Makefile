@@ -1,10 +1,12 @@
+.DEFAULT_GOAL := help
+
 BASE ?= master
 
 .PHONY: fmt check check-features clippy clippy-default test test-doc integration-tests
 
 fmt:
 	cargo fmt --all
-	$(MAKE) -C .. fmt_toml
+	dprint fmt
 
 check:
 	cargo check --all-features \
@@ -13,6 +15,7 @@ check:
 	    -p polars-lazy \
 	    -p polars-arrow \
 	    -p polars-time \
+	    -p polars-error \
 	    -p polars-ops
 
 clippy:
@@ -23,13 +26,15 @@ clippy:
 	    -p polars-arrow \
 	    -p polars-utils \
 	    -p polars-ops \
+	    -p polars-error \
+	    -p polars-row \
 	    -p polars-time
 
 clippy-default:
 	cargo clippy
 
-test:
-	POLARS_MAX_THREADS=4 cargo t -p polars-core test_4_threads
+test:  ## Run tests
+	POLARS_NO_STREAMING_GROUPBY=1 POLARS_MAX_THREADS=4 cargo t -p polars-core test_4_threads
 	cargo test --all-features \
 	    -p polars-lazy \
 	    -p polars-io \
@@ -37,6 +42,7 @@ test:
 	    -p polars-arrow \
 	    -p polars-time \
 	    -p polars-utils \
+	    -p polars-row \
 	    -- \
 	    --test-threads=2
 
@@ -47,7 +53,7 @@ miri:
 	# not tested on all features because miri does not support SIMD
 	# some tests are also filtered, because miri cannot deal with the rayon threadpool
 	# we ignore leaks because the thread pool of rayon is never killed.
-	MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks" \
+	MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-disable-stacked-borrows" \
 	POLARS_ALLOW_EXTENSION=1 \
 	cargo miri test \
 	    --no-default-features \
@@ -63,7 +69,7 @@ test-doc:
 	    -p polars-core \
 	    -p polars-arrow
 
-pre-commit: fmt clippy clippy-default
+pre-commit: fmt clippy clippy-default  ## Run autoformatting and linting
 
 
 check-features:
@@ -86,17 +92,35 @@ doctest:
 	cargo doc --features=docs-selection -p polars
 
 publish:
+#	cargo publish --allow-dirty -p polars-error
+#	sleep 20
+#	cargo publish --allow-dirty -p polars-utils
+#	sleep 20
+#	cargo publish --allow-dirty -p polars-row
+#	sleep 20
 	cargo publish --allow-dirty -p polars-arrow
-	sleep 15
-	cargo publish --allow-dirty -p polars-utils
-	sleep 15
+	sleep 20
 	cargo publish --allow-dirty -p polars-core
-	sleep 15
-	cargo publish --allow-dirty -p polars-time
+	sleep 20
 	cargo publish --allow-dirty -p polars-ops
-	sleep 15
+	sleep 20
+	cargo publish --allow-dirty -p polars-time
+	sleep 20
 	cargo publish --allow-dirty -p polars-io
-	sleep 15
+	sleep 20
+	cargo publish --allow-dirty -p polars-plan
+	sleep 20
+	cargo publish --allow-dirty -p polars-pipe
+	sleep 20
 	cargo publish --allow-dirty -p polars-lazy
-	sleep 15
+	sleep 20
+	cargo publish --allow-dirty -p polars-algo
+	sleep 20
+	cargo publish --allow-dirty -p polars-sql
+	sleep 20
 	cargo publish --allow-dirty -p polars
+
+.PHONY: help
+help:  ## Display this help screen
+	@echo -e "\033[1mAvailable commands:\033[0m\n"
+	@grep -E '^[a-z.A-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' | sort

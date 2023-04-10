@@ -1,7 +1,7 @@
 use super::*;
 
 pub struct BooleanChunkedBuilder {
-    array_builder: MutableBooleanArray,
+    pub(crate) array_builder: MutableBooleanArray,
     field: Field,
 }
 
@@ -18,16 +18,16 @@ impl ChunkedBuilder<bool, BooleanType> for BooleanChunkedBuilder {
         self.array_builder.push(None);
     }
 
-    fn finish(self) -> BooleanChunked {
-        let arr: BooleanArray = self.array_builder.into();
-        let arr = Box::new(arr) as ArrayRef;
+    fn finish(mut self) -> BooleanChunked {
+        let arr = self.array_builder.as_box();
+        let length = arr.len() as IdxSize;
 
         ChunkedArray {
             field: Arc::new(self.field),
             chunks: vec![arr],
             phantom: PhantomData,
-            categorical_map: None,
-            ..Default::default()
+            bit_settings: Default::default(),
+            length,
         }
     }
 

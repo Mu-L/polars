@@ -1,7 +1,8 @@
-use super::*;
 use polars_arrow::export::arrow::temporal_conversions::{
     MICROSECONDS, MILLISECONDS, MILLISECONDS_IN_DAY, NANOSECONDS, SECONDS_IN_DAY,
 };
+
+use super::*;
 
 const NANOSECONDS_IN_MILLISECOND: i64 = 1_000_000;
 const SECONDS_IN_HOUR: i64 = 3600;
@@ -21,6 +22,9 @@ pub trait DurationMethods {
 
     /// Extract the milliseconds from a `Duration`
     fn milliseconds(&self) -> Int64Chunked;
+
+    /// Extract the microseconds from a `Duration`
+    fn microseconds(&self) -> Int64Chunked;
 
     /// Extract the nanoseconds from a `Duration`
     fn nanoseconds(&self) -> Int64Chunked;
@@ -68,7 +72,16 @@ impl DurationMethods for DurationChunked {
         match self.time_unit() {
             TimeUnit::Milliseconds => self.0.clone(),
             TimeUnit::Microseconds => self.0.clone() / 1000,
-            TimeUnit::Nanoseconds => &self.0 / 1_000_000,
+            TimeUnit::Nanoseconds => &self.0 / NANOSECONDS_IN_MILLISECOND,
+        }
+    }
+
+    /// Extract the microseconds from a `Duration`
+    fn microseconds(&self) -> Int64Chunked {
+        match self.time_unit() {
+            TimeUnit::Milliseconds => &self.0 * 1000,
+            TimeUnit::Microseconds => self.0.clone(),
+            TimeUnit::Nanoseconds => &self.0 / 1000,
         }
     }
 

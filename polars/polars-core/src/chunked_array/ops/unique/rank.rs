@@ -1,10 +1,11 @@
-use crate::prelude::*;
-
 use polars_arrow::prelude::FromData;
 #[cfg(feature = "random")]
 use rand::prelude::SliceRandom;
+use rand::prelude::*;
 #[cfg(feature = "random")]
-use rand::{rngs::SmallRng, thread_rng, SeedableRng};
+use rand::{rngs::SmallRng, SeedableRng};
+
+use crate::prelude::*;
 
 #[derive(Copy, Clone)]
 pub enum RankMethod {
@@ -33,7 +34,14 @@ impl Default for RankOptions {
     }
 }
 
-pub(crate) fn rank(s: &Series, method: RankMethod, reverse: bool) -> Series {
+#[cfg(feature = "random")]
+fn get_random_seed() -> u64 {
+    let mut rng = SmallRng::from_entropy();
+
+    rng.next_u64()
+}
+
+pub(crate) fn rank(s: &Series, method: RankMethod, descending: bool, seed: Option<u64>) -> Series {
     match s.len() {
         1 => {
             return match method {
@@ -50,25 +58,35 @@ pub(crate) fn rank(s: &Series, method: RankMethod, reverse: bool) -> Series {
         _ => {}
     }
 
-    // Currently, nulls tie with the minimum or maximum bound for a type, depending on reverse.
-    // TODO: Need to expose nulls_last in argsort to prevent this.
-    if s.has_validity() {
-        // Fill using MaxBound/MinBound to keep nulls first.
-        let null_strategy = if reverse {
-            FillNullStrategy::MaxBound
-        } else {
+    if s.null_count() > 0 {
+        let nulls = s.is_not_null().rechunk();
+        let arr = nulls.downcast_iter().next().unwrap();
+        let validity = arr.values();
+        // Currently, nulls tie with the minimum or maximum bound for a type, depending on descending.
+        // TODO: Need to expose nulls_last in arg_sort to prevent this.
+        // Fill using MaxBound/MinBound to give nulls last rank.
+        // we will replace them later.
+        let null_strategy = if descending {
             FillNullStrategy::MinBound
+        } else {
+            FillNullStrategy::MaxBound
         };
         let s = s.fill_null(null_strategy).unwrap();
-        return rank(&s, method, reverse);
+
+        let mut out = rank(&s, method, descending, seed);
+        unsafe {
+            let arr = &mut out.chunks_mut()[0];
+            *arr = arr.with_validity(Some(validity.clone()))
+        }
+        return out;
     }
 
     // See: https://github.com/scipy/scipy/blob/v1.7.1/scipy/stats/stats.py#L8631-L8737
 
     let len = s.len();
     let null_count = s.null_count();
-    let sort_idx_ca = s.argsort(SortOptions {
-        descending: reverse,
+    let sort_idx_ca = s.arg_sort(SortOptions {
+        descending,
         ..Default::default()
     });
     let sort_idx = sort_idx_ca.downcast_iter().next().unwrap().values();
@@ -116,7 +134,8 @@ pub(crate) fn rank(s: &Series, method: RankMethod, reverse: bool) -> Series {
             // Safety:
             // in bounds
             let arr = unsafe { s.take_unchecked(&sort_idx_ca).unwrap() };
-            let not_consecutive_same = (&arr.slice(1, len - 1))
+            let not_consecutive_same = arr
+                .slice(1, len - 1)
                 .not_equal(&arr.slice(0, len - 1))
                 .unwrap()
                 .rechunk();
@@ -140,11 +159,10 @@ pub(crate) fn rank(s: &Series, method: RankMethod, reverse: bool) -> Series {
 
             let mut sort_idx = sort_idx.to_vec();
 
-            let mut thread_rng = thread_rng();
-            let rng = &mut SmallRng::from_rng(&mut thread_rng).unwrap();
+            let rng = &mut SmallRng::seed_from_u64(seed.unwrap_or_else(get_random_seed));
 
             // Shuffle sort_idx positions which point to ties in the original series.
-            for i in 0..(ties_indices.len() - 1) as usize {
+            for i in 0..(ties_indices.len() - 1) {
                 let ties_index_start = ties_indices[i];
                 let ties_index_end = ties_indices[i + 1];
                 if ties_index_end - ties_index_start > 1 {
@@ -170,7 +188,8 @@ pub(crate) fn rank(s: &Series, method: RankMethod, reverse: bool) -> Series {
             // in bounds
             let arr = unsafe { s.take_unchecked(&sort_idx_ca).unwrap() };
             let validity = arr.chunks()[0].validity().cloned();
-            let not_consecutive_same = (&arr.slice(1, len - 1))
+            let not_consecutive_same = arr
+                .slice(1, len - 1)
                 .not_equal(&arr.slice(0, len - 1))
                 .unwrap()
                 .rechunk();
@@ -185,7 +204,19 @@ pub(crate) fn rank(s: &Series, method: RankMethod, reverse: bool) -> Series {
             //     if method == 'min':
             //         return count[dense - 1] + 1
             // ```
-            let mut cumsum: IdxSize = if let RankMethod::Min = method { 0 } else { 1 };
+            // INVALID LINT REMOVE LATER
+            #[allow(clippy::bool_to_int_with_if)]
+            let mut cumsum: IdxSize = if let RankMethod::Min = method {
+                0
+            } else {
+                // nulls will be first, rank, but we will replace them (with null)
+                // so this ensures the second rank will be 1
+                if matches!(method, RankMethod::Dense) && s.null_count() > 0 {
+                    0
+                } else {
+                    1
+                }
+            };
 
             dense.push(cumsum);
             obs.values_iter().for_each(|b| {
@@ -201,7 +232,25 @@ pub(crate) fn rank(s: &Series, method: RankMethod, reverse: bool) -> Series {
             let dense = unsafe { dense.take_unchecked((&inv_ca).into()) };
 
             if let RankMethod::Dense = method {
-                return dense.into_series();
+                return if s.null_count() == 0 {
+                    dense.into_series()
+                } else {
+                    // null will be the first rank
+                    // we restore original nulls and shift all ranks by one
+                    let validity = s.is_null().rechunk();
+                    let validity = validity.downcast_iter().next().unwrap();
+                    let validity = validity.values().clone();
+
+                    let arr = dense.downcast_iter().next().unwrap();
+                    let arr = arr.with_validity(Some(validity));
+                    let dtype = arr.data_type().clone();
+
+                    // Safety:
+                    // given dtype is correct
+                    unsafe {
+                        Series::try_from_arrow_unchecked(s.name(), vec![arr], &dtype).unwrap()
+                    }
+                };
             }
 
             let bitmap = obs.values();
@@ -268,10 +317,10 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_rank() -> Result<()> {
+    fn test_rank() -> PolarsResult<()> {
         let s = Series::new("a", &[1, 2, 3, 2, 2, 3, 0]);
 
-        let out = rank(&s, RankMethod::Ordinal, false)
+        let out = rank(&s, RankMethod::Ordinal, false, None)
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
@@ -279,7 +328,7 @@ mod test {
 
         #[cfg(feature = "random")]
         {
-            let out = rank(&s, RankMethod::Random, false)
+            let out = rank(&s, RankMethod::Random, false, None)
                 .idx()?
                 .into_no_null_iter()
                 .collect::<Vec<_>>();
@@ -292,25 +341,25 @@ mod test {
             assert_ne!(out[3], out[4]);
         }
 
-        let out = rank(&s, RankMethod::Dense, false)
+        let out = rank(&s, RankMethod::Dense, false, None)
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
         assert_eq!(out, &[2, 3, 4, 3, 3, 4, 1]);
 
-        let out = rank(&s, RankMethod::Max, false)
+        let out = rank(&s, RankMethod::Max, false, None)
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
         assert_eq!(out, &[2, 5, 7, 5, 5, 7, 1]);
 
-        let out = rank(&s, RankMethod::Min, false)
+        let out = rank(&s, RankMethod::Min, false, None)
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
         assert_eq!(out, &[2, 3, 6, 3, 3, 6, 1]);
 
-        let out = rank(&s, RankMethod::Average, false)
+        let out = rank(&s, RankMethod::Average, false, None)
             .f32()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
@@ -321,7 +370,7 @@ mod test {
             &[Some(1), Some(2), Some(3), Some(2), None, None, Some(0)],
         );
 
-        let out = rank(&s, RankMethod::Average, false)
+        let out = rank(&s, RankMethod::Average, false, None)
             .f32()?
             .into_iter()
             .collect::<Vec<_>>();
@@ -329,13 +378,13 @@ mod test {
         assert_eq!(
             out,
             &[
-                Some(4.0f32),
-                Some(5.5),
-                Some(7.0),
-                Some(5.5),
-                Some(1.5),
-                Some(1.5),
-                Some(3.0)
+                Some(2.0f32),
+                Some(3.5),
+                Some(5.0),
+                Some(3.5),
+                None,
+                None,
+                Some(1.0)
             ]
         );
         let s = Series::new(
@@ -351,24 +400,36 @@ mod test {
                 Some(8),
             ],
         );
-        let out = rank(&s, RankMethod::Max, false)
+        let out = rank(&s, RankMethod::Max, false, None)
             .idx()?
-            .into_no_null_iter()
+            .into_iter()
             .collect::<Vec<_>>();
-        assert_eq!(out, &[5, 6, 4, 1, 8, 4, 2, 7]);
+        assert_eq!(
+            out,
+            &[
+                Some(4),
+                Some(5),
+                Some(3),
+                None,
+                Some(7),
+                Some(3),
+                Some(1),
+                Some(6)
+            ]
+        );
 
         Ok(())
     }
 
     #[test]
-    fn test_rank_all_null() -> Result<()> {
+    fn test_rank_all_null() -> PolarsResult<()> {
         let s = UInt32Chunked::new("", &[None, None, None]).into_series();
-        let out = rank(&s, RankMethod::Average, false)
+        let out = rank(&s, RankMethod::Average, false, None)
             .f32()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
         assert_eq!(out, &[2.0f32, 2.0, 2.0]);
-        let out = rank(&s, RankMethod::Dense, false)
+        let out = rank(&s, RankMethod::Dense, false, None)
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
@@ -379,20 +440,20 @@ mod test {
     #[test]
     fn test_rank_empty() {
         let s = UInt32Chunked::from_slice("", &[]).into_series();
-        let out = rank(&s, RankMethod::Average, false);
+        let out = rank(&s, RankMethod::Average, false, None);
         assert_eq!(out.dtype(), &DataType::Float32);
-        let out = rank(&s, RankMethod::Max, false);
+        let out = rank(&s, RankMethod::Max, false, None);
         assert_eq!(out.dtype(), &IDX_DTYPE);
     }
 
     #[test]
-    fn test_rank_reverse() -> Result<()> {
+    fn test_rank_reverse() -> PolarsResult<()> {
         let s = Series::new("", &[None, Some(1), Some(1), Some(5), None]);
-        let out = rank(&s, RankMethod::Dense, true)
+        let out = rank(&s, RankMethod::Dense, true, None)
             .idx()?
-            .into_no_null_iter()
+            .into_iter()
             .collect::<Vec<_>>();
-        assert_eq!(out, &[1 as IdxSize, 3, 3, 2, 1]);
+        assert_eq!(out, &[None, Some(2 as IdxSize), Some(2), Some(1), None]);
 
         Ok(())
     }

@@ -1,6 +1,7 @@
-use crate::prelude::*;
 use arrow::array::growable::make_growable;
 use arrow::error::{Error as ArrowError, Result};
+
+use crate::prelude::*;
 
 /// Concatenate multiple [Array] of the same type into a single [`Array`].
 /// This does not check the arrays types.
@@ -9,6 +10,9 @@ pub fn concatenate_owned_unchecked(arrays: &[ArrayRef]) -> Result<ArrayRef> {
         return Err(ArrowError::InvalidArgumentError(
             "concat requires input of at least one array".to_string(),
         ));
+    }
+    if arrays.len() == 1 {
+        return Ok(arrays[0].clone());
     }
     let mut arrays_ref = Vec::with_capacity(arrays.len());
     let mut lengths = Vec::with_capacity(arrays.len());

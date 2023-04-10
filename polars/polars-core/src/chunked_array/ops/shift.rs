@@ -1,20 +1,27 @@
+use num_traits::{abs, clamp};
+
 use crate::prelude::*;
-use num::{abs, clamp};
 
 macro_rules! impl_shift_fill {
     ($self:ident, $periods:expr, $fill_value:expr) => {{
-        let periods = clamp($periods, -($self.len() as i64), $self.len() as i64);
-        let slice_offset = (-periods).max(0) as i64;
-        let length = $self.len() - abs(periods) as usize;
+        let fill_length = abs($periods) as usize;
+
+        if fill_length >= $self.len() {
+            return match $fill_value {
+                Some(fill) => Self::full($self.name(), fill, $self.len()),
+                None => Self::full_null($self.name(), $self.len()),
+            };
+        }
+        let slice_offset = (-$periods).max(0) as i64;
+        let length = $self.len() - fill_length;
         let mut slice = $self.slice(slice_offset, length);
 
-        let fill_length = abs(periods) as usize;
         let mut fill = match $fill_value {
             Some(val) => Self::full($self.name(), val, fill_length),
             None => Self::full_null($self.name(), fill_length),
         };
 
-        if periods < 0 {
+        if $periods < 0 {
             slice.append(&fill);
             slice
         } else {
@@ -55,6 +62,16 @@ impl ChunkShift<BooleanType> for BooleanChunked {
 
 impl ChunkShiftFill<Utf8Type, Option<&str>> for Utf8Chunked {
     fn shift_and_fill(&self, periods: i64, fill_value: Option<&str>) -> Utf8Chunked {
+        let ca = self.as_binary();
+        unsafe {
+            ca.shift_and_fill(periods, fill_value.map(|v| v.as_bytes()))
+                .to_utf8()
+        }
+    }
+}
+
+impl ChunkShiftFill<BinaryType, Option<&[u8]>> for BinaryChunked {
+    fn shift_and_fill(&self, periods: i64, fill_value: Option<&[u8]>) -> BinaryChunked {
         impl_shift_fill!(self, periods, fill_value)
     }
 }
@@ -65,12 +82,18 @@ impl ChunkShift<Utf8Type> for Utf8Chunked {
     }
 }
 
+impl ChunkShift<BinaryType> for BinaryChunked {
+    fn shift(&self, periods: i64) -> Self {
+        self.shift_and_fill(periods, None)
+    }
+}
+
 impl ChunkShiftFill<ListType, Option<&Series>> for ListChunked {
     fn shift_and_fill(&self, periods: i64, fill_value: Option<&Series>) -> ListChunked {
         // This has its own implementation because a ListChunked cannot have a full-null without
         // knowing the inner type
         let periods = clamp(periods, -(self.len() as i64), self.len() as i64);
-        let slice_offset = (-periods).max(0) as i64;
+        let slice_offset = (-periods).max(0);
         let length = self.len() - abs(periods) as usize;
         let mut slice = self.slice(slice_offset, length);
 
@@ -83,10 +106,10 @@ impl ChunkShiftFill<ListType, Option<&Series>> for ListChunked {
         };
 
         if periods < 0 {
-            slice.append(&fill);
+            slice.append(&fill).unwrap();
             slice
         } else {
-            fill.append(&slice);
+            fill.append(&slice).unwrap();
             fill
         }
     }
@@ -99,7 +122,7 @@ impl ChunkShift<ListType> for ListChunked {
 }
 
 #[cfg(feature = "object")]
-impl<T> ChunkShiftFill<ObjectType<T>, Option<ObjectType<T>>> for ObjectChunked<T> {
+impl<T: PolarsObject> ChunkShiftFill<ObjectType<T>, Option<ObjectType<T>>> for ObjectChunked<T> {
     fn shift_and_fill(
         &self,
         _periods: i64,
@@ -109,7 +132,7 @@ impl<T> ChunkShiftFill<ObjectType<T>, Option<ObjectType<T>>> for ObjectChunked<T
     }
 }
 #[cfg(feature = "object")]
-impl<T> ChunkShift<ObjectType<T>> for ObjectChunked<T> {
+impl<T: PolarsObject> ChunkShift<ObjectType<T>> for ObjectChunked<T> {
     fn shift(&self, periods: i64) -> Self {
         self.shift_and_fill(periods, None)
     }

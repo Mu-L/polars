@@ -6,12 +6,18 @@ Exceptions
 .. autosummary::
     :toctree: api/
     :nosignatures:
-    
+
     ArrowError
+    ColumnNotFoundError
     ComputeError
     DuplicateError
+    InvalidOperationError
     NoDataError
-    NotFoundError
-    PanicException
+    NoRowsReturnedError
+    PolarsPanicError
+    RowsError
     SchemaError
+    SchemaFieldNotFoundError
     ShapeError
+    StructFieldNotFoundError
+    TooManyRowsReturnedError

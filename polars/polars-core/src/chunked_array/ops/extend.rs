@@ -1,5 +1,8 @@
+use arrow::compute::concatenate::concatenate;
+use arrow::Either;
+
 use crate::prelude::*;
-use arrow::{compute::concatenate::concatenate, Either};
+use crate::series::IsSorted;
 
 fn extend_immutable(immutable: &dyn Array, chunks: &mut Vec<ArrayRef>, other_chunks: &[ArrayRef]) {
     let out = if chunks.len() == 1 {
@@ -20,7 +23,7 @@ where
 {
     /// Extend the memory backed by this array with the values from `other`.
     ///
-    /// Different from [`ChunkedArray::append`] which adds chunks to this [`ChunkedArray`] `extent`
+    /// Different from [`ChunkedArray::append`] which adds chunks to this [`ChunkedArray`] `extend`
     /// appends the data from `other` to the underlying `PrimitiveArray` and thus may cause a reallocation.
     ///
     /// However if this does not cause a reallocation, the resulting data structure will not have any extra chunks
@@ -74,6 +77,8 @@ where
                 self.chunks.push(Box::new(arr) as ArrayRef)
             }
         }
+        self.compute_len();
+        self.set_sorted_flag(IsSorted::Not);
     }
 }
 
@@ -110,6 +115,45 @@ impl Utf8Chunked {
                 self.chunks.push(Box::new(arr) as ArrayRef)
             }
         }
+        self.compute_len();
+        self.set_sorted_flag(IsSorted::Not);
+    }
+}
+
+#[doc(hidden)]
+impl BinaryChunked {
+    pub fn extend(&mut self, other: &Self) {
+        if self.chunks.len() > 1 {
+            self.append(other);
+            *self = self.rechunk();
+            return;
+        }
+        let arr = self.downcast_iter().next().unwrap();
+
+        // increments 1
+        let arr = arr.clone();
+
+        // now we drop our owned ArrayRefs so that
+        // decrements 1
+        {
+            self.chunks.clear();
+        }
+
+        use Either::*;
+
+        match arr.into_mut() {
+            Left(immutable) => {
+                extend_immutable(&immutable, &mut self.chunks, &other.chunks);
+            }
+            Right(mut mutable) => {
+                for arr in other.downcast_iter() {
+                    mutable.extend_trusted_len(arr.into_iter())
+                }
+                let arr: BinaryArray<i64> = mutable.into();
+                self.chunks.push(Box::new(arr) as ArrayRef)
+            }
+        }
+        self.compute_len();
     }
 }
 
@@ -147,15 +191,18 @@ impl BooleanChunked {
                 self.chunks.push(Box::new(arr) as ArrayRef)
             }
         }
+        self.compute_len();
+        self.set_sorted_flag(IsSorted::Not);
     }
 }
 
 #[doc(hidden)]
 impl ListChunked {
-    pub fn extend(&mut self, other: &Self) {
+    pub fn extend(&mut self, other: &Self) -> PolarsResult<()> {
         // TODO! properly implement mutation
         // this is harder because we don't know the inner type of the list
-        self.append(other);
+        self.set_sorted_flag(IsSorted::Not);
+        self.append(other)
     }
 }
 
@@ -194,6 +241,7 @@ mod test {
         let to_append = Utf8Chunked::new("a", &["a", "b", "e"]);
 
         ca.extend(&to_append);
+        assert_eq!(ca.len(), 6);
         let vals = ca.into_no_null_iter().collect::<Vec<_>>();
         assert_eq!(vals, ["a", "b", "c", "a", "b", "e"])
     }
@@ -204,6 +252,7 @@ mod test {
         let to_append = BooleanChunked::new("a", &[false, false]);
 
         ca.extend(&to_append);
+        assert_eq!(ca.len(), 4);
         let vals = ca.into_no_null_iter().collect::<Vec<_>>();
         assert_eq!(vals, [true, false, false, false]);
     }

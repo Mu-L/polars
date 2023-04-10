@@ -1,21 +1,24 @@
-#[cfg(feature = "test")]
 mod aggregations;
-#[cfg(feature = "test")]
 mod arity;
+#[cfg(all(feature = "strings", feature = "cse"))]
+mod cse;
 #[cfg(feature = "parquet")]
 mod io;
-#[cfg(feature = "test")]
 mod logical;
-#[cfg(feature = "test")]
 mod optimization_checks;
-#[cfg(feature = "test")]
 mod predicate_queries;
-#[cfg(feature = "test")]
 mod projection_queries;
-#[cfg(feature = "test")]
 mod queries;
-#[cfg(feature = "strings")]
+#[cfg(feature = "streaming")]
+mod streaming;
+#[cfg(all(feature = "strings", feature = "cse"))]
 mod tpch;
+
+fn get_arenas() -> (Arena<AExpr>, Arena<ALogicalPlan>) {
+    let expr_arena = Arena::with_capacity(16);
+    let lp_arena = Arena::with_capacity(8);
+    (expr_arena, lp_arena)
+}
 
 fn load_df() -> DataFrame {
     df!("a" => &[1, 2, 3, 4, 5],
@@ -25,24 +28,23 @@ fn load_df() -> DataFrame {
     .unwrap()
 }
 
-use optimization_checks::*;
-use std::sync::Mutex;
-
-use polars_core::prelude::*;
-use polars_io::prelude::*;
 use std::io::Cursor;
+use std::iter::FromIterator;
 
-use crate::dsl::{argsort_by, pearson_corr};
-use crate::logical_plan::iterator::ArenaLpIter;
-use crate::logical_plan::optimizer::simplify_expr::SimplifyExprRule;
-use crate::logical_plan::optimizer::stack_opt::{OptimizationRule, StackOptimizer};
-use crate::prelude::*;
+use optimization_checks::*;
 use polars_core::chunked_array::builder::get_list_builder;
 use polars_core::df;
 #[cfg(feature = "temporal")]
 use polars_core::export::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use polars_core::prelude::*;
 pub(crate) use polars_core::SINGLE_LOCK;
-use std::iter::FromIterator;
+use polars_io::prelude::*;
+use polars_plan::logical_plan::{
+    ArenaLpIter, OptimizationRule, SimplifyExprRule, StackOptimizer, TypeCoercionRule,
+};
+
+use crate::dsl::{arg_sort_by, pearson_corr};
+use crate::prelude::*;
 
 static GLOB_PARQUET: &str = "../../examples/datasets/*.parquet";
 static GLOB_CSV: &str = "../../examples/datasets/*.csv";
@@ -51,12 +53,15 @@ static FOODS_CSV: &str = "../../examples/datasets/foods1.csv";
 static FOODS_IPC: &str = "../../examples/datasets/foods1.ipc";
 static FOODS_PARQUET: &str = "../../examples/datasets/foods1.parquet";
 
+#[cfg(feature = "csv-file")]
 fn scan_foods_csv() -> LazyFrame {
-    LazyCsvReader::new(FOODS_CSV.to_string()).finish().unwrap()
+    LazyCsvReader::new(FOODS_CSV).finish().unwrap()
 }
 
+#[cfg(feature = "ipc")]
 fn scan_foods_ipc() -> LazyFrame {
-    LazyFrame::scan_ipc(FOODS_IPC.to_string(), Default::default()).unwrap()
+    init_files();
+    LazyFrame::scan_ipc(FOODS_IPC, Default::default()).unwrap()
 }
 
 fn init_files() {
@@ -64,22 +69,30 @@ fn init_files() {
         "../../examples/datasets/foods1.csv",
         "../../examples/datasets/foods2.csv",
     ] {
-        let out_path1 = path.replace(".csv", ".parquet");
-        let out_path2 = path.replace(".csv", ".ipc");
+        for ext in [".parquet", ".ipc", ".ndjson"] {
+            let out_path = path.replace(".csv", ext);
 
-        for out_path in [out_path1, out_path2] {
             if std::fs::metadata(&out_path).is_err() {
                 let mut df = CsvReader::from_path(path).unwrap().finish().unwrap();
+                let f = std::fs::File::create(&out_path).unwrap();
 
-                if out_path.ends_with("parquet") {
-                    let f = std::fs::File::create(&out_path).unwrap();
-                    ParquetWriter::new(f)
-                        .with_statistics(true)
-                        .finish(&mut df)
-                        .unwrap();
-                } else {
-                    let f = std::fs::File::create(&out_path).unwrap();
-                    IpcWriter::new(f).finish(&mut df).unwrap();
+                match ext {
+                    ".parquet" => {
+                        ParquetWriter::new(f)
+                            .with_statistics(true)
+                            .finish(&mut df)
+                            .unwrap();
+                    }
+                    ".ipc" => {
+                        IpcWriter::new(f).finish(&mut df).unwrap();
+                    }
+                    ".ndjson" => {
+                        #[cfg(feature = "json")]
+                        {
+                            JsonWriter::new(f).finish(&mut df).unwrap()
+                        }
+                    }
+                    _ => panic!(),
                 }
             }
         }
@@ -89,7 +102,7 @@ fn init_files() {
 #[cfg(feature = "parquet")]
 fn scan_foods_parquet(parallel: bool) -> LazyFrame {
     init_files();
-    let out_path = FOODS_PARQUET.to_string();
+    let out_path = FOODS_PARQUET;
     let parallel = if parallel {
         ParallelStrategy::Auto
     } else {
@@ -101,7 +114,7 @@ fn scan_foods_parquet(parallel: bool) -> LazyFrame {
         cache: false,
         parallel,
         rechunk: true,
-        row_count: None,
+        ..Default::default()
     };
     LazyFrame::scan_parquet(out_path, args).unwrap()
 }

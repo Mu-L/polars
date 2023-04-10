@@ -1,6 +1,6 @@
-use super::*;
-use polars_core::POOL;
 use rayon::prelude::*;
+
+use super::*;
 
 /// Take an input Executor and a multiple expressions
 pub struct GroupByExec {
@@ -39,17 +39,16 @@ pub(super) fn groupby_helper(
     mut df: DataFrame,
     keys: Vec<Series>,
     aggs: &[Arc<dyn PhysicalExpr>],
-    apply: Option<&Arc<dyn DataFrameUdf>>,
-    state: &ExecutionState,
+    apply: Option<Arc<dyn DataFrameUdf>>,
+    state: &mut ExecutionState,
     maintain_order: bool,
     slice: Option<(i64, usize)>,
-) -> Result<DataFrame> {
+) -> PolarsResult<DataFrame> {
     df.as_single_chunk_par();
     let gb = df.groupby_with_series(keys, true, maintain_order)?;
 
     if let Some(f) = apply {
-        state.clear_schema_cache();
-        return gb.apply(|df| f.call_udf(df));
+        return gb.apply(move |df| f.call_udf(df));
     }
 
     let mut groups = gb.get_groups();
@@ -66,50 +65,77 @@ pub(super) fn groupby_helper(
     let (mut columns, agg_columns) = POOL.install(|| {
         let get_columns = || gb.keys_sliced(slice);
 
-        let get_agg = || aggs
-            .par_iter()
-            .map(|expr| {
-                let agg = expr.evaluate_on_groups(&df, groups, state)?.finalize();
-                if agg.len() != groups.len() {
-                    return Err(PolarsError::ComputeError(
-                        format!("returned aggregation is a different length: {} than the group lengths: {}",
-                                agg.len(),
-                                groups.len()).into()
-                    ))
-                }
-                Ok(agg)
-            })
-            .collect::<Result<Vec<_>>>();
+        let get_agg = || {
+            aggs.par_iter()
+                .map(|expr| {
+                    let agg = expr.evaluate_on_groups(&df, groups, state)?.finalize();
+                    polars_ensure!(agg.len() == groups.len(), agg_len = agg.len(), groups.len());
+                    Ok(agg)
+                })
+                .collect::<PolarsResult<Vec<_>>>()
+        };
 
         rayon::join(get_columns, get_agg)
     });
     let agg_columns = agg_columns?;
 
     columns.extend_from_slice(&agg_columns);
-    state.clear_schema_cache();
     DataFrame::new(columns)
 }
 
-impl Executor for GroupByExec {
-    fn execute(&mut self, state: &ExecutionState) -> Result<DataFrame> {
-        if state.verbose {
-            eprintln!("keys/aggregates are not partitionable: running default HASH AGGREGATION")
-        }
-        let df = self.input.execute(state)?;
-        state.set_schema(self.input_schema.clone());
+impl GroupByExec {
+    fn execute_impl(
+        &mut self,
+        state: &mut ExecutionState,
+        df: DataFrame,
+    ) -> PolarsResult<DataFrame> {
         let keys = self
             .keys
             .iter()
             .map(|e| e.evaluate(&df, state))
-            .collect::<Result<_>>()?;
+            .collect::<PolarsResult<_>>()?;
         groupby_helper(
             df,
             keys,
             &self.aggs,
-            self.apply.as_ref(),
+            self.apply.take(),
             state,
             self.maintain_order,
             self.slice,
         )
+    }
+}
+
+impl Executor for GroupByExec {
+    fn execute(&mut self, state: &mut ExecutionState) -> PolarsResult<DataFrame> {
+        #[cfg(debug_assertions)]
+        {
+            if state.verbose() {
+                println!("run GroupbyExec")
+            }
+        }
+        if state.verbose() {
+            eprintln!("keys/aggregates are not partitionable: running default HASH AGGREGATION")
+        }
+        let df = self.input.execute(state)?;
+
+        let profile_name = if state.has_node_timer() {
+            let by = self
+                .keys
+                .iter()
+                .map(|s| Ok(s.to_field(&self.input_schema)?.name))
+                .collect::<PolarsResult<Vec<_>>>()?;
+            let name = comma_delimited("groupby".to_string(), &by);
+            Cow::Owned(name)
+        } else {
+            Cow::Borrowed("")
+        };
+
+        if state.has_node_timer() {
+            let new_state = state.clone();
+            new_state.record(|| self.execute_impl(state, df), profile_name)
+        } else {
+            self.execute_impl(state, df)
+        }
     }
 }

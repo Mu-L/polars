@@ -3,7 +3,7 @@ pub use crate::prelude::ChunkCompare;
 use crate::prelude::*;
 
 mod any_value;
-pub(crate) mod arithmetic;
+pub mod arithmetic;
 mod comparison;
 mod from;
 pub mod implementations;
@@ -14,26 +14,25 @@ mod series_trait;
 #[cfg(feature = "private")]
 pub mod unstable;
 
-#[cfg(feature = "rank")]
-use crate::prelude::unique::rank::rank;
-#[cfg(feature = "zip_with")]
-use crate::series::arithmetic::coerce_lhs_rhs;
-use crate::utils::{split_ca, split_series};
-use crate::utils::{split_offsets, Wrap};
-use crate::POOL;
-use ahash::RandomState;
-use arrow::compute::aggregate::estimated_bytes_size;
-pub use from::*;
-use num::NumCast;
-use rayon::prelude::*;
-pub use series_trait::*;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
 
-pub use iterator::SeriesIter;
-pub use series_trait::IsSorted;
+use ahash::RandomState;
+use arrow::compute::aggregate::estimated_bytes_size;
+pub use from::*;
+pub use iterator::{SeriesIter, SeriesPhysIter};
+use num_traits::NumCast;
+use rayon::prelude::*;
+pub use series_trait::{IsSorted, *};
+
+#[cfg(feature = "rank")]
+use crate::prelude::unique::rank::rank;
+#[cfg(feature = "zip_with")]
+use crate::series::arithmetic::coerce_lhs_rhs;
+use crate::utils::{_split_offsets, split_ca, split_series, Wrap};
+use crate::POOL;
 
 /// # Series
 /// The columnar data type for a DataFrame.
@@ -146,7 +145,9 @@ impl Eq for Wrap<Series> {}
 impl Hash for Wrap<Series> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let rs = RandomState::with_seeds(0, 0, 0, 0);
-        let h = UInt64Chunked::from_vec("", self.0.vec_hash(rs)).sum();
+        let mut h = vec![];
+        self.0.vec_hash(rs, &mut h).unwrap();
+        let h = UInt64Chunked::from_vec("", h).sum();
         h.hash(state)
     }
 }
@@ -155,6 +156,21 @@ impl Series {
     /// Create a new empty Series
     pub fn new_empty(name: &str, dtype: &DataType) -> Series {
         Series::full_null(name, 0, dtype)
+    }
+
+    pub fn clear(&self) -> Series {
+        // only the inner of objects know their type
+        // so use this hack
+        #[cfg(feature = "object")]
+        if matches!(self.dtype(), DataType::Object(_)) {
+            return if self.is_empty() {
+                self.clone()
+            } else {
+                let av = self.get(0).unwrap();
+                Series::new(self.name(), [av]).slice(0, 0)
+            };
+        }
+        Series::new_empty(self.name(), self.dtype())
     }
 
     #[doc(hidden)]
@@ -166,9 +182,20 @@ impl Series {
         Arc::get_mut(&mut self.0).expect("implementation error")
     }
 
-    pub fn set_sorted(&mut self, sorted: IsSorted) {
+    /// # Safety
+    /// The caller must ensure the length and the data types of `ArrayRef` does not change.
+    pub unsafe fn chunks_mut(&mut self) -> &mut Vec<ArrayRef> {
+        #[allow(unused_mut)]
+        let mut ca = self._get_inner_mut();
+        let chunks = ca.chunks() as *const Vec<ArrayRef> as *mut Vec<ArrayRef>;
+        // Safety
+        // ca is the owner of `chunks` and this we do not break aliasing rules
+        &mut *chunks
+    }
+
+    pub fn set_sorted_flag(&mut self, sorted: IsSorted) {
         let inner = self._get_inner_mut();
-        inner._set_sorted(sorted)
+        inner._set_sorted_flag(sorted)
     }
 
     pub fn into_frame(self) -> DataFrame {
@@ -181,21 +208,15 @@ impl Series {
         self
     }
 
-    /// Shrink the capacity of this array to fit it's length.
+    /// Shrink the capacity of this array to fit its length.
     pub fn shrink_to_fit(&mut self) {
         self._get_inner_mut().shrink_to_fit()
-    }
-
-    /// Append arrow array of same datatype.
-    pub fn append_array(&mut self, other: ArrayRef) -> Result<&mut Self> {
-        self._get_inner_mut().append_array(other)?;
-        Ok(self)
     }
 
     /// Append in place. This is done by adding the chunks of `other` to this [`Series`].
     ///
     /// See [`ChunkedArray::append`] and [`ChunkedArray::extend`].
-    pub fn append(&mut self, other: &Series) -> Result<&mut Self> {
+    pub fn append(&mut self, other: &Series) -> PolarsResult<&mut Self> {
         self._get_inner_mut().append(other)?;
         Ok(self)
     }
@@ -203,30 +224,61 @@ impl Series {
     /// Extend the memory backed by this array with the values from `other`.
     ///
     /// See [`ChunkedArray::extend`] and [`ChunkedArray::append`].
-    pub fn extend(&mut self, other: &Series) -> Result<&mut Self> {
+    pub fn extend(&mut self, other: &Series) -> PolarsResult<&mut Self> {
         self._get_inner_mut().extend(other)?;
         Ok(self)
     }
 
-    pub fn sort(&self, reverse: bool) -> Self {
+    pub fn sort(&self, descending: bool) -> Self {
         self.sort_with(SortOptions {
-            descending: reverse,
+            descending,
             ..Default::default()
         })
     }
 
     /// Only implemented for numeric types
-    pub fn as_single_ptr(&mut self) -> Result<usize> {
+    pub fn as_single_ptr(&mut self) -> PolarsResult<usize> {
         self._get_inner_mut().as_single_ptr()
     }
 
     /// Cast `[Series]` to another `[DataType]`
-    pub fn cast(&self, dtype: &DataType) -> Result<Self> {
-        self.0.cast(dtype)
+    pub fn cast(&self, dtype: &DataType) -> PolarsResult<Self> {
+        // best leave as is.
+        if matches!(dtype, DataType::Unknown) {
+            return Ok(self.clone());
+        }
+        match self.0.cast(dtype) {
+            Ok(out) => Ok(out),
+            Err(err) => {
+                let len = self.len();
+                if self.null_count() == len {
+                    Ok(Series::full_null(self.name(), len, dtype))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Cast from physical to logical types without any checks on the validity of the cast.
+    ///
+    /// # Safety
+    /// This can lead to invalid memory access in downstream code.
+    pub unsafe fn cast_unchecked(&self, dtype: &DataType) -> PolarsResult<Self> {
+        match self.dtype() {
+            dt if dt.is_numeric() => {
+                with_match_physical_numeric_polars_type!(dt, |$T| {
+                    let ca: &ChunkedArray<$T> = self.as_ref().as_ref().as_ref();
+                        ca.cast_unchecked(dtype)
+                })
+            }
+            _ => self.cast(dtype),
+        }
     }
 
     /// Compute the sum of all values in this Series.
-    /// Returns `None` if the array is empty or only contains null values.
+    /// Returns `Some(0)` if the array is empty, and `None` if the array only
+    /// contains null values.
     ///
     /// If the [`DataType`] is one of `{Int8, UInt8, Int16, UInt16}` the `Series` is
     /// first cast to `Int64` to prevent overflow issues.
@@ -281,73 +333,54 @@ impl Series {
     }
 
     /// Explode a list or utf8 Series. This expands every item to a new row..
-    pub fn explode(&self) -> Result<Series> {
+    pub fn explode(&self) -> PolarsResult<Series> {
         match self.dtype() {
             DataType::List(_) => self.list().unwrap().explode(),
             DataType::Utf8 => self.utf8().unwrap().explode(),
-            _ => Err(PolarsError::InvalidOperation(
-                format!(
-                    "explode not supported for Series with dtype {:?}",
-                    self.dtype()
-                )
-                .into(),
-            )),
+            _ => polars_bail!(opq = explode, self.dtype()),
         }
     }
 
     /// Check if float value is NaN (note this is different than missing/ null)
-    pub fn is_nan(&self) -> Result<BooleanChunked> {
+    pub fn is_nan(&self) -> PolarsResult<BooleanChunked> {
         match self.dtype() {
             DataType::Float32 => Ok(self.f32().unwrap().is_nan()),
             DataType::Float64 => Ok(self.f64().unwrap().is_nan()),
-            _ => Ok(BooleanChunked::full(self.name(), false, self.len())),
+            _ => polars_bail!(opq = is_nan, self.dtype()),
         }
     }
 
     /// Check if float value is NaN (note this is different than missing/ null)
-    pub fn is_not_nan(&self) -> Result<BooleanChunked> {
+    pub fn is_not_nan(&self) -> PolarsResult<BooleanChunked> {
         match self.dtype() {
             DataType::Float32 => Ok(self.f32().unwrap().is_not_nan()),
             DataType::Float64 => Ok(self.f64().unwrap().is_not_nan()),
-            _ => Ok(BooleanChunked::full(self.name(), true, self.len())),
+            _ => polars_bail!(opq = is_not_nan, self.dtype()),
         }
     }
 
     /// Check if float value is finite
-    pub fn is_finite(&self) -> Result<BooleanChunked> {
+    pub fn is_finite(&self) -> PolarsResult<BooleanChunked> {
         match self.dtype() {
             DataType::Float32 => Ok(self.f32().unwrap().is_finite()),
             DataType::Float64 => Ok(self.f64().unwrap().is_finite()),
-            _ => Err(PolarsError::InvalidOperation(
-                format!(
-                    "is_nan not supported for series with dtype {:?}",
-                    self.dtype()
-                )
-                .into(),
-            )),
+            _ => polars_bail!(opq = is_finite, self.dtype()),
         }
     }
 
-    /// Check if float value is finite
-    pub fn is_infinite(&self) -> Result<BooleanChunked> {
+    /// Check if float value is infinite
+    pub fn is_infinite(&self) -> PolarsResult<BooleanChunked> {
         match self.dtype() {
             DataType::Float32 => Ok(self.f32().unwrap().is_infinite()),
             DataType::Float64 => Ok(self.f64().unwrap().is_infinite()),
-            _ => Err(PolarsError::InvalidOperation(
-                format!(
-                    "is_nan not supported for series with dtype {:?}",
-                    self.dtype()
-                )
-                .into(),
-            )),
+            _ => polars_bail!(opq = is_infinite, self.dtype()),
         }
     }
 
     /// Create a new ChunkedArray with values from self where the mask evaluates `true` and values
     /// from `other` where the mask evaluates `false`
     #[cfg(feature = "zip_with")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "zip_with")))]
-    pub fn zip_with(&self, mask: &BooleanChunked, other: &Series) -> Result<Series> {
+    pub fn zip_with(&self, mask: &BooleanChunked, other: &Series) -> PolarsResult<Series> {
         let (lhs, rhs) = coerce_lhs_rhs(self, other)?;
         lhs.zip_with_same_type(mask, rhs.as_ref())
     }
@@ -363,10 +396,10 @@ impl Series {
     pub fn to_physical_repr(&self) -> Cow<Series> {
         use DataType::*;
         match self.dtype() {
-            Date => Cow::Owned(self.cast(&DataType::Int32).unwrap()),
-            Datetime(_, _) | Duration(_) | Time => Cow::Owned(self.cast(&DataType::Int64).unwrap()),
+            Date => Cow::Owned(self.cast(&Int32).unwrap()),
+            Datetime(_, _) | Duration(_) | Time => Cow::Owned(self.cast(&Int64).unwrap()),
             #[cfg(feature = "dtype-categorical")]
-            Categorical(_) => Cow::Owned(self.cast(&DataType::UInt32).unwrap()),
+            Categorical(_) => Cow::Owned(self.cast(&UInt32).unwrap()),
             _ => Cow::Borrowed(self),
         }
     }
@@ -391,12 +424,12 @@ impl Series {
         &self,
         rechunk: bool,
         len: usize,
-        func: &(dyn Fn(usize, usize) -> Result<Series> + Send + Sync),
-    ) -> Result<Series> {
+        func: &(dyn Fn(usize, usize) -> PolarsResult<Series> + Send + Sync),
+    ) -> PolarsResult<Series> {
         let n_threads = POOL.current_num_threads();
-        let offsets = split_offsets(len, n_threads);
+        let offsets = _split_offsets(len, n_threads);
 
-        let series: Result<Vec<_>> = POOL.install(|| {
+        let series: PolarsResult<Vec<_>> = POOL.install(|| {
             offsets
                 .into_par_iter()
                 .map(|(offset, len)| func(offset, len))
@@ -410,7 +443,20 @@ impl Series {
     ///
     /// # Safety
     /// This doesn't check any bounds. Null validity is checked.
-    pub unsafe fn take_unchecked_threaded(&self, idx: &IdxCa, rechunk: bool) -> Result<Series> {
+    pub unsafe fn take_unchecked_from_slice(&self, idx: &[IdxSize]) -> PolarsResult<Series> {
+        let idx = IdxCa::mmap_slice("", idx);
+        self.take_unchecked(&idx)
+    }
+
+    /// Take by index if ChunkedArray contains a single chunk.
+    ///
+    /// # Safety
+    /// This doesn't check any bounds. Null validity is checked.
+    pub unsafe fn take_unchecked_threaded(
+        &self,
+        idx: &IdxCa,
+        rechunk: bool,
+    ) -> PolarsResult<Series> {
         self.threaded_op(rechunk, idx.len(), &|offset, len| {
             let idx = idx.slice(offset as i64, len);
             self.take_unchecked(&idx)
@@ -450,10 +496,9 @@ impl Series {
 
     /// Take by index. This operation is clone.
     ///
-    /// # Safety
-    ///
+    /// # Notes
     /// Out of bounds access doesn't Error but will return a Null value
-    pub fn take_threaded(&self, idx: &IdxCa, rechunk: bool) -> Result<Series> {
+    pub fn take_threaded(&self, idx: &IdxCa, rechunk: bool) -> PolarsResult<Series> {
         self.threaded_op(rechunk, idx.len(), &|offset, len| {
             let idx = idx.slice(offset as i64, len);
             self.take(&idx)
@@ -461,7 +506,7 @@ impl Series {
     }
 
     /// Filter by boolean mask. This operation clones data.
-    pub fn filter_threaded(&self, filter: &BooleanChunked, rechunk: bool) -> Result<Series> {
+    pub fn filter_threaded(&self, filter: &BooleanChunked, rechunk: bool) -> PolarsResult<Series> {
         // this would fail if there is a broadcasting filter.
         // because we cannot split that filter over threads
         // besides they are a no-op, so we do the standard filter.
@@ -472,7 +517,7 @@ impl Series {
         let filters = split_ca(filter, n_threads).unwrap();
         let series = split_series(self, n_threads).unwrap();
 
-        let series: Result<Vec<_>> = POOL.install(|| {
+        let series: PolarsResult<Vec<_>> = POOL.install(|| {
             filters
                 .par_iter()
                 .zip(series)
@@ -484,24 +529,25 @@ impl Series {
     }
 
     #[cfg(feature = "dot_product")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dot_product")))]
     pub fn dot(&self, other: &Series) -> Option<f64> {
         (self * other).sum::<f64>()
     }
 
-    #[cfg(feature = "row_hash")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "row_hash")))]
-    /// Get a hash of this Series
-    pub fn hash(&self, build_hasher: ahash::RandomState) -> UInt64Chunked {
-        UInt64Chunked::from_vec(self.name(), self.0.vec_hash(build_hasher))
-    }
-
     /// Get the sum of the Series as a new Series of length 1.
+    /// Returns a Series with a single zeroed entry if self is an empty numeric series.
     ///
     /// If the [`DataType`] is one of `{Int8, UInt8, Int16, UInt16}` the `Series` is
     /// first cast to `Int64` to prevent overflow issues.
     pub fn sum_as_series(&self) -> Series {
         use DataType::*;
+        if self.is_empty()
+            && (self.dtype().is_numeric() || matches!(self.dtype(), DataType::Boolean))
+        {
+            return Series::new("", [0])
+                .cast(self.dtype())
+                .unwrap()
+                .sum_as_series();
+        }
         match self.dtype() {
             Int8 | UInt8 | Int16 | UInt16 => self.cast(&Int64).unwrap().sum_as_series(),
             _ => self._sum_as_series(),
@@ -509,7 +555,6 @@ impl Series {
     }
 
     /// Get an array with the cumulative max computed at every element
-    #[cfg_attr(docsrs, doc(cfg(feature = "cum_agg")))]
     pub fn cummax(&self, _reverse: bool) -> Series {
         #[cfg(feature = "cum_agg")]
         {
@@ -522,7 +567,6 @@ impl Series {
     }
 
     /// Get an array with the cumulative min computed at every element
-    #[cfg_attr(docsrs, doc(cfg(feature = "cum_agg")))]
     pub fn cummin(&self, _reverse: bool) -> Series {
         #[cfg(feature = "cum_agg")]
         {
@@ -538,7 +582,6 @@ impl Series {
     ///
     /// If the [`DataType`] is one of `{Int8, UInt8, Int16, UInt16}` the `Series` is
     /// first cast to `Int64` to prevent overflow issues.
-    #[cfg_attr(docsrs, doc(cfg(feature = "cum_agg")))]
     #[allow(unused_variables)]
     pub fn cumsum(&self, reverse: bool) -> Series {
         #[cfg(feature = "cum_agg")]
@@ -574,7 +617,7 @@ impl Series {
                     let ca = self.f64().unwrap();
                     ca.cumsum(reverse).into_series()
                 }
-                dt => panic!("cumsum not supported for dtype: {:?}", dt),
+                dt => panic!("cumsum not supported for dtype: {dt:?}"),
             }
         }
         #[cfg(not(feature = "cum_agg"))]
@@ -587,7 +630,6 @@ impl Series {
     ///
     /// If the [`DataType`] is one of `{Int8, UInt8, Int16, UInt16, Int32, UInt32}` the `Series` is
     /// first cast to `Int64` to prevent overflow issues.
-    #[cfg_attr(docsrs, doc(cfg(feature = "cum_agg")))]
     #[allow(unused_variables)]
     pub fn cumprod(&self, reverse: bool) -> Series {
         #[cfg(feature = "cum_agg")]
@@ -615,7 +657,7 @@ impl Series {
                     let ca = self.f64().unwrap();
                     ca.cumprod(reverse).into_series()
                 }
-                dt => panic!("cumprod not supported for dtype: {:?}", dt),
+                dt => panic!("cumprod not supported for dtype: {dt:?}"),
             }
         }
         #[cfg(not(feature = "cum_agg"))]
@@ -628,19 +670,22 @@ impl Series {
     ///
     /// If the [`DataType`] is one of `{Int8, UInt8, Int16, UInt16}` the `Series` is
     /// first cast to `Int64` to prevent overflow issues.
-    #[cfg_attr(docsrs, doc(cfg(feature = "product")))]
     pub fn product(&self) -> Series {
         #[cfg(feature = "product")]
         {
             use DataType::*;
             match self.dtype() {
                 Boolean => self.cast(&DataType::Int64).unwrap().product(),
-                Int8 | UInt8 | Int16 | UInt16 => {
+                Int8 | UInt8 | Int16 | UInt16 | Int32 | UInt32 => {
                     let s = self.cast(&Int64).unwrap();
                     s.product()
                 }
                 Int64 => {
                     let ca = self.i64().unwrap();
+                    ca.prod_as_series()
+                }
+                UInt64 => {
+                    let ca = self.u64().unwrap();
                     ca.prod_as_series()
                 }
                 Float32 => {
@@ -651,7 +696,7 @@ impl Series {
                     let ca = self.f64().unwrap();
                     ca.prod_as_series()
                 }
-                dt => panic!("cumprod not supported for dtype: {:?}", dt),
+                dt => panic!("cumprod not supported for dtype: {dt:?}"),
             }
         }
         #[cfg(not(feature = "product"))]
@@ -661,24 +706,28 @@ impl Series {
     }
 
     #[cfg(feature = "rank")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rank")))]
-    pub fn rank(&self, options: RankOptions) -> Series {
-        rank(self, options.method, options.descending)
+    pub fn rank(&self, options: RankOptions, seed: Option<u64>) -> Series {
+        rank(self, options.method, options.descending, seed)
     }
 
     /// Cast throws an error if conversion had overflows
-    pub fn strict_cast(&self, data_type: &DataType) -> Result<Series> {
-        let s = self.cast(data_type)?;
-        if self.null_count() != s.null_count() {
-            Err(PolarsError::ComputeError(
-                format!(
-                    "strict conversion of cast from {:?} to {:?} failed. consider non-strict cast.\n
-                    If you were trying to cast Utf8 to Date,Time,Datetime, consider using `strptime`",
-                    self.dtype(),
-                    data_type
-                )
-                    .into(),
-            ))
+    pub fn strict_cast(&self, dtype: &DataType) -> PolarsResult<Series> {
+        let null_count = self.null_count();
+        let len = self.len();
+        if null_count == len {
+            return Ok(Series::full_null(self.name(), len, dtype));
+        }
+        let s = self.0.cast(dtype)?;
+        if null_count != s.null_count() {
+            let failure_mask = !self.is_null() & s.is_null();
+            let failures = self.filter_threaded(&failure_mask, false)?.unique()?;
+            polars_bail!(
+                ComputeError:
+                "strict conversion from `{}` to `{}` failed for value(s) {}; \
+                if you were trying to cast Utf8 to temporal dtypes, consider using `strptime`",
+                self.dtype(), dtype, failures.fmt_list(),
+
+            );
         } else {
             Ok(s)
         }
@@ -699,7 +748,7 @@ impl Series {
                 .clone()
                 .into_time()
                 .into_series(),
-            dt => panic!("date not implemented for {:?}", dt),
+            dt => panic!("date not implemented for {dt:?}"),
         }
     }
 
@@ -718,7 +767,7 @@ impl Series {
                 .clone()
                 .into_date()
                 .into_series(),
-            dt => panic!("date not implemented for {:?}", dt),
+            dt => panic!("date not implemented for {dt:?}"),
         }
     }
     pub(crate) fn into_datetime(self, timeunit: TimeUnit, tz: Option<TimeZone>) -> Series {
@@ -742,7 +791,7 @@ impl Series {
                 .clone()
                 .into_datetime(timeunit, tz)
                 .into_series(),
-            dt => panic!("into_datetime not implemented for {:?}", dt),
+            dt => panic!("into_datetime not implemented for {dt:?}"),
         }
     }
 
@@ -766,33 +815,13 @@ impl Series {
                 .clone()
                 .into_duration(timeunit)
                 .into_series(),
-            dt => panic!("into_duration not implemented for {:?}", dt),
-        }
-    }
-
-    /// Check if the underlying data is a logical type.
-    pub fn is_logical(&self) -> bool {
-        self.dtype().is_logical()
-    }
-
-    /// Check if underlying physical data is numeric.
-    ///
-    /// Date types and Categoricals are also considered numeric.
-    pub fn is_numeric_physical(&self) -> bool {
-        // allow because it cannot be replaced when object feature is activated
-        #[allow(clippy::match_like_matches_macro)]
-        match self.dtype() {
-            DataType::Utf8 | DataType::List(_) | DataType::Boolean | DataType::Null => false,
-            #[cfg(feature = "object")]
-            DataType::Object(_) => false,
-            _ => true,
+            dt => panic!("into_duration not implemented for {dt:?}"),
         }
     }
 
     #[cfg(feature = "abs")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "abs")))]
     /// convert numerical values to their absolute value
-    pub fn abs(&self) -> Result<Series> {
+    pub fn abs(&self) -> PolarsResult<Series> {
         let a = self.to_physical_repr();
         use DataType::*;
         let out = match a.dtype() {
@@ -805,25 +834,28 @@ impl Series {
             UInt8 | UInt16 | UInt32 | UInt64 => self.clone(),
             Float32 => a.f32().unwrap().abs().into_series(),
             Float64 => a.f64().unwrap().abs().into_series(),
-            dt => {
-                return Err(PolarsError::InvalidOperation(
-                    format!("abs not supported for series of type {:?}", dt).into(),
-                ));
-            }
+            dt => polars_bail!(opq = abs, dt),
         };
-        Ok(out)
+        out.cast(self.dtype())
     }
 
     #[cfg(feature = "private")]
     // used for formatting
-    pub fn str_value(&self, index: usize) -> Cow<str> {
-        match self.0.get(index) {
+    pub fn str_value(&self, index: usize) -> PolarsResult<Cow<str>> {
+        let out = match self.0.get(index)? {
             AnyValue::Utf8(s) => Cow::Borrowed(s),
             AnyValue::Null => Cow::Borrowed("null"),
             #[cfg(feature = "dtype-categorical")]
-            AnyValue::Categorical(idx, rev) => Cow::Borrowed(rev.get(idx)),
-            av => Cow::Owned(format!("{}", av)),
-        }
+            AnyValue::Categorical(idx, rev, arr) => {
+                if arr.is_null() {
+                    Cow::Borrowed(rev.get(idx))
+                } else {
+                    unsafe { Cow::Borrowed(arr.deref_unchecked().value(idx as usize)) }
+                }
+            }
+            av => Cow::Owned(format!("{av}")),
+        };
+        Ok(out)
     }
     /// Get the head of the Series.
     pub fn head(&self, length: Option<usize>) -> Series {
@@ -843,25 +875,34 @@ impl Series {
     }
 
     pub fn mean_as_series(&self) -> Series {
-        let val = [self.mean()];
-        let s = Series::new(self.name(), val);
-        if !self.dtype().is_numeric() {
-            Series::full_null(self.name(), 1, self.dtype())
-        } else {
-            s
+        match self.dtype() {
+            DataType::Float32 => {
+                let val = &[self.mean().map(|m| m as f32)];
+                Series::new(self.name(), val)
+            }
+            dt if dt.is_numeric() || matches!(dt, DataType::Boolean) => {
+                let val = &[self.mean()];
+                Series::new(self.name(), val)
+            }
+            dt @ DataType::Duration(_) => {
+                Series::new(self.name(), &[self.mean().map(|v| v as i64)])
+                    .cast(dt)
+                    .unwrap()
+            }
+            _ => return Series::full_null(self.name(), 1, self.dtype()),
         }
     }
 
     /// Compute the unique elements, but maintain order. This requires more work
     /// than a naive [`Series::unique`](SeriesTrait::unique).
-    pub fn unique_stable(&self) -> Result<Series> {
+    pub fn unique_stable(&self) -> PolarsResult<Series> {
         let idx = self.arg_unique()?;
         // Safety:
         // Indices are in bounds.
         unsafe { self.take_unchecked(&idx) }
     }
 
-    pub fn idx(&self) -> Result<&IdxCa> {
+    pub fn idx(&self) -> PolarsResult<&IdxCa> {
         #[cfg(feature = "bigidx")]
         {
             self.u64()
@@ -911,13 +952,13 @@ impl Deref for Series {
     type Target = dyn SeriesTrait;
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        self.0.as_ref()
     }
 }
 
 impl<'a> AsRef<(dyn SeriesTrait + 'a)> for Series {
     fn as_ref(&self) -> &(dyn SeriesTrait + 'a) {
-        &*self.0
+        self.0.as_ref()
     }
 }
 
@@ -969,9 +1010,10 @@ where
 
 #[cfg(test)]
 mod test {
+    use std::convert::TryFrom;
+
     use crate::prelude::*;
     use crate::series::*;
-    use std::convert::TryFrom;
 
     #[test]
     fn cast() {
@@ -993,8 +1035,16 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "dtype-struct")]
+    fn new_series_from_empty_structs() {
+        let dtype = DataType::Struct(vec![]);
+        let empties = vec![AnyValue::StructOwned(Box::new((vec![], vec![]))); 3];
+        let s = Series::from_any_values_and_dtype("", &empties, &dtype, false).unwrap();
+        assert_eq!(s.len(), 3);
+    }
+    #[test]
     fn new_series_from_arrow_primitive_array() {
-        let array = UInt32Array::from_slice(&[1, 2, 3, 4, 5]);
+        let array = UInt32Array::from_slice([1, 2, 3, 4, 5]);
         let array_ref: ArrayRef = Box::new(array);
 
         let _ = Series::try_from(("foo", array_ref)).unwrap();
@@ -1020,9 +1070,9 @@ mod test {
         let slice_2 = series.slice(-5, 5);
         let slice_3 = series.slice(0, 5);
 
-        assert_eq!(slice_1.get(0), AnyValue::Int64(3));
-        assert_eq!(slice_2.get(0), AnyValue::Int64(1));
-        assert_eq!(slice_3.get(0), AnyValue::Int64(1));
+        assert_eq!(slice_1.get(0).unwrap(), AnyValue::Int64(3));
+        assert_eq!(slice_2.get(0).unwrap(), AnyValue::Int64(1));
+        assert_eq!(slice_3.get(0).unwrap(), AnyValue::Int64(1));
     }
 
     #[test]

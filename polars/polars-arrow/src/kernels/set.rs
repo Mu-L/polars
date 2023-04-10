@@ -1,10 +1,15 @@
+use std::ops::BitOr;
+
+use arrow::array::*;
+use arrow::datatypes::DataType;
+use arrow::types::NativeType;
+use polars_error::polars_err;
+
 use crate::array::default_arrays::FromData;
-use crate::error::{PolarsError, Result};
+use crate::error::PolarsResult;
+use crate::index::IdxSize;
 use crate::kernels::BinaryMaskedSliceIterator;
 use crate::trusted_len::PushUnchecked;
-use arrow::array::*;
-use arrow::{datatypes::DataType, types::NativeType};
-use std::ops::BitOr;
 
 /// Set values in a primitive array where the primitive array has null values.
 /// this is faster because we don't have to invert and combine bitmaps
@@ -21,17 +26,15 @@ where
     let validity = BooleanArray::from_data_default(validity.clone(), None);
 
     let mut av = Vec::with_capacity(array.len());
-    BinaryMaskedSliceIterator::new(&validity)
-        .into_iter()
-        .for_each(|(lower, upper, truthy)| {
-            if truthy {
-                av.extend_from_slice(&values[lower..upper])
-            } else {
-                av.extend_trusted_len(std::iter::repeat(value).take(upper - lower))
-            }
-        });
+    BinaryMaskedSliceIterator::new(&validity).for_each(|(lower, upper, truthy)| {
+        if truthy {
+            av.extend_from_slice(&values[lower..upper])
+        } else {
+            av.extend_trusted_len(std::iter::repeat(value).take(upper - lower))
+        }
+    });
 
-    PrimitiveArray::from_data(array.data_type().clone(), av.into(), None)
+    PrimitiveArray::new(array.data_type().clone(), av.into(), None)
 }
 
 /// Set values in a primitive array based on a mask array. This is fast when large chunks of bits are set or unset.
@@ -44,15 +47,13 @@ pub fn set_with_mask<T: NativeType>(
     let values = array.values();
 
     let mut buf = Vec::with_capacity(array.len());
-    BinaryMaskedSliceIterator::new(mask)
-        .into_iter()
-        .for_each(|(lower, upper, truthy)| {
-            if truthy {
-                buf.extend_trusted_len(std::iter::repeat(value).take(upper - lower))
-            } else {
-                buf.extend_from_slice(&values[lower..upper])
-            }
-        });
+    BinaryMaskedSliceIterator::new(mask).for_each(|(lower, upper, truthy)| {
+        if truthy {
+            buf.extend_trusted_len(std::iter::repeat(value).take(upper - lower))
+        } else {
+            buf.extend_from_slice(&values[lower..upper])
+        }
+    });
     // make sure that where the mask is set to true, the validity buffer is also set to valid
     // after we have applied the or operation we have new buffer with no offsets
     let validity = array.validity().as_ref().map(|valid| {
@@ -60,7 +61,7 @@ pub fn set_with_mask<T: NativeType>(
         valid.bitor(mask_bitmap)
     });
 
-    PrimitiveArray::from_data(data_type, buf.into(), validity)
+    PrimitiveArray::new(data_type, buf.into(), validity)
 }
 
 /// Efficiently sets value at the indices from the iterator to `set_value`.
@@ -70,24 +71,24 @@ pub fn set_at_idx_no_null<T, I>(
     idx: I,
     set_value: T,
     data_type: DataType,
-) -> Result<PrimitiveArray<T>>
+) -> PolarsResult<PrimitiveArray<T>>
 where
     T: NativeType,
-    I: IntoIterator<Item = usize>,
+    I: IntoIterator<Item = IdxSize>,
 {
     let mut buf = Vec::with_capacity(array.len());
     buf.extend_from_slice(array.values().as_slice());
     let mut_slice = buf.as_mut_slice();
 
-    idx.into_iter().try_for_each::<_, Result<_>>(|idx| {
+    idx.into_iter().try_for_each::<_, PolarsResult<_>>(|idx| {
         let val = mut_slice
-            .get_mut(idx)
-            .ok_or_else(|| PolarsError::ComputeError("idx is out of bounds".into()))?;
+            .get_mut(idx as usize)
+            .ok_or_else(|| polars_err!(ComputeError: "index is out of bounds"))?;
         *val = set_value;
         Ok(())
     })?;
 
-    Ok(PrimitiveArray::from_data(
+    Ok(PrimitiveArray::new(
         data_type,
         buf.into(),
         array.validity().cloned(),
@@ -96,9 +97,11 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use arrow::array::UInt32Array;
     use std::iter::FromIterator;
+
+    use arrow::array::UInt32Array;
+
+    use super::*;
 
     #[test]
     fn test_set_mask() {
@@ -114,12 +117,11 @@ mod test {
         assert_eq!(slice[1], 1);
         assert_eq!(slice[0], 0);
 
-        let mask = BooleanArray::from_slice(&[
+        let mask = BooleanArray::from_slice([
             false, true, false, true, false, true, false, true, false, false,
         ]);
-        let val = UInt32Array::from_slice(&[0; 10]);
+        let val = UInt32Array::from_slice([0; 10]);
         let out = set_with_mask(&val, &mask, 1, DataType::UInt32);
-        dbg!(&out);
         assert_eq!(out.values().as_slice(), &[0, 1, 0, 1, 0, 1, 0, 1, 0, 0]);
 
         let val = UInt32Array::from(&[None, None, None]);
@@ -131,7 +133,7 @@ mod test {
 
     #[test]
     fn test_set_at_idx() {
-        let val = UInt32Array::from_slice(&[1, 2, 3]);
+        let val = UInt32Array::from_slice([1, 2, 3]);
         let out = set_at_idx_no_null(&val, std::iter::once(1), 100, DataType::UInt32).unwrap();
         assert_eq!(out.values().as_slice(), &[1, 100, 3]);
         let out = set_at_idx_no_null(&val, std::iter::once(100), 100, DataType::UInt32);

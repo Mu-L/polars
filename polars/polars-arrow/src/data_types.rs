@@ -20,11 +20,13 @@ unsafe impl IsFloat for i8 {}
 unsafe impl IsFloat for i16 {}
 unsafe impl IsFloat for i32 {}
 unsafe impl IsFloat for i64 {}
+unsafe impl IsFloat for i128 {}
 unsafe impl IsFloat for u8 {}
 unsafe impl IsFloat for u16 {}
 unsafe impl IsFloat for u32 {}
 unsafe impl IsFloat for u64 {}
 unsafe impl IsFloat for &str {}
+unsafe impl IsFloat for &[u8] {}
 unsafe impl IsFloat for bool {}
 unsafe impl<T: IsFloat> IsFloat for Option<T> {}
 
@@ -34,6 +36,7 @@ mod private {
     impl Sealed for i16 {}
     impl Sealed for i32 {}
     impl Sealed for i64 {}
+    impl Sealed for i128 {}
     impl Sealed for u8 {}
     impl Sealed for u16 {}
     impl Sealed for u32 {}
@@ -41,6 +44,7 @@ mod private {
     impl Sealed for f32 {}
     impl Sealed for f64 {}
     impl Sealed for &str {}
+    impl Sealed for &[u8] {}
     impl Sealed for bool {}
     impl<T: Sealed> Sealed for Option<T> {}
 }
@@ -48,10 +52,12 @@ mod private {
 macro_rules! impl_is_float {
     ($tp:ty) => {
         unsafe impl IsFloat for $tp {
+            #[inline]
             fn is_float() -> bool {
                 true
             }
 
+            #[inline]
             fn is_nan(&self) -> bool {
                 <$tp>::is_nan(*self)
             }

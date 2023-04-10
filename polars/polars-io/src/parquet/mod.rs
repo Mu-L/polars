@@ -7,29 +7,35 @@
 //! use polars_io::prelude::*;
 //! use std::fs::File;
 //!
-//! fn example() -> Result<DataFrame> {
+//! fn example() -> PolarsResult<DataFrame> {
 //!     let r = File::open("some_file.parquet").unwrap();
 //!     let reader = ParquetReader::new(r);
 //!     reader.finish()
 //! }
 //! ```
 //!
+#[cfg(feature = "cloud")]
+pub(super) mod async_impl;
 pub(super) mod mmap;
 pub mod predicates;
 mod read;
 mod read_impl;
 mod write;
 
-use super::*;
 pub use read::*;
-pub use write::*;
+pub use write::{BrotliLevel, GzipLevel, ZstdLevel, *};
+
+use super::*;
 
 #[cfg(test)]
 mod test {
-    use crate::prelude::*;
-    use polars_core::{df, prelude::*};
     use std::fs::File;
     use std::io::Cursor;
+
+    use polars_core::df;
+    use polars_core::prelude::*;
+
+    use crate::prelude::*;
 
     #[test]
     fn test_parquet() {
@@ -44,7 +50,7 @@ mod test {
 
     #[test]
     #[cfg(all(feature = "dtype-datetime", feature = "parquet"))]
-    fn test_parquet_datetime_round_trip() -> Result<()> {
+    fn test_parquet_datetime_round_trip() -> PolarsResult<()> {
         use std::io::{Cursor, Seek, SeekFrom};
 
         let mut f = Cursor::new(vec![]);

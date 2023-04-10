@@ -1,7 +1,8 @@
-use crate::prelude::*;
-use num::Float;
+use num_traits::Float;
 use polars_arrow::kernels::float::*;
 use polars_arrow::kernels::set::set_at_nulls;
+
+use crate::prelude::*;
 
 impl<T> ChunkedArray<T>
 where
@@ -28,6 +29,6 @@ where
             .downcast_iter()
             .map(|arr| Box::new(set_at_nulls(arr, T::Native::nan())) as ArrayRef)
             .collect();
-        ChunkedArray::from_chunks(self.name(), chunks)
+        unsafe { ChunkedArray::from_chunks(self.name(), chunks) }
     }
 }

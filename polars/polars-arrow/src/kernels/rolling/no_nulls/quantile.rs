@@ -1,7 +1,10 @@
+use std::fmt::Debug;
+
+use num_traits::ToPrimitive;
+
 use super::*;
 use crate::index::IdxSize;
 use crate::trusted_len::TrustedLen;
-use std::fmt::Debug;
 
 // used by agg_quantile
 pub fn rolling_quantile_by_iter<T, O>(
@@ -15,8 +18,8 @@ where
     T: std::iter::Sum<T>
         + NativeType
         + Copy
-        + std::cmp::PartialOrd
-        + num::ToPrimitive
+        + PartialOrd
+        + ToPrimitive
         + NumCast
         + Add<Output = T>
         + Sub<Output = T>
@@ -26,11 +29,7 @@ where
 {
     if values.is_empty() {
         let out: Vec<T> = vec![];
-        return Box::new(PrimitiveArray::from_data(
-            T::PRIMITIVE.into(),
-            out.into(),
-            None,
-        ));
+        return Box::new(PrimitiveArray::new(T::PRIMITIVE.into(), out.into(), None));
     }
 
     let mut sorted_window = SortedBuf::new(values, 0, 1);
@@ -61,8 +60,8 @@ pub(crate) fn compute_quantile2<T>(
 where
     T: std::iter::Sum<T>
         + Copy
-        + std::cmp::PartialOrd
-        + num::ToPrimitive
+        + PartialOrd
+        + ToPrimitive
         + NumCast
         + Add<Output = T>
         + Sub<Output = T>
@@ -129,8 +128,8 @@ pub fn rolling_median<T>(
 where
     T: NativeType
         + std::iter::Sum<T>
-        + std::cmp::PartialOrd
-        + num::ToPrimitive
+        + PartialOrd
+        + ToPrimitive
         + NumCast
         + Add<Output = T>
         + Sub<Output = T>
@@ -162,8 +161,8 @@ pub fn rolling_quantile<T>(
 where
     T: NativeType
         + std::iter::Sum<T>
-        + std::cmp::PartialOrd
-        + num::ToPrimitive
+        + PartialOrd
+        + ToPrimitive
         + NumCast
         + Add<Output = T>
         + Sub<Output = T>
@@ -243,8 +242,8 @@ where
         })
         .collect_trusted::<Vec<T>>();
 
-    let validity = create_validity(min_periods, len as usize, window_size, det_offsets_fn);
-    Box::new(PrimitiveArray::from_data(
+    let validity = create_validity(min_periods, len, window_size, det_offsets_fn);
+    Box::new(PrimitiveArray::new(
         T::PRIMITIVE.into(),
         out.into(),
         validity.map(|b| b.into()),
@@ -283,8 +282,8 @@ where
         })
         .collect_trusted::<Vec<T>>();
 
-    let validity = create_validity(min_periods, len as usize, window_size, det_offsets_fn);
-    Box::new(PrimitiveArray::from_data(
+    let validity = create_validity(min_periods, len, window_size, det_offsets_fn);
+    Box::new(PrimitiveArray::new(
         T::PRIMITIVE.into(),
         out.into(),
         validity.map(|b| b.into()),

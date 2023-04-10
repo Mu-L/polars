@@ -1,9 +1,10 @@
-use crate::kernels::take::take_unchecked;
+use arrow::array::ListArray;
+use arrow::offset::{Offsets, OffsetsBuffer};
+
+use crate::compute::take::take_unchecked;
 use crate::prelude::*;
 use crate::trusted_len::PushUnchecked;
 use crate::utils::CustomIterTools;
-use arrow::array::ListArray;
-use arrow::buffer::Buffer;
 
 /// Get the indices that would result in a get operation on the lists values.
 /// for example, consider this list:
@@ -30,9 +31,11 @@ use arrow::buffer::Buffer;
 ///
 /// ```
 fn sublist_get_indexes(arr: &ListArray<i64>, index: i64) -> IdxArr {
-    let mut iter = arr.offsets().iter();
+    let offsets = arr.offsets().as_slice();
+    let mut iter = offsets.iter();
 
-    let mut cum_offset: IdxSize = 0;
+    // the indices can be sliced, so we should not start at 0.
+    let mut cum_offset = (*offsets.first().unwrap_or(&0)) as IdxSize;
 
     if let Some(mut previous) = iter.next().copied() {
         let a: IdxArr = iter
@@ -59,7 +62,7 @@ fn sublist_get_indexes(arr: &ListArray<i64>, index: i64) -> IdxArr {
 
         a
     } else {
-        IdxArr::from_slice(&[])
+        IdxArr::from_slice([])
     }
 }
 
@@ -84,27 +87,28 @@ pub fn array_to_unit_list(array: ArrayRef) -> ListArray<i64> {
         }
     };
 
-    let offsets: Buffer<i64> = offsets.into();
-    let dtype = ListArray::<i64>::default_datatype(array.data_type().clone());
     // Safety:
     // offsets are monotonically increasing
-    unsafe { ListArray::<i64>::new_unchecked(dtype, offsets, array, None) }
+    unsafe {
+        let offsets: OffsetsBuffer<i64> = Offsets::new_unchecked(offsets).into();
+        let dtype = ListArray::<i64>::default_datatype(array.data_type().clone());
+        ListArray::<i64>::new(dtype, offsets, array, None)
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use arrow::array::{Array, Int32Array, PrimitiveArray};
-    use arrow::buffer::Buffer;
     use arrow::datatypes::DataType;
-    use std::sync::Arc;
+
+    use super::*;
 
     fn get_array() -> ListArray<i64> {
-        let values = Int32Array::from_slice(&[1, 2, 3, 4, 5, 6]);
-        let offsets = Buffer::from(vec![0i64, 3, 5, 6]);
+        let values = Int32Array::from_slice([1, 2, 3, 4, 5, 6]);
+        let offsets = OffsetsBuffer::try_from(vec![0i64, 3, 5, 6]).unwrap();
 
         let dtype = ListArray::<i64>::default_datatype(DataType::Int32);
-        ListArray::<i64>::from_data(dtype, offsets, Box::new(values), None)
+        ListArray::<i64>::new(dtype, offsets, Box::new(values), None)
     }
 
     #[test]
@@ -130,16 +134,14 @@ mod test {
             None,
             Some(11),
         ]);
-        let offsets = Buffer::from(vec![0i64, 1, 2, 3, 6, 9, 11]);
+        let offsets = OffsetsBuffer::try_from(vec![0i64, 1, 2, 3, 6, 9, 11]).unwrap();
 
         let dtype = ListArray::<i64>::default_datatype(DataType::Int32);
-        let arr = ListArray::<i64>::from_data(dtype, offsets, Box::new(values), None);
+        let arr = ListArray::<i64>::new(dtype, offsets, Box::new(values), None);
 
         let out = sublist_get_indexes(&arr, 1);
         assert_eq!(
-            out.into_iter()
-                .map(|opt_v| opt_v.cloned())
-                .collect::<Vec<_>>(),
+            out.into_iter().collect::<Vec<_>>(),
             &[None, None, None, Some(4), Some(7), Some(10)]
         );
     }

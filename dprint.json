@@ -1,10 +1,14 @@
 {
-  "incremental": true,
-  "toml": {
-  },
-  "includes": ["**/*.{toml}"],
-  "excludes": [],
+  "includes": [
+    "**/*.{md,toml}"
+  ],
+  "excludes": [
+    "**/target",
+    "py-polars/.pytest_cache",
+    "py-polars/.venv"
+  ],
   "plugins": [
-    "https://plugins.dprint.dev/toml-0.5.3.wasm"
+    "https://plugins.dprint.dev/markdown-0.15.2.wasm",
+    "https://plugins.dprint.dev/toml-0.5.4.wasm"
   ]
 }

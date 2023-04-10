@@ -6,6 +6,10 @@ pub use date::*;
 mod datetime;
 #[cfg(feature = "dtype-datetime")]
 pub use datetime::*;
+#[cfg(feature = "dtype-decimal")]
+mod decimal;
+#[cfg(feature = "dtype-decimal")]
+pub use decimal::*;
 #[cfg(feature = "dtype-duration")]
 mod duration;
 #[cfg(feature = "dtype-duration")]
@@ -17,18 +21,17 @@ mod struct_;
 #[cfg(feature = "dtype-time")]
 mod time;
 
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+
 #[cfg(feature = "dtype-categorical")]
 pub use categorical::*;
-
+#[cfg(feature = "dtype-struct")]
+pub use struct_::*;
 #[cfg(feature = "dtype-time")]
 pub use time::*;
 
-#[cfg(feature = "dtype-struct")]
-pub use struct_::*;
-
 use crate::prelude::*;
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
 
 /// Maps a logical type to a a chunked array implementation of the physical type.
 /// This saves a lot of compiler bloat and allows us to reuse functionality.
@@ -71,13 +74,17 @@ pub trait LogicalType {
     fn dtype(&self) -> &DataType;
 
     /// Gets AnyValue from LogicalType
-    fn get_any_value(&self, _i: usize) -> AnyValue<'_> {
-        // note that unchecked version is not here
-        // because I don't think it should ever be called on logical types
+    fn get_any_value(&self, _i: usize) -> PolarsResult<AnyValue<'_>> {
         unimplemented!()
     }
 
-    fn cast(&self, dtype: &DataType) -> Result<Series>;
+    /// # Safety
+    /// Does not do any bound checks.
+    unsafe fn get_any_value_unchecked(&self, _i: usize) -> AnyValue<'_> {
+        unimplemented!()
+    }
+
+    fn cast(&self, dtype: &DataType) -> PolarsResult<Series>;
 }
 
 impl<K: PolarsDataType, T: PolarsDataType> Logical<K, T>

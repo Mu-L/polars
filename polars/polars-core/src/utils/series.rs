@@ -1,8 +1,9 @@
 use crate::prelude::*;
+use crate::series::unstable::UnstableSeries;
 
 /// Transform to physical type and coerce floating point and similar sized integer to a bit representation
 /// to reduce compiler bloat
-pub(crate) fn to_physical_and_bit_repr(s: &[Series]) -> Vec<Series> {
+pub fn _to_physical_and_bit_repr(s: &[Series]) -> Vec<Series> {
     s.iter()
         .map(|s| {
             let physical = s.to_physical_repr();
@@ -15,4 +16,16 @@ pub(crate) fn to_physical_and_bit_repr(s: &[Series]) -> Vec<Series> {
             }
         })
         .collect()
+}
+
+/// A utility that allocates an `UnstableSeries`. The applied function can then use that
+/// series container to save heap allocations and swap arrow arrays.
+pub fn with_unstable_series<F, T>(dtype: &DataType, f: F) -> T
+where
+    F: Fn(&mut UnstableSeries) -> T,
+{
+    let mut container = Series::full_null("", 0, dtype);
+    let mut us = UnstableSeries::new(&mut container);
+
+    f(&mut us)
 }

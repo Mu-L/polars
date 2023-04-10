@@ -24,24 +24,26 @@ impl Default for RollingOptionsFixedWindow {
 
 #[cfg(feature = "rolling_window")]
 mod inner_mod {
-    use crate::prelude::*;
+    use std::ops::SubAssign;
+
     use arrow::array::{Array, PrimitiveArray};
     use arrow::bitmap::MutableBitmap;
-    use num::{Float, Zero};
+    use num_traits::pow::Pow;
+    use num_traits::{Float, Zero};
     use polars_arrow::bit_util::unset_bit_raw;
     use polars_arrow::data_types::IsFloat;
     use polars_arrow::trusted_len::PushUnchecked;
-    use std::ops::SubAssign;
+
+    use crate::prelude::*;
 
     /// utility
-    fn check_input(window_size: usize, min_periods: usize) -> Result<()> {
-        if min_periods > window_size {
-            Err(PolarsError::ComputeError(
-                "`windows_size` should be >= `min_periods`".into(),
-            ))
-        } else {
-            Ok(())
-        }
+    fn check_input(window_size: usize, min_periods: usize) -> PolarsResult<()> {
+        polars_ensure!(
+            min_periods <= window_size,
+            ComputeError: "`window_size`: {} should be >= `min_periods`: {}",
+            window_size, min_periods
+        );
+        Ok(())
     }
 
     /// utility
@@ -50,7 +52,7 @@ mod inner_mod {
             let right_window = (window_size + 1) / 2;
             (
                 idx.saturating_sub(window_size - right_window),
-                std::cmp::min(len, idx + right_window),
+                len.min(idx + right_window),
             )
         } else {
             (idx.saturating_sub(window_size - 1), idx + 1)
@@ -69,7 +71,7 @@ mod inner_mod {
             &self,
             f: &dyn Fn(&Series) -> Series,
             options: RollingOptionsFixedWindow,
-        ) -> Result<Series> {
+        ) -> PolarsResult<Series> {
             check_input(options.window_size, options.min_periods)?;
 
             let ca = self.rechunk();
@@ -86,7 +88,7 @@ mod inner_mod {
 
             let len = self.len();
             let arr = ca.downcast_iter().next().unwrap();
-            let series_container =
+            let mut series_container =
                 ChunkedArray::<T>::from_slice("", &[T::Native::zero()]).into_series();
             let array_ptr = series_container.array_ref(0);
             let ptr = array_ptr.as_ref() as *const dyn Array as *mut dyn Array
@@ -104,7 +106,9 @@ mod inner_mod {
                     if size < options.min_periods {
                         builder.append_null();
                     } else {
-                        let arr_window = arr.slice(start, size);
+                        // safety:
+                        // we are in bounds
+                        let arr_window = unsafe { arr.slice_typed_unchecked(start, size) };
 
                         // Safety.
                         // ptr is not dropped as we are in scope
@@ -113,6 +117,8 @@ mod inner_mod {
                         unsafe {
                             *ptr = arr_window;
                         }
+                        // ensure the length is correct
+                        series_container._get_inner_mut().compute_len();
 
                         let s = if size == options.window_size {
                             f(&series_container.multiply(&weights_series).unwrap())
@@ -147,7 +153,9 @@ mod inner_mod {
                     if size < options.min_periods {
                         builder.append_null();
                     } else {
-                        let arr_window = arr.slice(start, size);
+                        // safety:
+                        // we are in bounds
+                        let arr_window = unsafe { arr.slice_typed_unchecked(start, size) };
 
                         // Safety.
                         // ptr is not dropped as we are in scope
@@ -156,6 +164,8 @@ mod inner_mod {
                         unsafe {
                             *ptr = arr_window;
                         }
+                        // ensure the length is correct
+                        series_container._get_inner_mut().compute_len();
 
                         let s = f(&series_container);
                         let out = self.unpack_series_matching_type(&s)?;
@@ -172,21 +182,24 @@ mod inner_mod {
     where
         ChunkedArray<T>: IntoSeries,
         T: PolarsFloatType,
-        T::Native: Float + IsFloat + SubAssign + num::pow::Pow<T::Native, Output = T::Native>,
+        T::Native: Float + IsFloat + SubAssign + Pow<T::Native, Output = T::Native>,
     {
         /// Apply a rolling custom function. This is pretty slow because of dynamic dispatch.
-        pub fn rolling_apply_float<F>(&self, window_size: usize, f: F) -> Result<Self>
+        pub fn rolling_apply_float<F>(&self, window_size: usize, mut f: F) -> PolarsResult<Self>
         where
-            F: Fn(&ChunkedArray<T>) -> Option<T::Native>,
+            F: FnMut(&mut ChunkedArray<T>) -> Option<T::Native>,
         {
-            if window_size >= self.len() {
+            if window_size > self.len() {
                 return Ok(Self::full_null(self.name(), self.len()));
             }
             let ca = self.rechunk();
             let arr = ca.downcast_iter().next().unwrap();
 
-            let arr_container = ChunkedArray::<T>::from_slice("", &[T::Native::zero()]);
-            let array_ptr = &arr_container.chunks()[0];
+            // we create a temporary dummy ChunkedArray
+            // this will be a container where we swap the window contents every iteration
+            // doing so will save a lot of heap allocations.
+            let mut heap_container = ChunkedArray::<T>::from_slice("", &[T::Native::zero()]);
+            let array_ptr = &heap_container.chunks()[0];
             let ptr = array_ptr.as_ref() as *const dyn Array as *mut dyn Array
                 as *mut PrimitiveArray<T::Native>;
 
@@ -199,7 +212,10 @@ mod inner_mod {
             values.extend(std::iter::repeat(T::Native::default()).take(window_size - 1));
 
             for offset in 0..self.len() + 1 - window_size {
-                let arr_window = arr.slice(offset, window_size);
+                debug_assert!(offset + window_size <= arr.len());
+                let arr_window = unsafe { arr.slice_typed_unchecked(offset, window_size) };
+                // the lengths are cached, so we must update them
+                heap_container.length = arr_window.len() as IdxSize;
 
                 // Safety.
                 // ptr is not dropped as we are in scope
@@ -209,18 +225,28 @@ mod inner_mod {
                     *ptr = arr_window;
                 }
 
-                let out = f(&arr_container);
+                let out = f(&mut heap_container);
                 match out {
-                    Some(v) => unsafe { values.push_unchecked(v) },
-                    None => unsafe { unset_bit_raw(validity_ptr, offset + window_size - 1) },
+                    Some(v) => {
+                        // Safety: we have pre-allocated
+                        unsafe { values.push_unchecked(v) }
+                    }
+                    None => {
+                        // safety: we allocated enough for both the `values` vec
+                        // and the `validity_ptr`
+                        unsafe {
+                            values.push_unchecked(T::Native::default());
+                            unset_bit_raw(validity_ptr, offset + window_size - 1);
+                        }
+                    }
                 }
             }
-            let arr = PrimitiveArray::from_data(
+            let arr = PrimitiveArray::new(
                 T::get_dtype().to_arrow(),
                 values.into(),
                 Some(validity.into()),
             );
-            Ok(Self::from_chunks(self.name(), vec![Box::new(arr)]))
+            unsafe { Ok(Self::from_chunks(self.name(), vec![Box::new(arr)])) }
         }
     }
 }

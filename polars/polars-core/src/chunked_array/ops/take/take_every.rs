@@ -31,6 +31,12 @@ impl ChunkTakeEvery<BooleanType> for BooleanChunked {
 
 impl ChunkTakeEvery<Utf8Type> for Utf8Chunked {
     fn take_every(&self, n: usize) -> Utf8Chunked {
+        unsafe { self.as_binary().take_every(n).to_utf8() }
+    }
+}
+
+impl ChunkTakeEvery<BinaryType> for BinaryChunked {
+    fn take_every(&self, n: usize) -> BinaryChunked {
         let mut ca: Self = if !self.has_validity() {
             self.into_no_null_iter().step_by(n).collect()
         } else {
@@ -54,7 +60,7 @@ impl ChunkTakeEvery<ListType> for ListChunked {
 }
 
 #[cfg(feature = "object")]
-impl<T> ChunkTakeEvery<ObjectType<T>> for ObjectChunked<T> {
+impl<T: PolarsObject> ChunkTakeEvery<ObjectType<T>> for ObjectChunked<T> {
     fn take_every(&self, _n: usize) -> ObjectChunked<T> {
         todo!()
     }

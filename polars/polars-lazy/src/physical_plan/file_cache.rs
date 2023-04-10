@@ -1,7 +1,10 @@
-use crate::prelude::file_caching::FileFingerPrint;
-use crate::prelude::*;
-use parking_lot::Mutex;
+use std::sync::Mutex;
+
 use polars_core::prelude::*;
+#[cfg(any(feature = "parquet", feature = "csv-file", feature = "ipc"))]
+use polars_plan::logical_plan::FileFingerPrint;
+
+use crate::prelude::*;
 
 #[derive(Clone)]
 pub(crate) struct FileCache {
@@ -24,14 +27,23 @@ impl FileCache {
 
         Self { inner }
     }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn assert_empty(&self) {
+        for (_, guard) in self.inner.iter() {
+            let state = guard.lock().unwrap();
+            assert!(state.1.is_empty());
+        }
+    }
+
     pub(crate) fn read<F>(
         &self,
         finger_print: FileFingerPrint,
         total_read_count: FileCount,
         reader: &mut F,
-    ) -> Result<DataFrame>
+    ) -> PolarsResult<DataFrame>
     where
-        F: FnMut() -> Result<DataFrame>,
+        F: FnMut() -> PolarsResult<DataFrame>,
     {
         if total_read_count == 1 {
             if total_read_count == 0 {
@@ -41,7 +53,7 @@ impl FileCache {
         } else {
             // should exist
             let guard = self.inner.get(&finger_print).unwrap();
-            let mut state = guard.lock();
+            let mut state = guard.lock().unwrap();
 
             // initialize df
             if state.0 == 0 {

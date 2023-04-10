@@ -1,10 +1,12 @@
+// used only if feature="strings"
+#[allow(unused_imports)]
 use super::*;
 
 #[cfg(feature = "strings")]
 #[test]
-fn test_explode_row_numbers() -> Result<()> {
+fn test_explode_row_numbers() -> PolarsResult<()> {
     let df = df![
-        "text" => ["one two three four", "uno dos tres quatro"]
+        "text" => ["one two three four", "uno dos tres cuatro"]
     ]?
     .lazy()
     .select([col("text").str().split(" ").alias("tokens")])
